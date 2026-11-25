@@ -121,6 +121,35 @@ done
 nsenter -n -t "$IPID" python3 "$ROOT/tests/tiny_dns.py" 203.0.113.10 web.example=203.0.113.10 &
 PIDS+=("$!")
 
+# ns V: "a VPN provider", reached from ns A through interface vpn0. Both I
+# (alpha's normal default route) and V host 192.0.2.80, a web server
+# answering with the address it sees: which one answers shows the path.
+unshare -n --fork --kill-child sleep infinity &
+VPID=$!
+PIDS+=("$VPID")
+sleep 0.3
+ip link add vpn0 type veth peer name vV netns "$VPID"
+ip addr add 198.51.100.2/24 dev vpn0
+ip link set vpn0 up
+nsenter -n -t "$VPID" ip link set lo up
+nsenter -n -t "$VPID" ip addr add 198.51.100.1/24 dev vV
+nsenter -n -t "$VPID" ip link set vV up
+nsenter -n -t "$VPID" ip addr add 192.0.2.80/32 dev lo
+nsenter -n -t "$VPID" ip addr add 203.0.113.10/32 dev lo
+inI ip addr add 192.0.2.80/32 dev lo
+ip route add default via 203.0.113.10 dev vA3
+for ns in "$IPID" "$VPID"; do
+    nsenter -n -t "$ns" python3 -c "
+import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('192.0.2.80', 8080)); s.listen(8)
+while True:
+    c,peer=s.accept(); c.sendall(peer[0].encode()); c.close()
+# $W" &
+    PIDS+=("$!")
+done
+# The VPN side resolves too (the exit node's DNS goes out through vpn0).
+nsenter -n -t "$VPID" python3 "$ROOT/tests/tiny_dns.py" 203.0.113.10 web.example=203.0.113.10 &
+PIDS+=("$!")
+
 # Hub, with two accounts.
 ctl() { TC_STATE_DIR="$W/hub" "$BIN/tc-control" "$@"; }
 TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test --ephemeral-timeout 6s >"$W/hub.log" 2>&1 &
@@ -174,6 +203,8 @@ start_tcd() { # name direct_port
     # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
     local cmd=(env TC_TRAFFIC_INTERVAL=2 "$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
         --hostname "$name" --direct-port "$port" --no-dns --exit-dns 203.0.113.10)
+    # alpha, the exit node, sends forwarded traffic out through vpn0.
+    [[ $name == alpha ]] && cmd+=(--exit-interface vpn0)
     # Not through a shell function: $! must be the process itself (nsenter
     # execs into tcd), or cleanup would leave it running.
     local pre
@@ -373,7 +404,7 @@ pass "IPv6 inside the tunnel: addresses derived from IPv4, ping6 both ways, Magi
 web() { # machine address: what the web server sees us as
     local ns_var="NS_$1" pre; pre=$(ns_prefix "${!ns_var}")
     $pre python3 -c "
-import socket,sys; s=socket.create_connection(('$2', 8080), timeout=3); print(s.recv(100).decode())" 2>/dev/null
+import socket,sys; s=socket.create_connection(('$2', 8080), timeout=3); print(s.recv(100).decode())" 2>/dev/null || true
 }
 [[ -z "$(web bravo 203.0.113.10)" ]] || fail "bravo reaches the internet without an exit node"
 ctl nodes exit-node alpha.richard on >/dev/null
@@ -404,6 +435,22 @@ wait_status_not alpha "this machine forwards" "alpha still forwarding"
 ctl nodes exit-node alpha.richard on >/dev/null
 wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo didn't return to alpha"
 pass "turning the role off: bravo falls back to direct, and returns when it's back on"
+
+# ---- Exit interface and kill switch ----
+wait_status alpha "forwards internet traffic for its account, through vpn0" "alpha doesn't report its exit interface"
+SEEN=$(web bravo 192.0.2.80)
+[[ "$SEEN" == 198.51.100.2 ]] || fail "bravo's internet traffic should leave through vpn0: web saw '$SEEN'"
+OWN=$(web alpha 192.0.2.80)
+[[ "$OWN" == 203.0.113.1 ]] || fail "alpha's own traffic should keep its normal route: web saw '$OWN'"
+ip link set vpn0 down
+wait_status alpha "vpn0 is down: exit traffic is blocked" "kill switch not reported"
+LEAK=$(web bravo 192.0.2.80)
+[[ -z "$LEAK" ]] || fail "kill switch: bravo's traffic went out another way while vpn0 was down (web saw '$LEAK')"
+ip link set vpn0 up
+wait_status_not alpha "vpn0 is down" "alpha didn't notice vpn0 came back"
+SEEN=$(web bravo 192.0.2.80)
+[[ "$SEEN" == 198.51.100.2 ]] || fail "forwarding through vpn0 didn't resume: web saw '$SEEN'"
+pass "exit interface: forwarded traffic leaves through vpn0, alpha's own traffic doesn't; kill switch blocks it while vpn0 is down"
 
 # ---- Machine approval and ephemeral machines ----
 ctl accounts approval alice on >/dev/null

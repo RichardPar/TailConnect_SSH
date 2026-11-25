@@ -46,6 +46,9 @@ pub struct Options {
     pub hostname: String,
     /// Resolvers an exit node uses for its clients (default: the host's).
     pub exit_dns: Vec<SocketAddr>,
+    /// As an exit node: send the forwarded traffic out through this
+    /// interface (a VPN's tun0, say), blocking it while it's down.
+    pub exit_interface: Option<String>,
 }
 
 /// What survives a restart.
@@ -615,7 +618,7 @@ impl Daemon {
     fn set_role(self: &Arc<Self>, on: bool) {
         let mut serving = self.serving.lock().unwrap();
         match (on, serving.is_some()) {
-            (true, false) => match exit::serve(&self.opts.tun_name) {
+            (true, false) => match exit::serve(&self.opts.tun_name, self.opts.exit_interface.as_deref()) {
                 Ok(s) => {
                     let me = self.net.read().unwrap().me.as_ref().map(|m| m.ip);
                     if let Some(ip) = me {
@@ -627,7 +630,8 @@ impl Daemon {
                         let d = Arc::downgrade(self);
                         let allowed: Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync> =
                             Arc::new(move |ip| d.upgrade().is_some_and(|d| d.may_use_me_as_exit(ip)));
-                        tokio::spawn(exit::dns_forwarder(ip, ups, allowed, s.dns.clone()));
+                        let mark = s.iface.as_ref().map(|_| exit::EXIT_MARK);
+                        tokio::spawn(exit::dns_forwarder(ip, ups, allowed, s.dns.clone(), mark));
                     }
                     *serving = Some(s);
                 }
@@ -1024,6 +1028,16 @@ impl Daemon {
     }
 
     fn status(&self) -> api::Status {
+        // Lock `serving` once: a lock taken inside the struct expression
+        // below lives until its end, so taking it twice would deadlock.
+        let serving = {
+            let g = self.serving.lock().unwrap();
+            (
+                g.is_some(),
+                g.as_ref().and_then(|s| s.iface.clone()),
+                g.as_ref().and_then(|s| s.iface_problem.read().unwrap().clone()),
+            )
+        };
         let traffic = self.traffic.lock().unwrap().clone();
         let st = self.state.lock().unwrap().clone();
         let net = self.net.read().unwrap();
@@ -1079,7 +1093,9 @@ impl Daemon {
                 .and_then(|ip| net.peers.get(&ip))
                 .map(|p| format!("{}.{}", p.node.name, p.node.account)),
             exit_problem: self.exit_problem.read().unwrap().clone(),
-            exit_serving: self.serving.lock().unwrap().is_some(),
+            exit_serving: serving.0,
+            exit_interface: serving.1,
+            exit_interface_problem: serving.2,
             peers,
         }
     }

@@ -83,6 +83,16 @@ How it works and what to know:
 - **Falling back.** If the exit node goes away (turned off, removed or offline), the machine falls back to its own internet connection and `tcs status` says why. It returns to the exit node by itself when it's back.
 - **IPv6 to the internet** works if the exit node has a global IPv6 address. Otherwise programs fall back to IPv4.
 
+**Sending exit traffic through another VPN.** An exit node can send the traffic it forwards for others out through one particular interface instead of its normal connection, for example a commercial VPN's `tun0` or a second uplink. Machines using it then appear on the internet from that VPN, while the exit node's own traffic is unchanged. In `/etc/default/tailconnect-ssh` on the exit node, set `TCD_ARGS="--exit-interface tun0"`, then restart the service. Its `tcs status` says `exit node: this machine forwards internet traffic for its account, through tun0`.
+- **Kill switch.** While the interface is down or missing, for example while the VPN reconnects, forwarded traffic is **blocked**, never sent out through the normal connection. `tcs status` warns `tun0 is down: exit traffic is blocked until it is up`. tcd checks every 5 seconds, and routes through the interface again once it's back, even if it was recreated.
+- **How.** Policy rules match only packets coming in from the tunnel:
+  - rule 5260 lets the main table's specific routes apply (the LAN, the tunnel), but not its default nor OpenVPN's `0.0.0.0/1` + `128.0.0.0/1` pair;
+  - rule 5261 sends everything else to table 7444. That table holds the default route out of the interface, via the gateway of its widest route if it has one (an Ethernet uplink), or straight out of it (`tun0`, `wg0`). It also holds an `unreachable` default with metric 4000, which is what answers while the interface is down.
+  - Reverse-path filtering on the interface is set to loose, and restored afterwards.
+- **DNS** for the machines using the exit node goes out through the interface too: the forwarder's sockets carry mark `0x7444`, which rule 5262 sends to the same table, so the kill switch covers it. Give public resolvers with `--exit-dns` if the host's own are on its LAN, for example `TCD_ARGS="--exit-interface tun0 --exit-dns 1.1.1.1,9.9.9.9"`, or the VPN provider's.
+- **IPv6** goes through the interface if it has a global IPv6 address. Otherwise IPv6 is blocked and programs use IPv4.
+- **The LAN** of the exit node, and the other machines in the network, are still reached directly.
+
 ### Accounts, sharing and access rules
 
 | | |
@@ -261,7 +271,7 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` / `exit-node NODE on\|off` / `approve NODE` / `expiry NODE never\|default\|90d` | Machines; `NODE` is an ID or `name.account` |
 | `tc-control rules list [--account NAME]` / `add --account NAME FROM TO [PORTS]` / `delete ID` | Access rules |
 | `tc-control shares list` / `create NODE ACCOUNT [PORTS]` / `accept ID` / `ports ID PORTS` / `revoke ID` | Shares |
-| `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
+| `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…] [--exit-interface IFACE]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
 | `tc up [--server HOST[:PORT]] [--authkey KEY] [--tls-fingerprint FP] [--exit-node NAME]` | Join or reconnect; `--exit-node` alone switches the exit node without reconnecting (`""` for none) |
 | `tc down` / `tc logout` | Disconnect / disconnect and forget the server |
 | `tc status [--json]`, `tc ip [NAME]` | Show this machine, its peers, the path to each (`direct` or `hub`), and what they may do (`shared with you`, `has access to this machine on tcp:80`, `rules: can open tcp:22 here`) |
@@ -299,6 +309,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
   - an exit node serving only its own account;
   - falling back when the role is turned off, and returning when it's back;
   - the choice kept across restarts, and working over a direct path;
+  - an exit interface: forwarded traffic leaving through a "VPN" interface while the exit node's own traffic doesn't, and the kill switch blocking it while that interface is down;
 - the admin HTTP API with a bearer token;
 - isolation between accounts (maps, DNS, traffic);
 - a share that's one-way and limited to some ports, including changing the ports live;
@@ -317,7 +328,7 @@ Done (Linux MVP):
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
-- IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node;
+- IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node, optionally out through another VPN with a kill switch;
 - key expiry with renewal, machine approval, ephemeral machines;
 - per-account MagicDNS domains;
 - an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
@@ -327,5 +338,4 @@ Done (Linux MVP):
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Sending exit traffic through another interface (a commercial VPN) with a kill switch
-2. Windows (Wintun) and Android (VpnService) clients
+1. Windows (Wintun) and Android (VpnService) clients

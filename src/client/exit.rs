@@ -20,6 +20,23 @@
 //! | `5271: lookup main suppress_prefixlength 0` | every route of the main table except its default: the LAN, the tunnel |
 //! | `5272: lookup 7443` | table 7443: the default routes into the tunnel |
 //!
+//! **Exit interface** (`tcd --exit-interface tun0`): the traffic forwarded
+//! for others leaves through that interface (a commercial VPN, say) instead
+//! of the normal connection; the host's own traffic is untouched. Rules
+//! that match only packets coming in from the tunnel:
+//!
+//! | Rule | Effect |
+//! |---|---|
+//! | `5260: iif tcs0 lookup main suppress_prefixlength 1` | the main table's specific routes (the LAN, the tunnel), not its default nor OpenVPN's `0.0.0.0/1` + `128.0.0.0/1` |
+//! | `5261: iif tcs0 lookup 7444` | table 7444: the default out of the interface, and an `unreachable` default (metric 4000) |
+//! | `5262: fwmark 0x7444 lookup 7444` | the DNS forwarder's lookups for its clients |
+//!
+//! **Kill switch**: while the interface is down or gone, its route is gone
+//! and the `unreachable` default answers: the traffic is refused, never sent
+//! out the normal way. Every 5 seconds the route is put back (with the
+//! interface's current gateway) if the interface is up. IPv6 goes through
+//! the interface only if it has a global IPv6 address; otherwise it's blocked.
+//!
 //! Everything is undone when the role ends, the exit node is no longer used,
 //! or tcd stops, and leftovers are removed when tcd starts (after a crash).
 
@@ -37,7 +54,11 @@ use tracing::{debug, info, warn};
 pub const MARK: u32 = 0x7443;
 /// Routing table holding the default routes into the tunnel.
 pub const TABLE: u32 = 7443;
-const PREFS: [u32; 3] = [5270, 5271, 5272];
+const PREFS: [u32; 6] = [5260, 5261, 5262, 5270, 5271, 5272];
+/// Routing table for traffic leaving through the exit interface.
+pub const EXIT_TABLE: u32 = 7444;
+/// Firewall mark on the DNS forwarder's sockets when an exit interface is set.
+pub const EXIT_MARK: u32 = 0x7444;
 /// Port of the exit node's DNS forwarder, on its tunnel address.
 pub const DNS_PORT: u16 = 41653;
 const NFT_TABLE: &str = "tailconnect-ssh-exit";
@@ -81,13 +102,17 @@ pub struct Serving {
     sysctls: Vec<(String, String)>,
     iptables: Vec<(&'static str, Vec<String>)>,
     pub dns: CancellationToken,
+    /// The exit interface, when one is set.
+    pub iface: Option<String>,
+    /// Why forwarded traffic is blocked right now (the kill switch).
+    pub iface_problem: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 const FORWARD_V4: &str = "/proc/sys/net/ipv4/ip_forward";
 const FORWARD_V6: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
 /// Turn on forwarding and NAT for traffic from `tun`.
-pub fn serve(tun: &str) -> Result<Serving> {
+pub fn serve(tun: &str, iface: Option<&str>) -> Result<Serving> {
     let mut sysctls = Vec::new();
     // Keep router advertisements working where the host relies on them:
     // forwarding on makes accept_ra=1 stop accepting them.
@@ -171,12 +196,171 @@ pub fn serve(tun: &str) -> Result<Serving> {
             }
         }
     }
-    info!("exit node: forwarding internet traffic from {tun}");
+    let dns = CancellationToken::new();
+    let iface_problem = Arc::new(std::sync::RwLock::new(None));
+    if let Some(i) = iface {
+        // Replies come back on the interface from addresses the main table
+        // routes elsewhere: loose reverse-path filtering there.
+        let rp = format!("/proc/sys/net/ipv4/conf/{i}/rp_filter");
+        if let Some(old) = read_sysctl(&rp)
+            && old != "2"
+            && write_sysctl(&rp, "2").is_ok()
+        {
+            sysctls.push((rp, old));
+        }
+        if let Err(e) = iface_rules(tun) {
+            unserve(Serving {
+                sysctls,
+                iptables,
+                dns,
+                iface: None,
+                iface_problem,
+            });
+            bail!("exit node: routing through {i}: {e}");
+        }
+        tokio::spawn(watch_iface(i.to_string(), iface_problem.clone(), dns.clone()));
+        info!("exit node: forwarding internet traffic from {tun} through {i} (blocked while {i} is down)");
+    } else {
+        info!("exit node: forwarding internet traffic from {tun}");
+    }
     Ok(Serving {
         sysctls,
         iptables,
-        dns: CancellationToken::new(),
+        dns,
+        iface: iface.map(String::from),
+        iface_problem,
     })
+}
+
+/// The policy rules sending forwarded traffic (and the DNS forwarder's) to
+/// the exit interface's table, with the kill switch's unreachable default.
+fn iface_rules(tun: &str) -> Result<()> {
+    let table = EXIT_TABLE.to_string();
+    let mark = format!("{EXIT_MARK:#x}");
+    for f in ["-4", "-6"] {
+        for p in [5260, 5261, 5262] {
+            while run(&["ip", f, "rule", "del", "pref", &p.to_string()]).is_ok() {}
+        }
+        let _ = run(&["ip", f, "route", "flush", "table", &table]);
+        let def = if f == "-4" { "0.0.0.0/0" } else { "::/0" };
+        run(&[
+            "ip",
+            f,
+            "route",
+            "replace",
+            "unreachable",
+            def,
+            "metric",
+            "4000",
+            "table",
+            &table,
+        ])?;
+        run(&[
+            "ip",
+            f,
+            "rule",
+            "add",
+            "iif",
+            tun,
+            "lookup",
+            "main",
+            "suppress_prefixlength",
+            "1",
+            "pref",
+            "5260",
+        ])?;
+        run(&["ip", f, "rule", "add", "iif", tun, "lookup", &table, "pref", "5261"])?;
+        run(&[
+            "ip", f, "rule", "add", "fwmark", &mark, "lookup", &table, "pref", "5262",
+        ])?;
+    }
+    Ok(())
+}
+
+/// Is the interface present, up and with a link? (Asked with `ip link`,
+/// which, unlike /sys, always answers for tcd's own network namespace.)
+fn iface_up(i: &str) -> bool {
+    run(&["ip", "-o", "link", "show", "dev", i]).is_ok_and(|l| link_up(&l))
+}
+
+/// From `ip -o link` output: flags include UP and LOWER_UP.
+fn link_up(line: &str) -> bool {
+    let flags = line.split('<').nth(1).and_then(|r| r.split('>').next()).unwrap_or("");
+    let f: Vec<&str> = flags.split(',').collect();
+    f.contains(&"UP") && f.contains(&"LOWER_UP")
+}
+
+/// The gateway of the interface's widest route in the main table, if any:
+/// `default via G dev i`, or OpenVPN's `0.0.0.0/1 via G dev i`.
+fn iface_gateway(f: &str, i: &str) -> Option<String> {
+    widest_gateway(&run(&["ip", f, "route", "show", "table", "main", "dev", i]).ok()?)
+}
+
+/// The gateway of the widest route with one in `ip route show` output.
+fn widest_gateway(routes: &str) -> Option<String> {
+    let mut best: Option<(u8, String)> = None;
+    for l in routes.lines() {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        let Some(pos) = w.iter().position(|x| *x == "via") else {
+            continue;
+        };
+        let Some(gw) = w.get(pos + 1) else { continue };
+        let len = match w[0] {
+            "default" => 0,
+            p => p.split('/').nth(1).and_then(|l| l.parse().ok()).unwrap_or(128),
+        };
+        if best.as_ref().is_none_or(|(b, _)| len < *b) {
+            best = Some((len, gw.to_string()));
+        }
+    }
+    best.map(|(_, g)| g)
+}
+
+/// Does the interface have a global IPv6 address?
+fn iface_has_v6(i: &str) -> bool {
+    run(&["ip", "-6", "addr", "show", "dev", i, "scope", "global"]).is_ok_and(|s| s.contains("inet6"))
+}
+
+/// Keep the default route out of the exit interface while it's up, and
+/// report when it isn't (the kill switch then blocks forwarded traffic).
+async fn watch_iface(i: String, problem: Arc<std::sync::RwLock<Option<String>>>, cancel: CancellationToken) {
+    let table = EXIT_TABLE.to_string();
+    let mut last: Option<Option<String>> = None;
+    loop {
+        let now = if iface_up(&i) {
+            for f in ["-4", "-6"] {
+                if f == "-6" && !iface_has_v6(&i) {
+                    let _ = run(&["ip", "-6", "route", "del", "default", "dev", &i, "table", &table]);
+                    continue;
+                }
+                let mut args = vec!["ip", f, "route", "replace", "default"];
+                let gw = iface_gateway(f, &i);
+                if let Some(g) = &gw {
+                    args.extend(["via", g.as_str()]);
+                }
+                args.extend(["dev", i.as_str(), "metric", "0", "table", table.as_str()]);
+                if let Err(e) = run(&args) {
+                    debug!("exit interface route: {e}");
+                }
+            }
+            None
+        } else {
+            Some(format!("{i} is down: exit traffic is blocked until it is up"))
+        };
+        if last.as_ref() != Some(&now) {
+            match &now {
+                Some(p) => warn!("exit node: {p}"),
+                None if last.is_some() => info!("exit node: {i} is up again; forwarding through it"),
+                None => {}
+            }
+            *problem.write().unwrap() = now.clone();
+            last = Some(now);
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
 }
 
 fn restore(sysctls: &[(String, String)]) {
@@ -190,6 +374,13 @@ fn restore(sysctls: &[(String, String)]) {
 /// Undo [`serve`].
 pub fn unserve(s: Serving) {
     s.dns.cancel();
+    let table = EXIT_TABLE.to_string();
+    for f in ["-4", "-6"] {
+        for p in [5260, 5261, 5262] {
+            while run(&["ip", f, "rule", "del", "pref", &p.to_string()]).is_ok() {}
+        }
+        let _ = run(&["ip", f, "route", "flush", "table", &table]);
+    }
     let _ = run(&["nft", "delete", "table", "inet", NFT_TABLE]);
     for (cmd, r) in &s.iptables {
         let mut a = vec![*cmd, "-w", "-D", "FORWARD"];
@@ -244,6 +435,7 @@ pub fn unroute() {
             }
         }
         let _ = run(&["ip", f, "route", "flush", "table", &table]);
+        let _ = run(&["ip", f, "route", "flush", "table", &EXIT_TABLE.to_string()]);
     }
 }
 
@@ -309,6 +501,7 @@ pub async fn dns_forwarder(
     upstreams: Vec<SocketAddr>,
     allowed: Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync>,
     cancel: CancellationToken,
+    mark: Option<u32>,
 ) {
     // The tunnel address may take a moment to be usable.
     let sock = loop {
@@ -344,7 +537,7 @@ pub async fn dns_forwarder(
         let (sock, ups) = (sock.clone(), upstreams.clone());
         tokio::spawn(async move {
             for up in ups {
-                if let Ok(a) = ask(up, &q).await {
+                if let Ok(a) = ask(up, &q, mark).await {
                     let _ = sock.send_to(&a, from).await;
                     return;
                 }
@@ -353,13 +546,18 @@ pub async fn dns_forwarder(
     }
 }
 
-async fn ask(up: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
+async fn ask(up: SocketAddr, q: &[u8], mark: Option<u32>) -> Result<Vec<u8>> {
     let local: SocketAddr = if up.is_ipv4() {
         "0.0.0.0:0".parse()?
     } else {
         "[::]:0".parse()?
     };
     let s = tokio::net::UdpSocket::bind(local).await?;
+    if let Some(m) = mark {
+        // Out through the exit interface (and its kill switch) too.
+        use std::os::fd::AsRawFd;
+        crate::transport::set_mark(s.as_raw_fd(), m);
+    }
     s.send_to(q, up).await?;
     let mut buf = vec![0u8; 4096];
     loop {
@@ -412,6 +610,29 @@ mod tests {
                 "ACCEPT"
             ]
         );
+    }
+
+    #[test]
+    fn link_state() {
+        assert!(link_up(
+            "5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN"
+        ));
+        assert!(!link_up(
+            "5: tun0: <POINTOPOINT,MULTICAST,NOARP> mtu 1500 qdisc noop state DOWN"
+        ));
+        assert!(!link_up(
+            "7: vpn0@if3: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 state LOWERLAYERDOWN"
+        ));
+    }
+
+    #[test]
+    fn exit_interface_gateway() {
+        let openvpn = "0.0.0.0/1 via 10.8.0.1 metric 50\n10.8.0.0/24 proto kernel scope link src 10.8.0.6\n128.0.0.0/1 via 10.8.0.1";
+        assert_eq!(widest_gateway(openvpn).as_deref(), Some("10.8.0.1"));
+        let eth = "default via 192.168.2.1 proto dhcp metric 100\n192.168.2.0/24 proto kernel scope link";
+        assert_eq!(widest_gateway(eth).as_deref(), Some("192.168.2.1"));
+        // Point-to-point (wg0, tun0 without via): straight out of the device.
+        assert_eq!(widest_gateway("10.0.0.0/24 proto kernel scope link src 10.0.0.2"), None);
     }
 
     #[test]

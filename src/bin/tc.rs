@@ -125,7 +125,13 @@ fn print_status(s: &Status) {
         }
     }
     if s.exit_serving {
-        println!("exit node: this machine forwards internet traffic for its account");
+        match &s.exit_interface {
+            Some(i) => println!("exit node: this machine forwards internet traffic for its account, through {i}"),
+            None => println!("exit node: this machine forwards internet traffic for its account"),
+        }
+        if let Some(p) = &s.exit_interface_problem {
+            println!("exit node: {p}");
+        }
     }
     match (&s.exit_in_use, &s.exit_problem) {
         (Some(e), _) => println!("exit node: internet traffic and DNS go through {e}"),

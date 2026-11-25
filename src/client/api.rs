@@ -72,6 +72,12 @@ pub struct Status {
     /// This machine forwards internet traffic for its account.
     #[serde(default)]
     pub exit_serving: bool,
+    /// The interface forwarded traffic leaves through, if one is set.
+    #[serde(default)]
+    pub exit_interface: Option<String>,
+    /// Why forwarded traffic is blocked right now (the kill switch).
+    #[serde(default)]
+    pub exit_interface_problem: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 

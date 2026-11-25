@@ -37,6 +37,11 @@ struct Cli {
     /// using it (comma-separated addresses; default: this host's own).
     #[arg(long, value_delimiter = ',')]
     exit_dns: Vec<std::net::IpAddr>,
+    /// As an exit node: send the traffic forwarded for others out through
+    /// this interface (a VPN's tun0, a second uplink), never the normal
+    /// connection: while it's down, that traffic is blocked (kill switch).
+    #[arg(long)]
+    exit_interface: Option<String>,
 }
 
 #[tokio::main]
@@ -65,6 +70,7 @@ async fn main() -> Result<()> {
             .into_iter()
             .map(|ip| std::net::SocketAddr::new(ip, 53))
             .collect(),
+        exit_interface: cli.exit_interface,
     })?;
     d.run().await
 }
