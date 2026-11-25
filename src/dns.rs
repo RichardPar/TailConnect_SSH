@@ -1,6 +1,9 @@
 //! MagicDNS: a tiny resolver answering for tailnet names, reached in-tunnel
-//! at 100.100.100.100:53. It answers A queries for `name.<domain>` and
-//! single-label `name`, from the local network map only.
+//! at 100.100.100.100:53, from the local network map only.
+//!
+//! Every machine is `name.account.<domain>`. Relative names work too:
+//! `name.account`, and plain `name` for machines of this machine's own
+//! account.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -12,28 +15,47 @@ const RCODE_REFUSED: u8 = 5;
 const RCODE_FORMERR: u8 = 1;
 const TTL: u32 = 60;
 
-/// Names this machine can resolve: short name → address.
+/// Names this machine can resolve.
 #[derive(Debug, Default, Clone)]
 pub struct Zone {
     pub domain: String,
+    /// `name.account` → address.
     pub names: HashMap<String, Ipv4Addr>,
+    /// This machine's account: its machines also resolve by bare name.
+    pub account: String,
 }
 
 impl Zone {
+    pub fn insert(&mut self, name: &str, account: &str, ip: Ipv4Addr) {
+        self.names.insert(format!("{name}.{account}"), ip);
+    }
+
+    fn get(&self, rel: &str) -> Option<Ipv4Addr> {
+        if !rel.contains('.') {
+            return self.names.get(&format!("{rel}.{}", self.account)).copied();
+        }
+        self.names.get(rel).copied()
+    }
+
     fn lookup(&self, qname: &str) -> Lookup {
         let q = qname.trim_end_matches('.').to_ascii_lowercase();
-        let short = if let Some(s) = q.strip_suffix(&format!(".{}", self.domain)) {
-            s
-        } else if q == self.domain {
+        if q == self.domain {
             return Lookup::NoData;
-        } else if !q.contains('.') {
-            q.as_str()
-        } else {
-            return Lookup::NotOurs;
-        };
-        match self.names.get(short) {
-            Some(ip) => Lookup::Found(*ip),
-            None => Lookup::NxDomain,
+        }
+        if let Some(rel) = q.strip_suffix(&format!(".{}", self.domain)) {
+            // `account.domain` itself exists (it holds machines) but has no address.
+            if !rel.contains('.') && self.names.keys().any(|k| k.ends_with(&format!(".{rel}"))) {
+                return Lookup::NoData;
+            }
+            return match rel.matches('.').count() {
+                1 => self.get(rel).map_or(Lookup::NxDomain, Lookup::Found),
+                _ => Lookup::NxDomain,
+            };
+        }
+        match self.get(&q) {
+            Some(ip) => Lookup::Found(ip),
+            None if !q.contains('.') => Lookup::NxDomain,
+            None => Lookup::NotOurs,
         }
     }
 
@@ -175,15 +197,22 @@ mod tests {
     fn zone() -> Zone {
         let mut z = Zone {
             domain: "tc.internal".into(),
+            account: "richard".into(),
             ..Default::default()
         };
-        z.names.insert("laptop".into(), Ipv4Addr::new(100, 64, 0, 2));
+        z.insert("laptop", "richard", Ipv4Addr::new(100, 64, 0, 2));
+        z.insert("nas", "alice", Ipv4Addr::new(100, 64, 0, 9));
         z
     }
 
     #[test]
-    fn answers_fqdn_and_short_name() {
-        for n in ["laptop.tc.internal", "LAPTOP.tc.internal.", "laptop"] {
+    fn answers_fqdn_and_relative_names() {
+        for n in [
+            "laptop.richard.tc.internal",
+            "LAPTOP.richard.tc.internal.",
+            "laptop",
+            "laptop.richard",
+        ] {
             let r = answer(&zone(), &query(n, TYPE_A)).unwrap();
             assert_eq!(r[3] & 0x0f, 0, "{n}");
             assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1);
@@ -192,8 +221,22 @@ mod tests {
     }
 
     #[test]
+    fn other_accounts_need_the_account() {
+        for n in ["nas.alice.tc.internal", "nas.alice"] {
+            let r = answer(&zone(), &query(n, TYPE_A)).unwrap();
+            assert_eq!(&r[r.len() - 4..], &[100, 64, 0, 9], "{n}");
+        }
+        let r = answer(&zone(), &query("nas", TYPE_A)).unwrap();
+        assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN);
+        let r = answer(&zone(), &query("alice.tc.internal", TYPE_A)).unwrap();
+        assert_eq!((r[3] & 0x0f, r[7]), (0, 0), "account name: no data");
+    }
+
+    #[test]
     fn nxdomain_and_refused() {
-        let r = answer(&zone(), &query("nope.tc.internal", TYPE_A)).unwrap();
+        let r = answer(&zone(), &query("nope.richard.tc.internal", TYPE_A)).unwrap();
+        assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN);
+        let r = answer(&zone(), &query("laptop.tc.internal", TYPE_A)).unwrap();
         assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN);
         let r = answer(&zone(), &query("example.com", TYPE_A)).unwrap();
         assert_eq!(r[3] & 0x0f, RCODE_REFUSED);

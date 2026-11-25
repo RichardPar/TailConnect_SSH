@@ -42,12 +42,31 @@ enum Cmd {
     Ip { name: Option<String> },
 }
 
+/// How a peer relates to this machine, from what it may open here.
+fn relation(me_account: &str, p: &api::PeerStatus) -> Option<String> {
+    let all = p.inbound.iter().any(|x| x == "*");
+    let ports = p.inbound.join(",");
+    if p.account == me_account {
+        return match (all, p.inbound.is_empty()) {
+            (true, _) => None,
+            (false, true) => Some("rules: can't open connections here".into()),
+            (false, false) => Some(format!("rules: can open {ports} here")),
+        };
+    }
+    Some(match (all, p.inbound.is_empty()) {
+        (true, _) => "has access to this machine".into(),
+        (false, true) => "shared with you".into(),
+        (false, false) => format!("has access to this machine on {ports}"),
+    })
+}
+
 fn print_status(s: &Status) {
     match &s.me {
         Some(me) => println!(
-            "{} {}.{} ({})  via {}  [{}]",
+            "{} {}.{}.{} ({})  via {}  [{}]",
             me.ip,
             me.name,
+            me.account,
             s.domain,
             s.tun.as_deref().unwrap_or("no tun"),
             s.server.as_deref().unwrap_or("?"),
@@ -59,16 +78,27 @@ fn print_status(s: &Status) {
             s.server.as_ref().map(|x| format!(" (server {x})")).unwrap_or_default()
         ),
     }
+    if let Some(n) = &s.notice {
+        println!("notice: {n}");
+    }
     if let Some(e) = &s.last_error {
         println!("last error: {e}");
     }
+    let me_account = s.me.as_ref().map(|m| m.account.as_str()).unwrap_or("");
     for p in &s.peers {
-        let state = match (p.online, p.path.as_str(), p.e2e) {
+        let path = match (p.online, p.path.as_str(), p.e2e) {
             (false, _, _) => "offline",
             (_, "hub", true) => "hub, e2e",
             (_, path, _) => path,
         };
-        println!("{:<15} {:<24} {}", p.ip, p.name, state);
+        let name = format!("{}.{}", p.name, p.account);
+        match relation(me_account, p) {
+            Some(r) => println!("{:<15} {:<28} {path}; {r}", p.ip, name),
+            None => println!("{:<15} {:<28} {path}", p.ip, name),
+        }
+    }
+    if s.filter_dropped > 0 {
+        println!("filter: {} packets dropped", s.filter_dropped);
     }
 }
 
@@ -102,8 +132,16 @@ async fn main() -> Result<()> {
             let ip = match name {
                 None => status.me.map(|m| m.ip),
                 Some(n) => {
-                    let short = n.strip_suffix(&format!(".{}", status.domain)).unwrap_or(&n);
-                    status.peers.iter().find(|p| p.name == short).map(|p| p.ip)
+                    // NAME (own account), NAME.ACCOUNT or NAME.ACCOUNT.DOMAIN
+                    let n = n.to_ascii_lowercase();
+                    let rel = n.strip_suffix(&format!(".{}", status.domain)).unwrap_or(&n);
+                    let mine = status.me.as_ref().map(|m| m.account.clone()).unwrap_or_default();
+                    let (name, account) = rel.split_once('.').unwrap_or((rel, mine.as_str()));
+                    status
+                        .peers
+                        .iter()
+                        .find(|p| p.name == name && p.account == account)
+                        .map(|p| p.ip)
                 }
             };
             match ip {

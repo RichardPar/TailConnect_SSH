@@ -44,10 +44,31 @@ pub struct ServerTls {
     pub config: Arc<ServerConfig>,
     /// Fingerprint of the leaf certificate, for clients that pin it.
     pub fingerprint: String,
+    /// DNS names in the leaf certificate.
+    pub names: Vec<String>,
+    /// Whether the certificate was generated here (clients must pin it).
+    pub self_signed: bool,
+}
+
+/// ALPN protocol id for browsers: the web portal shares port 443 with SSH.
+pub const ALPN_HTTP: &[u8] = b"http/1.1";
+
+impl ServerTls {
+    /// The same certificate, also offering HTTP/1.1 for the web portal. SSH
+    /// clients ask for `tc-ssh/1` and still get it; browsers don't offer it.
+    pub fn with_http(&self) -> Arc<ServerConfig> {
+        let mut c = (*self.config).clone();
+        c.alpn_protocols = vec![crate::ALPN.to_vec(), ALPN_HTTP.to_vec()];
+        Arc::new(c)
+    }
 }
 
 fn build_server(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerTls> {
-    let fingerprint = cert_fingerprint(certs.first().ok_or_else(|| anyhow!("no certificate"))?);
+    let leaf = certs.first().ok_or_else(|| anyhow!("no certificate"))?;
+    let fingerprint = cert_fingerprint(leaf);
+    let names = webpki::EndEntityCert::try_from(leaf)
+        .map(|c| c.valid_dns_names().map(|n| n.to_ascii_lowercase()).collect())
+        .unwrap_or_default();
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -57,6 +78,8 @@ fn build_server(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>
     Ok(ServerTls {
         config: Arc::new(config),
         fingerprint,
+        names,
+        self_signed: false,
     })
 }
 
@@ -80,7 +103,9 @@ pub fn server_self_signed(dir: &Path, names: Vec<String>) -> Result<ServerTls> {
         write_private(&key_path, ck.signing_key.serialize_pem().as_bytes())?;
         fs::write(&cert_path, ck.cert.pem())?;
     }
-    server_from_pem(&cert_path, &key_path)
+    let mut t = server_from_pem(&cert_path, &key_path)?;
+    t.self_signed = true;
+    Ok(t)
 }
 
 /// An ephemeral self-signed certificate, for direct peer listeners where TLS

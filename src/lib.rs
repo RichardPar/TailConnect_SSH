@@ -10,9 +10,11 @@
 //!   answers MagicDNS queries.
 //! * `tc` is the command-line front end to `tcd`.
 
+pub mod acl;
 pub mod client;
 pub mod dns;
 pub mod e2e;
+pub mod filter;
 pub mod frame;
 pub mod keys;
 pub mod packet;
@@ -24,7 +26,9 @@ pub mod transport;
 /// Protocol version spoken between `tcd` and `tc-control`.
 /// Version 2: relayed packets are end-to-end encrypted (`SEALED` frames);
 /// the hub no longer relays plaintext.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 3: accounts, sharing and access rules; peers carry `inbound`,
+/// which the receiving machine's packet filter enforces.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The tailnet address range: 100.64.0.0/10 (carrier-grade NAT space).
 pub const TAILNET_NET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 64, 0, 0);

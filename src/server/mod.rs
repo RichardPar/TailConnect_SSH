@@ -5,10 +5,18 @@
 //! path. Relayed packets are end-to-end encrypted between the machines
 //! ([`crate::e2e`]): the hub sees only the destination address, and tells the
 //! receiver which machine sent each message.
+//!
+//! Accounts, shares and access rules ([`policy`]) decide each machine's
+//! network map and what each peer may open on it. The hub relays only
+//! between machines that are in each other's maps; the receiving machine's
+//! packet filter enforces the rest.
 
+pub mod auth;
 pub mod db;
+pub mod policy;
+pub mod portal;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +39,21 @@ pub struct Options {
     pub state_dir: PathBuf,
     pub domain: String,
     pub tls: crate::tls::ServerTls,
+    /// The web portal, on the same port (by ALPN). `None`: SSH only.
+    pub portal: Option<PortalOptions>,
+    /// Addresses new machines get (within 100.64.0.0/10).
+    pub ip_pool: (u32, u32),
+}
+
+pub struct PortalOptions {
+    pub signup: portal::Signup,
+    /// Shown in join commands; empty: the host name the browser used.
+    pub public_server: String,
+    /// Extra host names the portal answers to.
+    pub hosts: Vec<String>,
+    /// Also serve the portal over plain HTTP here (for example
+    /// 127.0.0.1:7741, reached through an SSH tunnel).
+    pub plain_listen: Option<SocketAddr>,
 }
 
 /// A connected machine.
@@ -40,6 +63,9 @@ struct Session {
     tx: mpsc::Sender<Frame>,
     endpoints: Vec<SocketAddr>,
     kill: Arc<Notify>,
+    /// Addresses in this machine's current network map: the only ones the
+    /// hub relays its messages to.
+    allowed: HashSet<Ipv4Addr>,
 }
 
 pub struct Hub {
@@ -50,6 +76,15 @@ pub struct Hub {
     /// Bumped whenever any machine's view of the network may have changed.
     map_version: watch::Sender<u64>,
     next_conn: AtomicU64,
+    /// Accounts, machines, rules and shares, from one read of the database.
+    snapshot: RwLock<Arc<policy::Snapshot>>,
+}
+
+/// A machine's view of the network.
+struct MapView {
+    me: Node,
+    peers: Vec<Node>,
+    notice: Option<String>,
 }
 
 impl Hub {
@@ -57,23 +92,43 @@ impl Hub {
         self.map_version.send_modify(|v| *v += 1);
     }
 
-    fn netmap_for(&self, me: Ipv4Addr) -> Result<Vec<Node>> {
-        let nodes = self.db.lock().unwrap().nodes()?;
+    /// Reload the policy snapshot from the database.
+    fn refresh(&self) -> Result<()> {
+        let s = policy::Snapshot::load(&self.db.lock().unwrap())?;
+        *self.snapshot.write().unwrap() = Arc::new(s);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Arc<policy::Snapshot> {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    /// The network map for the machine with `key`, or `None` if it no
+    /// longer exists.
+    fn view(&self, key: &str) -> Option<MapView> {
+        let snap = self.snapshot();
+        let me = snap.by_key(key)?;
         let sessions = self.sessions.read().unwrap();
-        Ok(nodes
-            .into_iter()
-            .filter(|n| n.ip != me)
-            .map(|n| {
-                let s = sessions.get(&n.ip);
-                Node {
-                    name: n.name,
-                    ip: n.ip,
-                    key: n.key,
-                    online: s.is_some(),
-                    endpoints: s.map(|s| s.endpoints.clone()).unwrap_or_default(),
-                }
-            })
-            .collect())
+        let node = |n: &policy::SNode, inbound: Vec<String>| {
+            let s = sessions.get(&n.ip);
+            Node {
+                name: n.name.clone(),
+                account: n.account.clone(),
+                tags: n.tags.clone(),
+                ip: n.ip,
+                key: n.key.clone(),
+                online: s.is_some(),
+                endpoints: s.map(|s| s.endpoints.clone()).unwrap_or_default(),
+                inbound,
+            }
+        };
+        let (peers, notice) = match snap.peers_of(me) {
+            Some(ps) => (ps.iter().map(|p| node(p.node, p.inbound.to_wire())).collect(), None),
+            None => (vec![], Some(format!("account {} is suspended", me.account))),
+        };
+        let mut me = node(me, vec![]);
+        me.endpoints.clear();
+        Some(MapView { me, peers, notice })
     }
 
     /// Route one sealed message from the machine at `from`. The hub can't
@@ -89,6 +144,10 @@ impl Hub {
         }
         msg[..4].copy_from_slice(&from.octets());
         let sessions = self.sessions.read().unwrap();
+        // Only between machines that are in each other's network maps.
+        if !sessions.get(&from).is_some_and(|s| s.allowed.contains(&dst)) {
+            return;
+        }
         if let Some(s) = sessions.get(&dst) {
             // Drop rather than block when the receiver is slow; TCP inside
             // the tunnel will back off.
@@ -117,12 +176,13 @@ impl Hub {
                 continue;
             }
             last = v;
-            let known: std::collections::HashSet<String> = match self.db.lock().unwrap().nodes() {
-                Ok(n) => n.into_iter().map(|n| n.key).collect(),
-                Err(_) => continue,
-            };
+            if let Err(e) = self.refresh() {
+                warn!("reloading policy: {e:#}");
+                continue;
+            }
+            let snap = self.snapshot();
             for s in self.sessions.read().unwrap().values() {
-                if !known.contains(&s.key) {
+                if snap.by_key(&s.key).is_none() {
                     s.kill.notify_one();
                 }
             }
@@ -134,7 +194,8 @@ impl Hub {
 pub async fn run(opts: Options) -> Result<()> {
     std::fs::create_dir_all(&opts.state_dir)?;
     let host_key = crate::keys::load_or_create(&opts.state_dir.join("ssh_host_ed25519_key"))?;
-    let db = db::Db::open(&opts.state_dir.join("tailconnect.db"))?;
+    let mut db = db::Db::open(&opts.state_dir.join("tailconnect.db"))?;
+    db.set_pool(opts.ip_pool);
     info!("SSH host key: {}", key_id(host_key.public_key()));
     info!("TLS certificate SHA-256: {}", opts.tls.fingerprint);
 
@@ -144,33 +205,128 @@ pub async fn run(opts: Options) -> Result<()> {
         sessions: RwLock::new(HashMap::new()),
         map_version: watch::channel(0).0,
         next_conn: AtomicU64::new(1),
+        snapshot: RwLock::new(Arc::default()),
     });
+    hub.refresh()?;
     tokio::spawn(hub.clone().watch_db());
 
     let ssh = transport::server_ssh_config(host_key);
-    let tls = TlsAcceptor::from(opts.tls.config.clone());
+    let portal = match &opts.portal {
+        Some(po) => Some(start_portal(&hub, &opts, po).await?),
+        None => None,
+    };
+    let tls = TlsAcceptor::from(if portal.is_some() {
+        opts.tls.with_http()
+    } else {
+        opts.tls.config.clone()
+    });
     let listener = TcpListener::bind(opts.listen)
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
-    info!("listening on {} (SSH inside TLS)", opts.listen);
+    info!(
+        "listening on {} (SSH inside TLS{})",
+        opts.listen,
+        if portal.is_some() { ", and the web portal" } else { "" }
+    );
 
     // Any key may authenticate: unknown keys may only register, with an
     // auth key, in their Hello message.
     let policy: KeyPolicy = Arc::new(|_| true);
     loop {
         let (tcp, peer) = listener.accept().await?;
-        let (hub, tls, ssh, policy) = (hub.clone(), tls.clone(), ssh.clone(), policy.clone());
+        let (hub, tls, ssh, policy, portal) = (hub.clone(), tls.clone(), ssh.clone(), policy.clone(), portal.clone());
         tokio::spawn(async move {
-            match transport::accept(tcp, tls, ssh, policy).await {
-                Ok(conn) => {
+            tcp.set_nodelay(true).ok();
+            let tls = match tokio::time::timeout(Duration::from_secs(20), tls.accept(tcp)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return debug!("{peer}: TLS handshake: {e}"),
+                Err(_) => return debug!("{peer}: TLS handshake timed out"),
+            };
+            // tcd asks for tc-ssh/1; anything else (browsers) is the portal.
+            let is_ssh = tls.get_ref().1.alpn_protocol() == Some(crate::ALPN);
+            if !is_ssh {
+                if let Some(router) = portal {
+                    portal::serve_conn(router, tls, portal::ConnInfo { peer, tls: true }).await;
+                }
+                return;
+            }
+            let conn = tokio::time::timeout(Duration::from_secs(20), transport::accept_ssh(tls, ssh, policy)).await;
+            match conn {
+                Ok(Ok(conn)) => {
                     if let Err(e) = serve(hub, conn, peer).await {
                         info!("{peer}: {e:#}");
                     }
                 }
-                Err(e) => debug!("{peer}: {e:#}"),
+                Ok(Err(e)) => debug!("{peer}: {e:#}"),
+                Err(_) => debug!("{peer}: SSH handshake timed out"),
             }
         });
     }
+}
+
+/// Set up the web portal; returns its router. It has its own database
+/// connection, so the hub notices its changes like the CLI's.
+async fn start_portal(hub: &Arc<Hub>, opts: &Options, po: &PortalOptions) -> Result<axum::Router> {
+    let db = db::Db::open(&opts.state_dir.join("tailconnect.db"))?;
+    let mut hosts: Vec<String> = po.hosts.iter().map(|h| h.trim().to_ascii_lowercase()).collect();
+    hosts.extend(opts.tls.names.iter().cloned());
+    if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        hosts.push(h.trim().to_ascii_lowercase());
+    }
+    if !po.public_server.is_empty() {
+        let (h, _) = crate::client::parse_server(&po.public_server)?;
+        hosts.push(h.to_ascii_lowercase());
+    }
+    hosts.retain(|h| !h.is_empty());
+    hosts.sort();
+    hosts.dedup();
+    let operators = db
+        .accounts()?
+        .iter()
+        .filter(|a| a.role == db::Role::Operator && a.has_password)
+        .count();
+    if operators == 0 {
+        warn!(
+            "portal: no operator can sign in yet: create one with `tc-control accounts create NAME --operator --password`, or use `tc-control admin-token`"
+        );
+    }
+    let cfg = portal::Config {
+        signup: po.signup,
+        domain: opts.domain.clone(),
+        public_server: po.public_server.clone(),
+        tls_fingerprint: opts.tls.self_signed.then(|| opts.tls.fingerprint.clone()),
+        hosts,
+    };
+    info!(
+        "portal: sign-up {}; answers to IP addresses, localhost and {}",
+        po.signup.as_str(),
+        if cfg.hosts.is_empty() {
+            "no other names".into()
+        } else {
+            cfg.hosts.join(", ")
+        }
+    );
+    let h = hub.clone();
+    let online: portal::OnlineFn = Arc::new(move || h.sessions.read().unwrap().keys().copied().collect());
+    let router = portal::router(portal::Portal::new(cfg, db, online));
+    if let Some(addr) = po.plain_listen {
+        let l = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("portal: listening on {addr}"))?;
+        if !addr.ip().is_loopback() {
+            warn!("portal: plain HTTP on {addr}: passwords cross the network unencrypted");
+        }
+        info!("portal: also plain HTTP on {addr}");
+        let r = router.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, peer)) = l.accept().await else { continue };
+                let r = r.clone();
+                tokio::spawn(portal::serve_conn(r, tcp, portal::ConnInfo { peer, tls: false }));
+            }
+        });
+    }
+    Ok(router)
 }
 
 async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> {
@@ -221,7 +377,8 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
             let r = hub.db.lock().unwrap().register(&key, &hostname, &ak);
             match r {
                 Ok(n) => {
-                    info!("registered {} ({}) at {} from {peer}", n.name, n.ip, key);
+                    info!("registered {}.{} ({}) at {} from {peer}", n.name, n.account, n.ip, key);
+                    hub.refresh()?;
                     n
                 }
                 Err(e) => {
@@ -263,24 +420,16 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
                 tx: tx.clone(),
                 endpoints: with_observed(endpoints, observed, listen_port),
                 kill: kill.clone(),
+                allowed: HashSet::new(),
             },
         );
     }
-    info!("{} ({ip}) online from {peer}", node.name);
+    let label = format!("{}.{}", node.name, node.account);
+    info!("{label} ({ip}) online from {peer}");
 
-    let welcome = ServerMsg::Welcome {
-        node: Node {
-            name: node.name.clone(),
-            ip,
-            key: key.clone(),
-            online: true,
-            endpoints: vec![],
-        },
-        domain: hub.domain.clone(),
-        prefix_len: crate::TAILNET_PREFIX,
-    };
-    let _ = tx.send(Frame::control(&welcome)).await;
     let mut version = hub.map_version.subscribe();
+    // The first map goes out from the loop below, triggered by this bump.
+    version.mark_changed();
     hub.bump();
 
     // Reader: route packets inline, pass control messages to the loop.
@@ -310,7 +459,7 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
         }
     });
 
-    let mut last_name = node.name.clone();
+    let mut last_me: Option<Node> = None;
     loop {
         tokio::select! {
             _ = &mut reader => break,
@@ -318,23 +467,28 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
             r = version.changed() => {
                 if r.is_err() { break; }
                 version.borrow_and_update();
-                // Renamed or removed?
-                let row = hub.db.lock().unwrap().node_by_key(&key);
-                match row {
-                    Ok(None) => break,
-                    Ok(Some(n)) if n.name != last_name => {
-                        last_name = n.name.clone();
-                        let w = ServerMsg::Welcome {
-                            node: Node { name: n.name, ip, key: key.clone(), online: true, endpoints: vec![] },
-                            domain: hub.domain.clone(),
-                            prefix_len: crate::TAILNET_PREFIX,
-                        };
-                        let _ = tx.send(Frame::control(&w)).await;
+                // Removed?
+                let Some(view) = hub.view(&key) else { break };
+                // First map, or renamed: (re)introduce the machine to itself.
+                if last_me.as_ref() != Some(&view.me) {
+                    last_me = Some(view.me.clone());
+                    let w = ServerMsg::Welcome {
+                        node: view.me,
+                        domain: hub.domain.clone(),
+                        prefix_len: crate::TAILNET_PREFIX,
+                    };
+                    if tx.send(Frame::control(&w)).await.is_err() {
+                        break;
                     }
-                    _ => {}
                 }
-                let Ok(peers) = hub.netmap_for(ip) else { continue };
-                if tx.send(Frame::control(&ServerMsg::NetMap { peers })).await.is_err() {
+                let allowed: HashSet<Ipv4Addr> = view.peers.iter().map(|p| p.ip).collect();
+                if let Some(s) = hub.sessions.write().unwrap().get_mut(&ip)
+                    && s.conn_id == conn_id
+                {
+                    s.allowed = allowed;
+                }
+                let m = ServerMsg::NetMap { peers: view.peers, notice: view.notice };
+                if tx.send(Frame::control(&m)).await.is_err() {
                     break;
                 }
             }
@@ -362,7 +516,7 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
     drop(tx);
     writer.abort();
     close().await;
-    info!("{last_name} ({ip}) offline");
+    info!("{label} ({ip}) offline");
     Ok(())
 }
 

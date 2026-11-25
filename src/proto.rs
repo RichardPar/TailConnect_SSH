@@ -8,8 +8,13 @@ use serde::{Deserialize, Serialize};
 /// A machine on the network, as the hub describes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Node {
-    /// Short name, unique on the server (`laptop`).
+    /// Short name, unique within its account (`laptop`).
     pub name: String,
+    /// The account (network) the machine belongs to.
+    #[serde(default)]
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Tailnet address.
     pub ip: Ipv4Addr,
     /// SSH public key in OpenSSH form (`ssh-ed25519 AAAA...`). For direct
@@ -21,6 +26,12 @@ pub struct Node {
     /// Addresses where the machine accepts direct SSH sessions.
     #[serde(default)]
     pub endpoints: Vec<SocketAddr>,
+    /// What this peer may open on the receiving machine, as a port spec
+    /// list (see [`crate::acl::Access::to_wire`]): `["*"]` for everything,
+    /// empty for replies only. A missing field means replies only, so the
+    /// receiver's packet filter fails closed.
+    #[serde(default)]
+    pub inbound: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +70,17 @@ pub enum ServerMsg {
         prefix_len: u8,
     },
     /// The full list of peers. Sent after `Welcome` and whenever it changes.
-    NetMap { peers: Vec<Node> },
+    NetMap {
+        peers: Vec<Node>,
+        /// Why the map is empty or limited (for example a suspended account).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
     /// Fatal error; the hub closes the session after sending it.
     Error { message: String },
 }
 
-/// Fully qualified MagicDNS name.
-pub fn fqdn(name: &str, domain: &str) -> String {
-    format!("{name}.{domain}")
+/// Fully qualified MagicDNS name: `name.account.domain`.
+pub fn fqdn(name: &str, account: &str, domain: &str) -> String {
+    format!("{name}.{account}.{domain}")
 }

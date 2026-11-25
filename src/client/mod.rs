@@ -93,19 +93,22 @@ struct Net {
     domain: String,
     peers: HashMap<Ipv4Addr, PeerState>,
     zone: Zone,
+    /// From the hub, when the map is empty or limited (suspended account).
+    notice: Option<String>,
 }
 
 impl Net {
     fn rebuild_zone(&mut self) {
         let mut z = Zone {
             domain: self.domain.clone(),
-            names: HashMap::new(),
+            account: self.me.as_ref().map(|m| m.account.clone()).unwrap_or_default(),
+            ..Default::default()
         };
         for p in self.peers.values() {
-            z.names.insert(p.node.name.clone(), p.node.ip);
+            z.insert(&p.node.name, &p.node.account, p.node.ip);
         }
         if let Some(me) = &self.me {
-            z.names.insert(me.name.clone(), me.ip);
+            z.insert(&me.name, &me.account, me.ip);
         }
         self.zone = z;
     }
@@ -132,6 +135,9 @@ pub struct Daemon {
     map_changed: Notify,
     /// End-to-end encryption for packets relayed by the hub.
     e2e: crate::e2e::E2e,
+    /// What each peer may open on this machine; enforced on every packet
+    /// that arrives.
+    filter: Mutex<crate::filter::Filter>,
     next_link: AtomicU64,
 }
 
@@ -162,6 +168,7 @@ impl Daemon {
             map_changed: Notify::new(),
             next_link: AtomicU64::new(1),
             e2e,
+            filter: Mutex::new(Default::default()),
         }))
     }
 
@@ -224,6 +231,7 @@ impl Daemon {
         }
         *self.tun_tx.write().unwrap() = None;
         *self.hub_tx.write().unwrap() = None;
+        self.filter.lock().unwrap().set_peers([]);
         *self.net.write().unwrap() = Net::default();
         self.e2e.sync(&[]);
         self.set_phase(phase);
@@ -423,7 +431,7 @@ impl Daemon {
                     domain,
                     prefix_len,
                 } => {
-                    info!("joined as {} ({}) in {domain}", node.name, node.ip);
+                    info!("joined as {}.{} ({}) in {domain}", node.name, node.account, node.ip);
                     *auth_key = None;
                     {
                         let mut net = self.net.write().unwrap();
@@ -431,7 +439,7 @@ impl Daemon {
                         net.domain = domain.clone();
                         net.rebuild_zone();
                     }
-                    if let Err(e) = self.ensure_tun(node.ip, prefix_len, &domain) {
+                    if let Err(e) = self.ensure_tun(node.ip, prefix_len, &domain, &node.account) {
                         break Err(HubError::Fatal(format!("creating TUN device: {e:#}")));
                     }
                     if !running {
@@ -453,7 +461,12 @@ impl Daemon {
                         }
                     }
                 }
-                ServerMsg::NetMap { peers } => self.apply_netmap(peers),
+                ServerMsg::NetMap { peers, notice } => {
+                    if let Some(n) = &notice {
+                        warn!("hub: {n}");
+                    }
+                    self.apply_netmap(peers, notice)
+                }
                 ServerMsg::Error { message } => break Err(HubError::Fatal(format!("server: {message}"))),
             }
         };
@@ -461,8 +474,16 @@ impl Daemon {
         result
     }
 
-    fn apply_netmap(&self, peers: Vec<Node>) {
+    fn apply_netmap(&self, peers: Vec<Node>, notice: Option<String>) {
+        // The filter first: it denies peers it doesn't know, so a peer that is
+        // added is restricted before it's reachable, and one that is removed
+        // is cut off at once.
+        self.filter
+            .lock()
+            .unwrap()
+            .set_peers(peers.iter().map(|n| (n.ip, crate::acl::Access::from_wire(&n.inbound))));
         let mut net = self.net.write().unwrap();
+        net.notice = notice;
         let mut old = std::mem::take(&mut net.peers);
         for n in peers {
             let (direct, last_attempt) = match old.remove(&n.ip) {
@@ -499,7 +520,7 @@ impl Daemon {
     }
 
     /// Create the TUN device, or recreate it if our address changed.
-    fn ensure_tun(self: &Arc<Self>, ip: Ipv4Addr, prefix_len: u8, domain: &str) -> Result<()> {
+    fn ensure_tun(self: &Arc<Self>, ip: Ipv4Addr, prefix_len: u8, domain: &str, account: &str) -> Result<()> {
         let mut tun = self.tun.lock().unwrap();
         if tun.as_ref().is_some_and(|t| t.ip == ip) {
             return Ok(());
@@ -556,7 +577,7 @@ impl Daemon {
         *tun = Some(Tun { ip, cancel });
         drop(tun);
         if self.opts.dns {
-            configure_dns(&self.opts.tun_name, domain);
+            configure_dns(&self.opts.tun_name, domain, account);
         }
         Ok(())
     }
@@ -580,6 +601,7 @@ impl Daemon {
         if !known {
             return;
         }
+        self.filter.lock().unwrap().outbound(&pkt, Instant::now());
         let pkt = match direct {
             Some(tx) => match tx.try_send(Frame::packet(pkt)) {
                 Ok(()) => return,
@@ -634,6 +656,9 @@ impl Daemon {
                 return;
             }
         }
+        if !self.filter.lock().unwrap().inbound(&pkt, Instant::now()) {
+            return;
+        }
         let tun = self.tun_tx.read().unwrap().clone();
         if let Some(tx) = tun {
             let _ = tx.try_send(pkt);
@@ -678,6 +703,9 @@ impl Daemon {
             .values()
             .map(|p| api::PeerStatus {
                 name: p.node.name.clone(),
+                account: p.node.account.clone(),
+                tags: p.node.tags.clone(),
+                inbound: crate::acl::Access::from_wire(&p.node.inbound).to_wire(),
                 ip: p.node.ip,
                 online: p.node.online,
                 path: if p.direct.is_some() {
@@ -700,6 +728,8 @@ impl Daemon {
             tun: self.tun.lock().unwrap().as_ref().map(|_| self.opts.tun_name.clone()),
             direct_port: self.opts.direct_port,
             last_error: self.last_error.read().unwrap().clone(),
+            notice: net.notice.clone(),
+            filter_dropped: self.filter.lock().unwrap().dropped(),
             peers,
         }
     }
@@ -761,15 +791,19 @@ fn local_endpoints(port: u16) -> Vec<SocketAddr> {
 }
 
 /// Point systemd-resolved at the in-tunnel resolver for our domain.
-fn configure_dns(tun: &str, domain: &str) {
+/// Our own account's names are searched (`laptop` → `laptop.richard.tc.internal`);
+/// the whole domain is routed here.
+fn configure_dns(tun: &str, domain: &str, account: &str) {
     let tun = tun.to_string();
+    let search = format!("{account}.{domain}");
+    let route = format!("~{domain}");
     let domain = domain.to_string();
     tokio::task::spawn_blocking(move || {
         let run = |args: &[&str]| std::process::Command::new("resolvectl").args(args).output();
         let dns = crate::MAGIC_DNS_IP.to_string();
         match run(&["dns", &tun, &dns]) {
             Ok(o) if o.status.success() => {
-                let _ = run(&["domain", &tun, &domain]);
+                let _ = run(&["domain", &tun, &search, &route]);
                 info!("MagicDNS: *.{domain} via {dns} on {tun}");
             }
             Ok(o) => warn!(

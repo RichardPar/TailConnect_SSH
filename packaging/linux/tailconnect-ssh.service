@@ -1,0 +1,18 @@
+[Unit]
+Description=TailConnect-SSH machine daemon
+Documentation=file:///opt/tailconnect-ssh/README.md
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/default/tailconnect-ssh
+ExecStart=/opt/tailconnect-ssh/bin/tcd $TCD_ARGS
+StateDirectory=tailconnect-ssh
+StateDirectoryMode=0700
+RuntimeDirectory=tailconnect-ssh
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

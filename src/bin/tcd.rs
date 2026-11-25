@@ -13,13 +13,14 @@ use tailconnect::client::{Daemon, Options, api::DEFAULT_SOCKET};
     about = "TailConnect daemon: TUN device, SSH-over-TLS tunnels and MagicDNS"
 )]
 struct Cli {
-    #[arg(long, env = "TC_STATE_DIR", default_value = "/var/lib/tailconnect")]
+    #[arg(long, env = "TC_STATE_DIR", default_value = "/var/lib/tailconnect-ssh")]
     state_dir: PathBuf,
     /// Local API socket for `tc`.
     #[arg(long, env = "TC_SOCKET", default_value = DEFAULT_SOCKET)]
     socket: PathBuf,
     /// Name of the TUN interface.
-    #[arg(long, default_value = "tc0")]
+    /// (`tcs0`, so it can run beside the WireGuard TailConnect's `tc0`.)
+    #[arg(long, default_value = "tcs0")]
     tun: String,
     #[arg(long, default_value_t = tailconnect::DEFAULT_MTU)]
     mtu: u16,

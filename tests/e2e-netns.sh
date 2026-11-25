@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # End-to-end test without root: runs in unprivileged user + network namespaces.
 #
-#   ns A: tc-control on :443, machine "alpha"
-#   ns B: machine "bravo", reaching the hub over a veth pair (10.99.0.0/24)
+#   ns A: tc-control on :443, machine "alpha" (account richard)
+#   ns B: machine "bravo" (richard), reaching the hub over veth 10.99.0.0/24
+#   ns C: machine "charlie" (alice), reaching the hub over veth 10.98.0.0/24
 #
-# Checks: join with an auth key, refusal of bad keys and TLS pins, ping and
-# TCP both ways over the hub with end-to-end encryption, MagicDNS, direct SSH sessions between the
-# machines after a restart, and removal of a machine by the operator.
+# Each machine needs its own namespace: two TUN devices in one namespace
+# would both route 100.64.0.0/10, and traffic would leave through either.
 #
-# Usage: tests/e2e-netns.sh   (after `cargo build`)
+# Checks: joining, refusal of bad keys and TLS pins, ping/TCP/MagicDNS over
+# the hub with end-to-end encryption, account isolation, a one-way share
+# limited to some ports, access rules, suspending an account, direct SSH
+# paths (with the packet filter still enforced on them), removal, and the web
+# portal on the same port: sign-in, keys, tags, host and origin checks,
+# sign-up with approval.
+#
+# Usage: tests/e2e-netns.sh   (after `cargo build`; BIN=target/release to test that)
 set -euo pipefail
 
 if [[ "${TC_E2E_INNER:-}" != 1 ]]; then
@@ -24,6 +31,8 @@ cleanup() {
     sleep 0.5
     for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
     pkill -9 -P $$ 2>/dev/null || true
+    # Anything else started for this run has $W on its command line.
+    pkill -9 -f -- "$W" 2>/dev/null || true
     if [[ "${KEEP:-}" != 1 ]]; then rm -rf "$W"; else echo "logs in $W"; fi
 }
 trap cleanup EXIT
@@ -57,96 +66,231 @@ inB ip link set lo up
 inB ip addr add 10.99.0.2/24 dev vB
 inB ip link set vB up
 
-# Hub.
-export TC_STATE_DIR="$W/hub"
-"$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test >"$W/hub.log" 2>&1 &
+unshare -n --fork --kill-child sleep infinity &
+CPID=$!
+PIDS+=("$CPID")
+sleep 0.3
+inC() { nsenter -n -t "$CPID" "$@"; }
+ip link add vA2 type veth peer name vC netns "$CPID"
+ip addr add 10.98.0.1/24 dev vA2
+ip link set vA2 up
+inC ip link set lo up
+inC ip addr add 10.98.0.2/24 dev vC
+inC ip link set vC up
+
+# Hub, with two accounts.
+ctl() { TC_STATE_DIR="$W/hub" "$BIN/tc-control" "$@"; }
+TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test >"$W/hub.log" 2>&1 &
 PIDS+=("$!")
 wait_for 40 grep -q "listening on" "$W/hub.log" || fail "hub did not start"
-FP=$("$BIN/tc-control" fingerprint | awk '/TLS fingerprint/ {print $3}')
-KEY=$("$BIN/tc-control" authkey create --reusable)
-unset TC_STATE_DIR
-pass "hub up, TLS fingerprint $FP"
+FP=$(ctl fingerprint | awk '/TLS fingerprint/ {print $3}')
+PW="correct horse battery staple"
+echo "$PW" | ctl accounts create richard --operator --password >/dev/null
+ctl accounts create alice >/dev/null
+KR=$(ctl authkey create --account richard --reusable)
+pass "hub up, accounts richard (operator) and alice"
 
-start_tcd() { # name ns direct_port
-    local name=$1 ns=$2 port=$3
+# ---- Web portal on the same port ----
+JAR="$W/cookies"
+curl_() { curl -sk --max-time 5 "$@"; }
+apic() { # METHOD PATH [JSON]
+    if [[ $# -ge 3 ]]; then
+        curl_ -b "$JAR" -c "$JAR" -X "$1" -H 'Content-Type: application/json' -d "$3" "https://127.0.0.1$2"
+    else
+        curl_ -b "$JAR" -c "$JAR" -X "$1" "https://127.0.0.1$2"
+    fi
+}
+curl_ https://127.0.0.1/ | grep -q "<title>TailConnect</title>" || fail "portal page not served on :443"
+[[ $(curl_ -o /dev/null -w '%{http_version}' https://127.0.0.1/) == 1.1 ]] || fail "portal not on HTTP/1.1"
+[[ $(curl_ -o /dev/null -w '%{http_code}' -H 'Host: evil.example' https://127.0.0.1/) == 421 ]] || fail "unknown host name accepted"
+apic POST /api/login '{"name":"richard","password":"wrong password!"}' | grep -q "wrong name or password" || fail "wrong password accepted"
+apic POST /api/login "{\"name\":\"richard\",\"password\":\"$PW\"}" | grep -q '"ok":true' || fail "portal sign-in"
+apic GET /api/me | grep -q '"operator":true' || fail "portal /me"
+[[ $(curl_ -b "$JAR" -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Origin: https://evil.example' \
+    -d '{"expires_hours":1}' https://127.0.0.1/api/keys) == 403 ]] || fail "cross-site write accepted"
+KA=$(apic POST /api/keys '{"account":"alice","expires_hours":1}' | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+[[ $KA == tckey-* ]] || fail "portal didn't create a key for alice"
+R=$(curl_ -X POST -H 'Content-Type: application/json' -d "{\"name\":\"mallory\",\"password\":\"$PW\"}" https://127.0.0.1/api/signup)
+[[ $R == *pending* ]] || fail "sign-up should wait for approval: $R"
+ctl accounts list | grep -q "mallory.*pending" || fail "pending account not in the database"
+pass "portal on :443 beside SSH: sign-in, key for alice, host/origin checks, sign-up pending approval"
+
+NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=B
+start_tcd() { # name direct_port
+    local name=$1 port=$2 ns_var="NS_$1"
     local cmd=("$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
         --hostname "$name" --direct-port "$port" --no-dns)
-    if [[ $ns == B ]]; then inB "${cmd[@]}" >>"$W/$name.log" 2>&1 & else "${cmd[@]}" >>"$W/$name.log" 2>&1 & fi
+    # Not through a shell function: $! must be the process itself (nsenter
+    # execs into tcd), or cleanup would leave it running.
+    local pre
+    pre=$(ns_prefix "${!ns_var}")
+    $pre "${cmd[@]}" >>"$W/$name.log" 2>&1 &
     PIDS+=("$!")
     wait_for 20 test -S "$name.sock" || fail "tcd $name did not start"
 }
+stop_tcd() {
+    tc_ "$1" down >/dev/null || true
+    pkill -f "tcd --state-dir $W/$1 " || true
+    sleep 0.3
+    rm -f "$1.sock"
+}
 tc_() { local name=$1; shift; "$BIN/tc" --socket "$name.sock" "$@"; }
-
-# Phase 1: hub only.
-start_tcd alpha A 0
-start_tcd bravo B 0
-tc_ alpha up --server 127.0.0.1:443 --tls-fingerprint "$FP" --authkey "$KEY" || fail "alpha up"
-tc_ bravo up --server 10.99.0.1 --tls-fingerprint "$FP" --authkey "$KEY" || fail "bravo up"
-A_IP=$(tc_ alpha ip)
-B_IP=$(tc_ bravo ip)
-pass "joined: alpha=$A_IP bravo=$B_IP"
-
-# Bad auth key and a wrong pin are refused.
-start_tcd charlie B 0
-if tc_ charlie up --server 10.99.0.1 --tls-fingerprint "$FP" --authkey tckey-wrong 2>"$W/err"; then fail "bad auth key accepted"; fi
-grep -q "invalid auth key" "$W/err" || fail "unexpected error: $(cat "$W/err")"
-if tc_ charlie up --server 10.99.0.1 --tls-fingerprint "$(printf '0%.0s' {1..64})" --authkey "$KEY" 2>"$W/err"; then fail "wrong TLS pin accepted"; fi
-pass "bad auth key and wrong TLS fingerprint refused"
-
-wait_for 20 sh -c "'$BIN/tc' --socket alpha.sock status | grep -q 'bravo.*hub'" || fail "alpha doesn't see bravo"
-ping -c 3 -W 2 "$B_IP" >/dev/null || fail "ping alpha -> bravo over hub"
-inB ping -c 3 -W 2 "$A_IP" >/dev/null || fail "ping bravo -> alpha over hub"
-pass "ping both ways through the hub"
-tc_ alpha status | grep -q 'bravo.*hub, e2e' || fail "alpha has no end-to-end session with bravo"
-tc_ bravo status | grep -q 'alpha.*hub, e2e' || fail "bravo has no end-to-end session with alpha"
-pass "relayed traffic is end-to-end encrypted (Noise IK sessions up both ways)"
-
-ANS=$(dig +short +time=2 +tries=2 @100.100.100.100 bravo.tc.internal A)
-[[ "$ANS" == "$B_IP" ]] || fail "MagicDNS bravo.tc.internal -> '$ANS'"
-ANS=$(inB dig +short +time=2 +tries=2 @100.100.100.100 alpha A)
-[[ "$ANS" == "$A_IP" ]] || fail "MagicDNS alpha -> '$ANS'"
-pass "MagicDNS resolves FQDN and short names"
-
-# TCP over the tunnel.
-inB python3 -c "
+ns_prefix() { # A|B|C -> command prefix entering that namespace
+    case $1 in
+        B) echo "nsenter -n -t $BPID" ;;
+        C) echo "nsenter -n -t $CPID" ;;
+        *) echo "" ;;
+    esac
+}
+on() { # machine cmd...  (run in that machine's namespace)
+    local ns_var="NS_$1" pre; shift
+    pre=$(ns_prefix "${!ns_var}")
+    $pre "$@"
+}
+status_has() { tc_ "$1" status | grep -q -- "$2"; }
+wait_status() { # machine regex message
+    wait_for 20 status_has "$1" "$2" || { tc_ "$1" status; fail "$3"; }
+}
+wait_status_not() {
+    wait_for 20 sh -c "! '$BIN/tc' --socket '$1.sock' status | grep -q -- '$2'" || { tc_ "$1" status; fail "$3"; }
+}
+can_ping() { on "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1 || on "$1" ping -c 2 -W 1 "$2" >/dev/null 2>&1; }
+cant_ping() { ! on "$1" ping -c 2 -W 1 "$2" >/dev/null 2>&1; }
+# A TCP server on machine $1, address $2, port $3, answering "ok" to every connection.
+serve_tcp() {
+    local ns_var="NS_$1" pre
+    pre=$(ns_prefix "${!ns_var}")
+    $pre python3 -c "
 import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('$B_IP', 9000)); s.listen(1); c,_=s.accept(); n=0
+s.bind(('$2', $3)); s.listen(8)
 while True:
-    d=c.recv(65536)
-    if not d: break
-    n+=len(d)
-c.sendall(str(n).encode()); c.close()" &
-sleep 0.5
-GOT=$(python3 -c "
-import socket,time; s=socket.create_connection(('$B_IP', 9000)); t=time.time()
-b=b'x'*65536
-for _ in range(160): s.sendall(b)
-s.shutdown(socket.SHUT_WR); print(s.recv(100).decode(), round(10/(time.time()-t),1))")
-[[ "${GOT%% *}" == $((160 * 65536)) ]] || fail "TCP transfer got '$GOT'"
-pass "10 MiB TCP transfer over hub (${GOT##* } MiB/s)"
+    c,_=s.accept(); c.sendall(b'ok'); c.close()
+# $W" &
+    PIDS+=("$!")
+}
+can_tcp() { # from-machine ip port
+    on "$1" python3 -c "
+import socket,sys; s=socket.create_connection(('$2', $3), timeout=3); sys.exit(0 if s.recv(2)==b'ok' else 1)" 2>/dev/null
+}
 
-# Phase 2: restart with direct sessions enabled.
-for n in alpha bravo; do tc_ "$n" down >/dev/null; done
-pkill -f "tcd --state-dir $W/alpha" || true
-pkill -f "tcd --state-dir $W/bravo" || true
-sleep 0.5
-rm -f alpha.sock bravo.sock
-start_tcd alpha A 7443
-start_tcd bravo B 7443
-tc_ alpha up >/dev/null || fail "alpha up (rejoin)"
-tc_ bravo up >/dev/null || fail "bravo up (rejoin)"
-[[ "$(tc_ alpha ip)" == "$A_IP" ]] || fail "alpha changed address on rejoin"
-wait_for 60 sh -c "'$BIN/tc' --socket alpha.sock status | grep -q 'bravo.*direct'" || fail "no direct path alpha->bravo"
-wait_for 20 sh -c "'$BIN/tc' --socket bravo.sock status | grep -q 'alpha.*direct'" || fail "no direct path bravo->alpha"
-ping -c 3 -W 2 "$B_IP" >/dev/null || fail "ping alpha -> bravo direct"
-inB ping -c 3 -W 2 "$A_IP" >/dev/null || fail "ping bravo -> alpha direct"
-pass "direct SSH path both ways, ping works"
+# ---- Joining ----
+start_tcd alpha 0
+start_tcd bravo 0
+start_tcd charlie 0
+start_tcd delta 0
+tc_ alpha up --server 127.0.0.1:443 --tls-fingerprint "$FP" --authkey "$KR" >/dev/null || fail "alpha up"
+tc_ bravo up --server 10.99.0.1 --tls-fingerprint "$FP" --authkey "$KR" >/dev/null || fail "bravo up"
+tc_ charlie up --server 10.98.0.1 --tls-fingerprint "$FP" --authkey "$KA" >/dev/null || fail "charlie up"
+A=$(tc_ alpha ip); B=$(tc_ bravo ip); C=$(tc_ charlie ip)
+pass "joined: alpha=$A bravo=$B (richard), charlie=$C (alice, with the portal's key)"
+ONLINE=$(apic GET /api/machines | python3 -c "import json,sys; print(sorted(m['name']+'.'+m['account'] for m in json.load(sys.stdin) if m['online']))")
+[[ $ONLINE == "['alpha.richard', 'bravo.richard', 'charlie.alice']" ]] || fail "portal's online machines: $ONLINE"
 
-# Remove a machine from the hub: it is cut off.
-TC_STATE_DIR="$W/hub" "$BIN/tc-control" nodes remove bravo >/dev/null
-wait_for 20 sh -c "'$BIN/tc' --socket alpha.sock status | grep -qv bravo && ! '$BIN/tc' --socket alpha.sock status | grep -q bravo" || fail "bravo still in alpha's map"
-if ping -c 2 -W 1 "$B_IP" >/dev/null 2>&1; then fail "removed machine still reachable"; fi
-wait_for 20 sh -c "'$BIN/tc' --socket bravo.sock status | grep -q needs-login" || fail "bravo not logged out"
+if tc_ delta up --server 10.99.0.1 --tls-fingerprint "$FP" --authkey "$KA" 2>"$W/err"; then fail "used single-use key accepted"; fi
+grep -q "already been used" "$W/err" || fail "unexpected error: $(cat "$W/err")"
+if tc_ delta up --server 10.99.0.1 --tls-fingerprint "$(printf '0%.0s' {1..64})" --authkey "$KR" 2>"$W/err"; then fail "wrong TLS pin accepted"; fi
+stop_tcd delta
+pass "used single-use key and wrong TLS fingerprint refused"
+
+# ---- Hub path, E2E, DNS ----
+wait_status alpha "bravo.richard.*hub" "alpha doesn't see bravo"
+can_ping alpha "$B" || fail "ping alpha -> bravo over hub"
+can_ping bravo "$A" || fail "ping bravo -> alpha over hub"
+wait_status alpha "bravo.richard.*hub, e2e" "no e2e session alpha -> bravo"
+wait_status bravo "alpha.richard.*hub, e2e" "no e2e session bravo -> alpha"
+pass "ping both ways through the hub, end-to-end encrypted"
+
+for q in bravo.richard.tc.internal bravo bravo.richard; do
+    ANS=$(dig +short +time=2 +tries=2 @100.100.100.100 "$q" A)
+    [[ "$ANS" == "$B" ]] || fail "MagicDNS $q -> '$ANS'"
+done
+pass "MagicDNS: bravo.richard.tc.internal, bravo.richard, bravo"
+
+serve_tcp bravo "$B" 9000
+sleep 0.5
+can_tcp alpha "$B" 9000 || fail "TCP alpha -> bravo"
+pass "TCP over the hub"
+
+# ---- Isolation ----
+status_has alpha charlie && fail "alpha sees charlie (another account)"
+[[ $(tc_ charlie status | grep -c 100.64) == 1 ]] || { tc_ charlie status; fail "charlie sees other accounts' machines"; }
+cant_ping charlie "$A" || fail "charlie reached alpha without a share"
+cant_ping alpha "$C" || fail "alpha reached charlie"
+ANS=$(on charlie dig +short +time=2 +tries=1 @100.100.100.100 alpha.richard.tc.internal A)
+[[ -z "$ANS" ]] || fail "charlie resolves alpha.richard before any share"
+pass "accounts are isolated (maps, DNS, traffic)"
+
+# ---- One-way share, limited ports ----
+serve_tcp alpha "$A" 9000
+serve_tcp alpha "$A" 9001
+SID=$(ctl shares create alpha.richard alice icmp,tcp:9000 | grep -o 'share [0-9]*' | awk '{print $2}')
+sleep 2
+status_has charlie alpha && fail "pending share already in effect"
+ctl shares accept "$SID" >/dev/null
+wait_status charlie "alpha.richard.*shared with you" "share not visible to charlie"
+wait_status alpha "charlie.alice.*has access to this machine on tcp:9000,icmp" "share not visible on alpha"
+can_ping charlie "$A" || fail "charlie can't ping shared alpha"
+can_tcp charlie "$A" 9000 || fail "charlie can't reach shared port 9000"
+can_tcp charlie "$A" 9001 && fail "charlie reached unshared port 9001"
+cant_ping alpha "$C" || fail "shared alpha opened a connection to charlie"
+status_has bravo charlie && fail "bravo (not shared) sees charlie"
+ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 alpha.richard A)
+[[ "$ANS" == "$A" ]] || fail "charlie resolves alpha.richard -> '$ANS'"
+wait_status charlie "filter: [0-9]* packets dropped" "charlie's filter didn't count alpha's pings"
+pass "share: charlie -> alpha on icmp,tcp:9000 only; alpha can't open connections back; bravo not exposed"
+
+ctl shares ports "$SID" tcp:9001 >/dev/null
+wait_status alpha "charlie.alice.*on tcp:9001" "share ports not updated"
+can_tcp charlie "$A" 9001 || fail "new share port 9001 not reachable"
+can_tcp charlie "$A" 9000 && fail "old share port 9000 still reachable"
+pass "share ports changed live"
+
+# ---- Suspension ----
+ctl accounts suspend alice >/dev/null
+wait_status charlie "notice: account alice is suspended" "charlie not told about suspension"
+wait_status_not alpha charlie "alpha still sees suspended charlie"
+cant_ping charlie "$A" || fail "suspended charlie reached alpha"
+ctl accounts activate alice >/dev/null
+wait_status charlie "alpha.richard.*shared with you" "share not restored after activation"
+can_tcp charlie "$A" 9001 || fail "charlie can't reach alpha after activation"
+pass "suspending alice cuts charlie off; activating restores it"
+
+# ---- Access rules within richard ----
+AID=$(apic GET /api/machines | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin) if m['name']=='alpha'][0])")
+apic POST "/api/machines/$AID/tags" '{"tags":"staff"}' | grep -q staff || fail "tagging through the portal"
+ctl nodes tag bravo.richard server >/dev/null
+RID=$(ctl rules add --account richard tag:staff tag:server tcp:9000 | grep -o 'rule [0-9]*' | awk '{print $2}')
+wait_status bravo "alpha.richard.*rules: can open tcp:9000 here" "rule not in bravo's map"
+wait_status alpha "bravo.richard.*rules: can't open connections here" "rule not in alpha's map"
+can_tcp alpha "$B" 9000 || fail "rule doesn't allow alpha -> bravo:9000"
+cant_ping alpha "$B" || fail "rule should block ping alpha -> bravo"
+cant_ping bravo "$A" || fail "rule should block bravo -> alpha"
+ctl rules delete "$RID" >/dev/null
+wait_status_not bravo "rules:" "deleting the last rule didn't restore everything"
+can_ping bravo "$A" || fail "ping bravo -> alpha after deleting the rule"
+pass "rules: tag:staff -> tag:server on tcp:9000 only; deleting the rule restores everything"
+
+# ---- Direct paths (filter still applies) ----
+for n in alpha bravo charlie; do stop_tcd "$n"; done
+start_tcd alpha 7443
+start_tcd bravo 7443
+start_tcd charlie 7443
+for n in alpha bravo charlie; do tc_ "$n" up >/dev/null || fail "$n up (rejoin)"; done
+[[ "$(tc_ alpha ip)" == "$A" ]] || fail "alpha changed address on rejoin"
+wait_for 60 status_has alpha 'bravo.richard *direct' || { tc_ alpha status; fail "no direct path alpha->bravo"; }
+wait_for 60 status_has charlie 'alpha.richard *direct' || { tc_ charlie status; fail "no direct path charlie->alpha"; }
+can_ping alpha "$B" || fail "ping alpha -> bravo direct"
+can_ping bravo "$A" || fail "ping bravo -> alpha direct"
+can_tcp charlie "$A" 9001 || fail "charlie -> alpha:9001 over direct path"
+can_tcp charlie "$A" 9000 && fail "charlie reached unshared alpha:9000 over direct path"
+cant_ping alpha "$C" || fail "alpha opened a connection to charlie over direct path"
+pass "direct SSH paths; share limits still enforced on them"
+
+# ---- Removal ----
+ctl nodes remove bravo.richard >/dev/null
+wait_status_not alpha bravo "bravo still in alpha's map"
+cant_ping alpha "$B" || fail "removed machine still reachable"
+wait_status bravo needs-login "bravo not logged out"
 pass "removed machine is cut off and needs login"
 
 echo "ALL PASSED"

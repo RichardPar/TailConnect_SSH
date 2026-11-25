@@ -1,26 +1,153 @@
-//! The hub's SQLite database: machines and pre-auth keys.
+//! The hub's SQLite database: accounts, machines, pre-auth keys, access
+//! rules and shares.
+//!
+//! Schema versions (`PRAGMA user_version`):
+//! * 0: machines and auth keys only (TailConnect-SSH 0.1).
+//! * 1: accounts; machines, keys and rules belong to one; shares. A version
+//!   0 database is migrated into an account named `default`.
+//! * 2: the web portal: account passwords and roles, the `pending` status,
+//!   invites, share links, settings (the admin token's hash).
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::acl::{Access, Rule, valid_label};
 use crate::now_unix;
 
 pub struct Db {
     conn: Connection,
+    /// Addresses new machines get, inclusive (within 100.64.0.0/10).
+    pool: (u32, u32),
+}
+
+/// The whole tailnet range.
+const FULL_POOL: (u32, u32) = (0x6440_0000, 0x647f_ffff);
+
+/// Parse an address pool such as `100.96.0.0/16`. It must lie within
+/// 100.64.0.0/10, the range every machine routes into its tunnel.
+pub fn parse_pool(s: &str) -> Result<(u32, u32)> {
+    let (a, len) = s
+        .trim()
+        .split_once('/')
+        .context("write the pool as ADDRESS/PREFIX, like 100.96.0.0/16")?;
+    let a: Ipv4Addr = a.parse().context("bad pool address")?;
+    let len: u32 = len.parse().context("bad pool prefix length")?;
+    if !(10..=30).contains(&len) {
+        bail!("pool prefix length must be 10 to 30");
+    }
+    let mask = u32::MAX << (32 - len);
+    let start = u32::from(a) & mask;
+    let end = start | !mask;
+    if start < FULL_POOL.0 || end > FULL_POOL.1 {
+        bail!("the pool must lie within 100.64.0.0/10");
+    }
+    Ok((start, end))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    Active,
+    /// Signed up in the portal, waiting for an operator's approval.
+    Pending,
+    Suspended,
+}
+
+impl Status {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Active => "active",
+            Status::Pending => "pending",
+            Status::Suspended => "suspended",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        // Anything unexpected counts as suspended: fail closed.
+        match s {
+            "active" => Status::Active,
+            "pending" => Status::Pending,
+            _ => Status::Suspended,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Tenant,
+    /// Manages the server: every account, machine, key, rule and share.
+    Operator,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Tenant => "tenant",
+            Role::Operator => "operator",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "tenant" => Ok(Role::Tenant),
+            "operator" => Ok(Role::Operator),
+            _ => bail!("role must be operator or tenant"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountRow {
+    pub id: i64,
+    pub name: String,
+    pub status: Status,
+    pub created: i64,
+    pub role: Role,
+    pub has_password: bool,
+    /// When the password, role or status last changed: sessions from before
+    /// then are no longer valid.
+    pub changed: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InviteRow {
+    pub id: i64,
+    pub prefix: String,
+    pub expires: i64,
+    pub used_by: Option<String>,
+    pub revoked: bool,
+    pub created: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareLinkRow {
+    pub id: i64,
+    pub prefix: String,
+    pub node_id: i64,
+    pub node: String,
+    pub owner_id: i64,
+    pub owner: String,
+    pub ports: String,
+    pub expires: i64,
+    pub used_by: Option<String>,
+    pub revoked: bool,
+    pub created: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeRow {
     pub id: i64,
+    pub account_id: i64,
+    pub account: String,
     pub name: String,
     pub ip: Ipv4Addr,
     pub key: String,
     pub hostname: String,
+    pub tags: Vec<String>,
     pub created: i64,
     pub last_seen: Option<i64>,
 }
@@ -28,6 +155,7 @@ pub struct NodeRow {
 #[derive(Debug, Clone)]
 pub struct AuthKeyRow {
     pub id: i64,
+    pub account: String,
     pub prefix: String,
     pub reusable: bool,
     pub expires: Option<i64>,
@@ -36,18 +164,54 @@ pub struct AuthKeyRow {
     pub created: i64,
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS nodes(
+#[derive(Debug, Clone)]
+pub struct RuleRow {
+    pub id: i64,
+    pub account_id: i64,
+    pub account: String,
+    pub src: String,
+    pub dst: String,
+    pub ports: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareRow {
+    pub id: i64,
+    pub node_id: i64,
+    pub node: String,
+    /// The shared machine's account.
+    pub owner_id: i64,
+    pub owner: String,
+    /// The account it's shared with.
+    pub account_id: i64,
+    pub account: String,
+    pub ports: String,
+    pub accepted: bool,
+    pub created: i64,
+}
+
+const SCHEMA_V1: &str = "
+CREATE TABLE accounts(
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'active',
+    created INTEGER NOT NULL
+);
+CREATE TABLE nodes(
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    name TEXT NOT NULL,
     ip TEXT NOT NULL UNIQUE,
     key TEXT NOT NULL UNIQUE,
     hostname TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '',
     created INTEGER NOT NULL,
-    last_seen INTEGER
+    last_seen INTEGER,
+    UNIQUE(account_id, name)
 );
-CREATE TABLE IF NOT EXISTS authkeys(
+CREATE TABLE authkeys(
     id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
     hash TEXT NOT NULL UNIQUE,
     prefix TEXT NOT NULL,
     reusable INTEGER NOT NULL,
@@ -56,7 +220,110 @@ CREATE TABLE IF NOT EXISTS authkeys(
     revoked INTEGER NOT NULL DEFAULT 0,
     created INTEGER NOT NULL
 );
+CREATE TABLE rules(
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    ports TEXT NOT NULL,
+    created INTEGER NOT NULL
+);
+CREATE TABLE shares(
+    id INTEGER PRIMARY KEY,
+    node_id INTEGER NOT NULL REFERENCES nodes(id),
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    ports TEXT NOT NULL DEFAULT '*',
+    accepted INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL,
+    UNIQUE(node_id, account_id)
+);
 ";
+
+const SCHEMA_V2_UPGRADE: &str = "
+ALTER TABLE accounts ADD COLUMN password_hash TEXT;
+ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'tenant';
+ALTER TABLE accounts ADD COLUMN changed INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE invites(
+    id INTEGER PRIMARY KEY,
+    hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL,
+    expires INTEGER NOT NULL,
+    used_by INTEGER,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL
+);
+CREATE TABLE share_links(
+    id INTEGER PRIMARY KEY,
+    hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL,
+    node_id INTEGER NOT NULL REFERENCES nodes(id),
+    ports TEXT NOT NULL,
+    expires INTEGER NOT NULL,
+    used_by INTEGER,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL
+);
+CREATE TABLE settings(
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
+";
+
+const SCHEMA_VERSION: i64 = 2;
+
+/// Name of the account that machines from a version 0 database move into.
+pub const DEFAULT_ACCOUNT: &str = "default";
+
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        bail!("database schema version {version} is newer than this tc-control understands ({SCHEMA_VERSION})");
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if version == 0 {
+        let has_nodes: bool = tx
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)?;
+        if has_nodes {
+            // Version 0: move everything into the default account.
+            tx.execute_batch(
+                "ALTER TABLE nodes RENAME TO nodes_v0;
+                 ALTER TABLE authkeys RENAME TO authkeys_v0;",
+            )?;
+            tx.execute_batch(SCHEMA_V1)?;
+            tx.execute(
+                "INSERT INTO accounts(name, created) VALUES (?1, ?2)",
+                params![DEFAULT_ACCOUNT, now_unix()],
+            )?;
+            let acct = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO nodes(id, account_id, name, ip, key, hostname, created, last_seen)
+                 SELECT id, ?1, name, ip, key, hostname, created, last_seen FROM nodes_v0",
+                [acct],
+            )?;
+            tx.execute(
+                "INSERT INTO authkeys(id, account_id, hash, prefix, reusable, expires, used, revoked, created)
+                 SELECT id, ?1, hash, prefix, reusable, expires, used, revoked, created FROM authkeys_v0",
+                [acct],
+            )?;
+            tx.execute_batch("DROP TABLE nodes_v0; DROP TABLE authkeys_v0;")?;
+        } else {
+            tx.execute_batch(SCHEMA_V1)?;
+        }
+    }
+    // Version 1 to 2.
+    tx.execute_batch(SCHEMA_V2_UPGRADE)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
 
 fn hash_key(k: &str) -> String {
     hex::encode(Sha256::digest(k.trim().as_bytes()))
@@ -77,41 +344,217 @@ pub fn sanitise_name(s: &str) -> String {
     if out.is_empty() { "node".into() } else { out }
 }
 
+fn split_tags(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+const NODE_SELECT: &str =
+    "SELECT n.id, n.account_id, a.name, n.name, n.ip, n.key, n.hostname, n.tags, n.created, n.last_seen
+     FROM nodes n JOIN accounts a ON a.id = n.account_id";
+
 fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
-    let ip: String = r.get(2)?;
+    let ip: String = r.get(4)?;
+    let tags: String = r.get(7)?;
     Ok(NodeRow {
         id: r.get(0)?,
-        name: r.get(1)?,
+        account_id: r.get(1)?,
+        account: r.get(2)?,
+        name: r.get(3)?,
         ip: ip.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
-        key: r.get(3)?,
-        hostname: r.get(4)?,
-        created: r.get(5)?,
-        last_seen: r.get(6)?,
+        key: r.get(5)?,
+        hostname: r.get(6)?,
+        tags: split_tags(&tags),
+        created: r.get(8)?,
+        last_seen: r.get(9)?,
     })
 }
 
-const NODE_COLS: &str = "id, name, ip, key, hostname, created, last_seen";
+const ACCOUNT_COLS: &str = "id, name, status, created, role, password_hash IS NOT NULL, changed";
+
+fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
+    let status: String = r.get(2)?;
+    let role: String = r.get(4)?;
+    Ok(AccountRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        status: Status::parse(&status),
+        created: r.get(3)?,
+        // An unknown role grants nothing extra.
+        role: Role::parse(&role).unwrap_or(Role::Tenant),
+        has_password: r.get(5)?,
+        changed: r.get(6)?,
+    })
+}
+
+const SHARE_SELECT: &str = "SELECT s.id, s.node_id, n.name, o.id, o.name, a.id, a.name, s.ports, s.accepted, s.created
+     FROM shares s JOIN nodes n ON n.id = s.node_id JOIN accounts o ON o.id = n.account_id
+     JOIN accounts a ON a.id = s.account_id";
+
+fn row_to_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
+    Ok(ShareRow {
+        id: r.get(0)?,
+        node_id: r.get(1)?,
+        node: r.get(2)?,
+        owner_id: r.get(3)?,
+        owner: r.get(4)?,
+        account_id: r.get(5)?,
+        account: r.get(6)?,
+        ports: r.get(7)?,
+        accepted: r.get(8)?,
+        created: r.get(9)?,
+    })
+}
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Db { conn })
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&mut conn)?;
+        Ok(Db { conn, pool: FULL_POOL })
     }
 
     #[cfg(test)]
     pub fn memory() -> Self {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        Db { conn }
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&mut conn).unwrap();
+        Db { conn, pool: FULL_POOL }
+    }
+
+    /// Hand out addresses from `pool` only (see [`parse_pool`]).
+    pub fn set_pool(&mut self, pool: (u32, u32)) {
+        self.pool = pool;
     }
 
     /// Changes whenever another connection commits a write.
     pub fn data_version(&self) -> Result<i64> {
         Ok(self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
+
+    // ---- accounts ----
+
+    pub fn accounts(&self) -> Result<Vec<AccountRow>> {
+        let mut st = self
+            .conn
+            .prepare(&format!("SELECT {ACCOUNT_COLS} FROM accounts ORDER BY name"))?;
+        let rows = st.query_map([], row_to_account)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn account(&self, name: &str) -> Result<AccountRow> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE name = ?1"),
+                [name.trim()],
+                row_to_account,
+            )
+            .optional()?
+            .with_context(|| format!("no account named {name}"))
+    }
+
+    pub fn create_account(&self, name: &str) -> Result<AccountRow> {
+        self.create_account_with(name, Status::Active, Role::Tenant, None)
+    }
+
+    /// Create an account. `password_hash` is a PHC string (see
+    /// [`super::auth::hash_password`]); without one, the account can't sign
+    /// in to the portal and is only for machines.
+    pub fn create_account_with(
+        &self,
+        name: &str,
+        status: Status,
+        role: Role,
+        password_hash: Option<&str>,
+    ) -> Result<AccountRow> {
+        let name = valid_account_name(name)?;
+        if self.account(&name).is_ok() {
+            bail!("an account named {name} already exists");
+        }
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO accounts(name, created, status, role, password_hash, changed) VALUES (?1, ?2, ?3, ?4, ?5, ?2)",
+            params![name, now, status.as_str(), role.as_str(), password_hash],
+        )?;
+        self.account(&name)
+    }
+
+    pub fn account_by_id(&self, id: i64) -> Result<AccountRow> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE id = ?1"),
+                [id],
+                row_to_account,
+            )
+            .optional()?
+            .with_context(|| format!("no account with id {id}"))
+    }
+
+    /// The stored password hash of an account, if it has one.
+    pub fn password_hash(&self, name: &str) -> Result<Option<(AccountRow, String)>> {
+        let Ok(a) = self.account(name) else { return Ok(None) };
+        let h: Option<String> =
+            self.conn
+                .query_row("SELECT password_hash FROM accounts WHERE id = ?1", [a.id], |r| r.get(0))?;
+        Ok(h.map(|h| (a, h)))
+    }
+
+    /// Set (or, with `None`, clear) an account's password. Ends its sessions.
+    pub fn set_password(&self, name: &str, password_hash: Option<&str>) -> Result<()> {
+        let a = self.account(name)?;
+        self.conn.execute(
+            "UPDATE accounts SET password_hash = ?1, changed = ?2 WHERE id = ?3",
+            params![password_hash, now_unix(), a.id],
+        )?;
+        Ok(())
+    }
+
+    /// Change an account's role. Ends its sessions.
+    pub fn set_role(&self, name: &str, role: Role) -> Result<()> {
+        let a = self.account(name)?;
+        self.conn.execute(
+            "UPDATE accounts SET role = ?1, changed = ?2 WHERE id = ?3",
+            params![role.as_str(), now_unix(), a.id],
+        )?;
+        Ok(())
+    }
+
+    /// Change an account's status. Ends its sessions.
+    pub fn set_account_status(&self, name: &str, status: Status) -> Result<()> {
+        let a = self.account(name)?;
+        self.conn.execute(
+            "UPDATE accounts SET status = ?1, changed = ?2 WHERE id = ?3",
+            params![status.as_str(), now_unix(), a.id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an account with its machines, keys, rules and shares.
+    pub fn delete_account(&mut self, name: &str) -> Result<()> {
+        let a = self.account(name)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM shares WHERE account_id = ?1 OR node_id IN (SELECT id FROM nodes WHERE account_id = ?1)",
+            [a.id],
+        )?;
+        tx.execute(
+            "DELETE FROM share_links WHERE node_id IN (SELECT id FROM nodes WHERE account_id = ?1)",
+            [a.id],
+        )?;
+        for t in ["rules", "authkeys", "nodes"] {
+            tx.execute(&format!("DELETE FROM {t} WHERE account_id = ?1"), [a.id])?;
+        }
+        tx.execute("DELETE FROM accounts WHERE id = ?1", [a.id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- machines ----
 
     pub fn nodes(&self) -> Result<Vec<NodeRow>> {
         all_nodes(&self.conn)
@@ -120,39 +563,48 @@ impl Db {
     pub fn node_by_key(&self, key: &str) -> Result<Option<NodeRow>> {
         Ok(self
             .conn
-            .query_row(
-                &format!("SELECT {NODE_COLS} FROM nodes WHERE key = ?1"),
-                [key],
-                row_to_node,
-            )
+            .query_row(&format!("{NODE_SELECT} WHERE n.key = ?1"), [key], row_to_node)
             .optional()?)
     }
 
-    pub fn node_by_name(&self, name: &str) -> Result<Option<NodeRow>> {
-        Ok(self
-            .conn
-            .query_row(
-                &format!("SELECT {NODE_COLS} FROM nodes WHERE name = ?1"),
-                [name],
-                row_to_node,
-            )
-            .optional()?)
+    pub fn node(&self, id: i64) -> Result<NodeRow> {
+        self.conn
+            .query_row(&format!("{NODE_SELECT} WHERE n.id = ?1"), [id], row_to_node)
+            .optional()?
+            .with_context(|| format!("no machine with id {id}"))
     }
 
-    /// Register a machine, consuming `auth_key`.
+    /// Find a machine by id or `name.account`.
+    pub fn find_node(&self, s: &str) -> Result<NodeRow> {
+        if let Ok(id) = s.parse::<i64>() {
+            return self.node(id);
+        }
+        let (name, account) = s
+            .split_once('.')
+            .with_context(|| format!("name machines as ID or NAME.ACCOUNT (not {s:?})"))?;
+        self.conn
+            .query_row(
+                &format!("{NODE_SELECT} WHERE n.name = ?1 AND a.name = ?2"),
+                [name, account],
+                row_to_node,
+            )
+            .optional()?
+            .with_context(|| format!("no machine {name} in account {account}"))
+    }
+
+    /// Register a machine, consuming `auth_key`. The machine joins the key's
+    /// account.
     pub fn register(&mut self, key: &str, hostname: &str, auth_key: &str) -> Result<NodeRow> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_unix();
-        let ak: Option<(i64, bool, Option<i64>, i64, bool)> = tx
+        let ak: Option<(i64, i64, bool, Option<i64>, i64, bool)> = tx
             .query_row(
-                "SELECT id, reusable, expires, used, revoked FROM authkeys WHERE hash = ?1",
+                "SELECT id, account_id, reusable, expires, used, revoked FROM authkeys WHERE hash = ?1",
                 [hash_key(auth_key)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
-        let Some((ak_id, reusable, expires, used, revoked)) = ak else {
+        let Some((ak_id, account_id, reusable, expires, used, revoked)) = ak else {
             bail!("invalid auth key");
         };
         if revoked {
@@ -165,11 +617,12 @@ impl Db {
             bail!("auth key has already been used");
         }
         tx.execute("UPDATE authkeys SET used = used + 1 WHERE id = ?1", [ak_id])?;
-        let name = unique_name(&tx, hostname)?;
-        let ip = next_ip(&tx)?;
+        let name = unique_name(&tx, account_id, hostname)?;
+        let ip = next_ip(&tx, self.pool)?;
         tx.execute(
-            "INSERT INTO nodes(name, ip, key, hostname, created, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![name, ip.to_string(), key, hostname, now],
+            "INSERT INTO nodes(account_id, name, ip, key, hostname, created, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![account_id, name, ip.to_string(), key, hostname, now],
         )?;
         tx.commit()?;
         self.node_by_key(key)?.context("node vanished after insert")
@@ -183,50 +636,88 @@ impl Db {
         Ok(())
     }
 
-    pub fn remove_node(&self, name: &str) -> Result<bool> {
-        Ok(self.conn.execute("DELETE FROM nodes WHERE name = ?1", [name])? > 0)
+    /// Delete a machine and its shares.
+    pub fn remove_node(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM shares WHERE node_id = ?1", [id])?;
+        tx.execute("DELETE FROM share_links WHERE node_id = ?1", [id])?;
+        if tx.execute("DELETE FROM nodes WHERE id = ?1", [id])? == 0 {
+            bail!("no machine with id {id}");
+        }
+        tx.commit()?;
+        Ok(())
     }
 
-    pub fn rename_node(&self, old: &str, new: &str) -> Result<String> {
-        let new = sanitise_name(new);
-        if self.node_by_name(&new)?.is_some() {
-            bail!("a machine named {new} already exists");
-        }
-        if self
+    pub fn rename_node(&self, id: i64, new: &str) -> Result<String> {
+        let n = self.node(id)?;
+        let new = valid_label(new, "machine name")?;
+        let taken: Option<i64> = self
             .conn
-            .execute("UPDATE nodes SET name = ?1 WHERE name = ?2", [&new, old])?
-            == 0
-        {
-            bail!("no machine named {old}");
+            .query_row(
+                "SELECT id FROM nodes WHERE account_id = ?1 AND name = ?2",
+                params![n.account_id, new],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some_and(|t| t != id) {
+            bail!("account {} already has a machine named {new}", n.account);
         }
+        self.conn
+            .execute("UPDATE nodes SET name = ?1 WHERE id = ?2", params![new, id])?;
         Ok(new)
     }
 
-    /// Create a pre-auth key. Returns the secret, shown once.
-    pub fn create_authkey(&self, reusable: bool, expires: Option<i64>) -> Result<String> {
+    /// Replace a machine's tags.
+    pub fn set_tags(&self, id: i64, tags: &[String]) -> Result<Vec<String>> {
+        let mut clean = Vec::new();
+        for t in tags {
+            let t = t.trim().trim_start_matches("tag:");
+            if !t.is_empty() {
+                clean.push(valid_label(t, "tag")?);
+            }
+        }
+        clean.sort();
+        clean.dedup();
+        if self
+            .conn
+            .execute("UPDATE nodes SET tags = ?1 WHERE id = ?2", params![clean.join(","), id])?
+            == 0
+        {
+            bail!("no machine with id {id}");
+        }
+        Ok(clean)
+    }
+
+    // ---- auth keys ----
+
+    /// Create a pre-auth key for `account`. Returns the secret, shown once.
+    pub fn create_authkey(&self, account: &str, reusable: bool, expires: Option<i64>) -> Result<String> {
+        let a = self.account(account)?;
         let secret = format!("tckey-{}", hex::encode(rand::random::<[u8; 24]>()));
         let prefix: String = secret.chars().take(14).collect();
         self.conn.execute(
-            "INSERT INTO authkeys(hash, prefix, reusable, expires, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![hash_key(&secret), prefix, reusable, expires, now_unix()],
+            "INSERT INTO authkeys(account_id, hash, prefix, reusable, expires, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![a.id, hash_key(&secret), prefix, reusable, expires, now_unix()],
         )?;
         Ok(secret)
     }
 
     pub fn authkeys(&self) -> Result<Vec<AuthKeyRow>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT id, prefix, reusable, expires, used, revoked, created FROM authkeys ORDER BY id")?;
+        let mut st = self.conn.prepare(
+            "SELECT k.id, a.name, k.prefix, k.reusable, k.expires, k.used, k.revoked, k.created
+             FROM authkeys k JOIN accounts a ON a.id = k.account_id ORDER BY k.id",
+        )?;
         let rows = st
             .query_map([], |r| {
                 Ok(AuthKeyRow {
                     id: r.get(0)?,
-                    prefix: r.get(1)?,
-                    reusable: r.get(2)?,
-                    expires: r.get(3)?,
-                    used: r.get(4)?,
-                    revoked: r.get(5)?,
-                    created: r.get(6)?,
+                    account: r.get(1)?,
+                    prefix: r.get(2)?,
+                    reusable: r.get(3)?,
+                    expires: r.get(4)?,
+                    used: r.get(5)?,
+                    revoked: r.get(6)?,
+                    created: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -239,17 +730,364 @@ impl Db {
             .execute("UPDATE authkeys SET revoked = 1 WHERE id = ?1", [id])?
             > 0)
     }
+
+    // ---- access rules ----
+
+    pub fn rules(&self) -> Result<Vec<RuleRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT r.id, r.account_id, a.name, r.src, r.dst, r.ports
+             FROM rules r JOIN accounts a ON a.id = r.account_id ORDER BY a.name, r.id",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(RuleRow {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    account: r.get(2)?,
+                    src: r.get(3)?,
+                    dst: r.get(4)?,
+                    ports: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn add_rule(&self, account: &str, src: &str, dst: &str, ports: &str) -> Result<i64> {
+        let a = self.account(account)?;
+        let r = Rule::compile(src, dst, ports)?;
+        self.conn.execute(
+            "INSERT INTO rules(account_id, src, dst, ports, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                a.id,
+                r.from.to_string(),
+                r.to.to_string(),
+                r.ports.to_string(),
+                now_unix()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn delete_rule(&self, id: i64) -> Result<()> {
+        if self.conn.execute("DELETE FROM rules WHERE id = ?1", [id])? == 0 {
+            bail!("no rule with id {id}");
+        }
+        Ok(())
+    }
+
+    // ---- shares ----
+
+    pub fn shares(&self) -> Result<Vec<ShareRow>> {
+        let mut st = self.conn.prepare(&format!("{SHARE_SELECT} ORDER BY s.id"))?;
+        let rows = st.query_map([], row_to_share)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Offer machine `node_id` to `account`. Pending until accepted.
+    pub fn create_share(&self, node_id: i64, account: &str, ports: &str) -> Result<i64> {
+        let n = self.node(node_id)?;
+        let a = self.account(account)?;
+        if a.id == n.account_id {
+            bail!("{} already belongs to account {}", n.name, a.name);
+        }
+        let ports = Access::parse(ports)?.to_string();
+        let r = self.conn.execute(
+            "INSERT INTO shares(node_id, account_id, ports, created) VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, a.id, ports, now_unix()],
+        );
+        match r {
+            Ok(_) => Ok(self.conn.last_insert_rowid()),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                bail!("{}.{} is already shared with {}", n.name, n.account, a.name)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn accept_share(&self, id: i64) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE shares SET accepted = 1 WHERE id = ?1", [id])?
+            == 0
+        {
+            bail!("no share with id {id}");
+        }
+        Ok(())
+    }
+
+    pub fn set_share_ports(&self, id: i64, ports: &str) -> Result<String> {
+        let ports = Access::parse(ports)?.to_string();
+        if self
+            .conn
+            .execute("UPDATE shares SET ports = ?1 WHERE id = ?2", params![ports, id])?
+            == 0
+        {
+            bail!("no share with id {id}");
+        }
+        Ok(ports)
+    }
+
+    pub fn revoke_share(&self, id: i64) -> Result<()> {
+        if self.conn.execute("DELETE FROM shares WHERE id = ?1", [id])? == 0 {
+            bail!("no share with id {id}");
+        }
+        Ok(())
+    }
+
+    pub fn share(&self, id: i64) -> Result<ShareRow> {
+        self.conn
+            .query_row(&format!("{SHARE_SELECT} WHERE s.id = ?1"), [id], row_to_share)
+            .optional()?
+            .with_context(|| format!("no share with id {id}"))
+    }
+
+    // ---- share links ----
+
+    /// Create a single-use link sharing `node_id`. Returns the secret, shown once.
+    pub fn create_share_link(&self, node_id: i64, ports: &str, expires: i64) -> Result<String> {
+        self.node(node_id)?;
+        let ports = Access::parse(ports)?.to_string();
+        let secret = format!("tc-share-{}", hex::encode(rand::random::<[u8; 18]>()));
+        let prefix: String = secret.chars().take(17).collect();
+        self.conn.execute(
+            "INSERT INTO share_links(hash, prefix, node_id, ports, expires, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![hash_key(&secret), prefix, node_id, ports, expires, now_unix()],
+        )?;
+        Ok(secret)
+    }
+
+    pub fn share_links(&self) -> Result<Vec<ShareLinkRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT l.id, l.prefix, l.node_id, n.name, o.id, o.name, l.ports, l.expires, u.name, l.revoked, l.created
+             FROM share_links l JOIN nodes n ON n.id = l.node_id JOIN accounts o ON o.id = n.account_id
+             LEFT JOIN accounts u ON u.id = l.used_by ORDER BY l.id",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(ShareLinkRow {
+                    id: r.get(0)?,
+                    prefix: r.get(1)?,
+                    node_id: r.get(2)?,
+                    node: r.get(3)?,
+                    owner_id: r.get(4)?,
+                    owner: r.get(5)?,
+                    ports: r.get(6)?,
+                    expires: r.get(7)?,
+                    used_by: r.get(8)?,
+                    revoked: r.get(9)?,
+                    created: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn revoke_share_link(&self, id: i64) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE share_links SET revoked = 1 WHERE id = ?1", [id])?
+            == 0
+        {
+            bail!("no share link with id {id}");
+        }
+        Ok(())
+    }
+
+    /// Redeem a share link for `account_id`: an accepted share. Returns its id.
+    pub fn redeem_share_link(&mut self, code: &str, account_id: i64) -> Result<i64> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let link: Option<(i64, i64, String, i64, Option<i64>, bool)> = tx
+            .query_row(
+                "SELECT id, node_id, ports, expires, used_by, revoked FROM share_links WHERE hash = ?1",
+                [hash_key(code)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?;
+        let Some((id, node_id, ports, expires, used_by, revoked)) = link else {
+            bail!("invalid share link");
+        };
+        if revoked || used_by.is_some() || expires <= now_unix() {
+            bail!("this share link has been used, revoked or has expired");
+        }
+        let owner: i64 = tx.query_row("SELECT account_id FROM nodes WHERE id = ?1", [node_id], |r| r.get(0))?;
+        if owner == account_id {
+            bail!("this machine already belongs to your account");
+        }
+        tx.execute(
+            "UPDATE share_links SET used_by = ?1 WHERE id = ?2",
+            params![account_id, id],
+        )?;
+        // An existing share (perhaps pending) is replaced by the link's.
+        tx.execute(
+            "DELETE FROM shares WHERE node_id = ?1 AND account_id = ?2",
+            params![node_id, account_id],
+        )?;
+        tx.execute(
+            "INSERT INTO shares(node_id, account_id, ports, accepted, created) VALUES (?1, ?2, ?3, 1, ?4)",
+            params![node_id, account_id, ports, now_unix()],
+        )?;
+        let share = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(share)
+    }
+
+    // ---- invites ----
+
+    pub fn create_invite(&self, expires: i64) -> Result<String> {
+        let secret = format!("tc-invite-{}", hex::encode(rand::random::<[u8; 18]>()));
+        let prefix: String = secret.chars().take(18).collect();
+        self.conn.execute(
+            "INSERT INTO invites(hash, prefix, expires, created) VALUES (?1, ?2, ?3, ?4)",
+            params![hash_key(&secret), prefix, expires, now_unix()],
+        )?;
+        Ok(secret)
+    }
+
+    pub fn invites(&self) -> Result<Vec<InviteRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT i.id, i.prefix, i.expires, u.name, i.revoked, i.created
+             FROM invites i LEFT JOIN accounts u ON u.id = i.used_by ORDER BY i.id",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(InviteRow {
+                    id: r.get(0)?,
+                    prefix: r.get(1)?,
+                    expires: r.get(2)?,
+                    used_by: r.get(3)?,
+                    revoked: r.get(4)?,
+                    created: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn revoke_invite(&self, id: i64) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE invites SET revoked = 1 WHERE id = ?1", [id])?
+            == 0
+        {
+            bail!("no invite with id {id}");
+        }
+        Ok(())
+    }
+
+    /// Sign up: create an account, consuming `invite` if given. With a valid
+    /// invite the account is active; otherwise it gets `status`.
+    pub fn sign_up(
+        &mut self,
+        name: &str,
+        password_hash: &str,
+        invite: Option<&str>,
+        status: Status,
+    ) -> Result<AccountRow> {
+        let name = valid_account_name(name)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: i64 = tx.query_row("SELECT count(*) FROM accounts WHERE name = ?1", [&name], |r| r.get(0))?;
+        if exists > 0 {
+            bail!("that name is taken");
+        }
+        let mut status = status;
+        let mut invite_id = None;
+        if let Some(code) = invite.map(str::trim).filter(|c| !c.is_empty()) {
+            let row: Option<(i64, i64, Option<i64>, bool)> = tx
+                .query_row(
+                    "SELECT id, expires, used_by, revoked FROM invites WHERE hash = ?1",
+                    [hash_key(code)],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            match row {
+                Some((id, expires, None, false)) if expires > now_unix() => {
+                    invite_id = Some(id);
+                    status = Status::Active;
+                }
+                _ => bail!("invalid or used invite code"),
+            }
+        }
+        let now = now_unix();
+        tx.execute(
+            "INSERT INTO accounts(name, created, status, role, password_hash, changed) VALUES (?1, ?2, ?3, 'tenant', ?4, ?2)",
+            params![name, now, status.as_str(), password_hash],
+        )?;
+        let id = tx.last_insert_rowid();
+        if let Some(i) = invite_id {
+            tx.execute("UPDATE invites SET used_by = ?1 WHERE id = ?2", params![id, i])?;
+        }
+        tx.commit()?;
+        self.account_by_id(id)
+    }
+
+    // ---- settings ----
+
+    pub fn setting(&self, k: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT v FROM settings WHERE k = ?1", [k], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, k: &str, v: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
+            params![k, v],
+        )?;
+        Ok(())
+    }
+
+    /// Create a new admin token, replacing the old one. Returns the secret.
+    pub fn new_admin_token(&self) -> Result<String> {
+        let secret = format!("tc-admin-{}", hex::encode(rand::random::<[u8; 24]>()));
+        self.set_setting("admin_token_hash", &hash_key(&secret))?;
+        self.set_setting("admin_token_changed", &now_unix().to_string())?;
+        Ok(secret)
+    }
+
+    /// Whether `token` is the admin token; and when the token last changed.
+    pub fn check_admin_token(&self, token: &str) -> Result<bool> {
+        let Some(h) = self.setting("admin_token_hash")? else {
+            return Ok(false);
+        };
+        Ok(constant_eq(h.as_bytes(), hash_key(token).as_bytes()))
+    }
+
+    pub fn admin_token_changed(&self) -> Result<i64> {
+        Ok(self
+            .setting("admin_token_changed")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+}
+
+/// Account names are DNS labels of at most 32 characters (they're part of
+/// every machine's name).
+pub fn valid_account_name(s: &str) -> Result<String> {
+    let n = valid_label(s, "account name")?;
+    if n.len() > 32 {
+        bail!("account names are at most 32 characters");
+    }
+    Ok(n)
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn all_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
-    let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY name"))?;
+    let mut st = conn.prepare(&format!("{NODE_SELECT} ORDER BY a.name, n.name"))?;
     let rows = st.query_map([], row_to_node)?.collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 
-fn unique_name(conn: &Connection, base: &str) -> Result<String> {
+fn unique_name(conn: &Connection, account_id: i64, base: &str) -> Result<String> {
     let base = sanitise_name(base);
-    let taken: HashSet<String> = all_nodes(conn)?.into_iter().map(|n| n.name).collect();
+    let mut st = conn.prepare("SELECT name FROM nodes WHERE account_id = ?1")?;
+    let taken: HashSet<String> = st
+        .query_map([account_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     if !taken.contains(&base) {
         return Ok(base);
     }
@@ -264,12 +1102,15 @@ fn unique_name(conn: &Connection, base: &str) -> Result<String> {
     unreachable!()
 }
 
-/// Lowest free address in 100.64.0.0/10, skipping .0, .255 and the DNS address.
-fn next_ip(conn: &Connection) -> Result<Ipv4Addr> {
-    let used: HashSet<Ipv4Addr> = all_nodes(conn)?.into_iter().map(|n| n.ip).collect();
-    let start = u32::from(Ipv4Addr::new(100, 64, 0, 1));
-    let end = u32::from(Ipv4Addr::new(100, 127, 255, 254));
-    for n in start..=end {
+/// Lowest free address in 100.64.0.0/10 (unique across all accounts),
+/// skipping .0, .255 and the DNS address.
+fn next_ip(conn: &Connection, pool: (u32, u32)) -> Result<Ipv4Addr> {
+    let mut st = conn.prepare("SELECT ip FROM nodes")?;
+    let used: HashSet<Ipv4Addr> = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok().and_then(|s| s.parse().ok()))
+        .collect();
+    for n in pool.0..=pool.1 {
         let ip = Ipv4Addr::from(n);
         let last = ip.octets()[3];
         if last == 0 || last == 255 || ip == crate::MAGIC_DNS_IP || used.contains(&ip) {
@@ -284,6 +1125,14 @@ fn next_ip(conn: &Connection) -> Result<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    fn db_with(accounts: &[&str]) -> Db {
+        let db = Db::memory();
+        for a in accounts {
+            db.create_account(a).unwrap();
+        }
+        db
+    }
+
     #[test]
     fn names_are_sanitised() {
         assert_eq!(sanitise_name("Richard's MacBook Pro"), "richard-s-macbook-pro");
@@ -291,27 +1140,125 @@ mod tests {
     }
 
     #[test]
-    fn register_allocates_unique_names_and_ips() {
-        let mut db = Db::memory();
-        let k = db.create_authkey(true, None).unwrap();
-        let a = db.register("ssh-ed25519 A", "box", &k).unwrap();
-        let b = db.register("ssh-ed25519 B", "box", &k).unwrap();
-        assert_eq!((a.name.as_str(), a.ip), ("box", Ipv4Addr::new(100, 64, 0, 1)));
+    fn names_unique_per_account_ips_unique_globally() {
+        let mut db = db_with(&["richard", "alice"]);
+        let kr = db.create_authkey("richard", true, None).unwrap();
+        let ka = db.create_authkey("alice", true, None).unwrap();
+        let a = db.register("ssh-ed25519 A", "box", &kr).unwrap();
+        let b = db.register("ssh-ed25519 B", "box", &kr).unwrap();
+        let c = db.register("ssh-ed25519 C", "box", &ka).unwrap();
+        assert_eq!(
+            (a.name.as_str(), a.account.as_str(), a.ip),
+            ("box", "richard", Ipv4Addr::new(100, 64, 0, 1))
+        );
         assert_eq!((b.name.as_str(), b.ip), ("box-2", Ipv4Addr::new(100, 64, 0, 2)));
+        assert_eq!(
+            (c.name.as_str(), c.account.as_str(), c.ip),
+            ("box", "alice", Ipv4Addr::new(100, 64, 0, 3))
+        );
+        assert_eq!(db.find_node("box.alice").unwrap().id, c.id);
+        assert!(db.rename_node(b.id, "box").is_err());
     }
 
     #[test]
     fn single_use_and_revoked_keys() {
-        let mut db = Db::memory();
-        let k = db.create_authkey(false, None).unwrap();
+        let mut db = db_with(&["r"]);
+        let k = db.create_authkey("r", false, None).unwrap();
         db.register("ssh-ed25519 A", "a", &k).unwrap();
         assert!(db.register("ssh-ed25519 B", "b", &k).is_err());
-        let k2 = db.create_authkey(true, None).unwrap();
+        let k2 = db.create_authkey("r", true, None).unwrap();
         let id = db.authkeys().unwrap().last().unwrap().id;
         db.revoke_authkey(id).unwrap();
         assert!(db.register("ssh-ed25519 C", "c", &k2).is_err());
-        let k3 = db.create_authkey(true, Some(now_unix() - 1)).unwrap();
+        let k3 = db.create_authkey("r", true, Some(now_unix() - 1)).unwrap();
         assert!(db.register("ssh-ed25519 D", "d", &k3).is_err());
         assert!(db.register("ssh-ed25519 E", "e", "tckey-bogus").is_err());
+    }
+
+    #[test]
+    fn shares_rules_and_account_deletion() {
+        let mut db = db_with(&["richard", "alice"]);
+        let k = db.create_authkey("richard", true, None).unwrap();
+        let web = db.register("ssh-ed25519 W", "web", &k).unwrap();
+        assert!(db.create_share(web.id, "richard", "*").is_err(), "own account");
+        let s = db.create_share(web.id, "alice", "tcp:443, tcp:80").unwrap();
+        assert!(db.create_share(web.id, "alice", "*").is_err(), "duplicate");
+        assert_eq!(db.shares().unwrap()[0].ports, "tcp:80,tcp:443");
+        assert!(!db.shares().unwrap()[0].accepted);
+        db.accept_share(s).unwrap();
+        assert!(db.shares().unwrap()[0].accepted);
+        assert!(db.add_rule("richard", "tag:staff", "tag:server", "tcp:22").is_ok());
+        assert!(db.add_rule("richard", "tag:", "*", "*").is_err());
+        assert_eq!(
+            db.set_tags(web.id, &["Server".into(), "tag:web".into()]).unwrap(),
+            vec!["server", "web"]
+        );
+        db.delete_account("richard").unwrap();
+        assert!(db.nodes().unwrap().is_empty() && db.shares().unwrap().is_empty() && db.rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn address_pool() {
+        assert_eq!(parse_pool("100.96.0.0/16").unwrap(), (0x6460_0000, 0x6460_ffff));
+        assert!(parse_pool("10.0.0.0/8").is_err());
+        assert!(parse_pool("100.64.0.0/9").is_err());
+        let mut db = db_with(&["r"]);
+        db.set_pool(parse_pool("100.96.0.0/24").unwrap());
+        let k = db.create_authkey("r", true, None).unwrap();
+        assert_eq!(
+            db.register("ssh-ed25519 A", "a", &k).unwrap().ip,
+            Ipv4Addr::new(100, 96, 0, 1)
+        );
+    }
+
+    #[test]
+    fn migrates_version_1() {
+        let path = std::env::temp_dir().join(format!("tc-migrate1-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(
+                "INSERT INTO accounts(name, status, created) VALUES ('richard', 'active', 1);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let a = db.account("richard").unwrap();
+        assert_eq!(
+            (a.role, a.has_password, a.status),
+            (Role::Tenant, false, Status::Active)
+        );
+        assert!(db.invites().unwrap().is_empty() && db.share_links().unwrap().is_empty());
+        assert!(db.setting("admin_token_hash").unwrap().is_none());
+        drop(db);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_0() {
+        let path = std::env::temp_dir().join(format!("tc-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, ip TEXT NOT NULL UNIQUE,
+                    key TEXT NOT NULL UNIQUE, hostname TEXT NOT NULL, created INTEGER NOT NULL, last_seen INTEGER);
+                 CREATE TABLE authkeys(id INTEGER PRIMARY KEY, hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
+                    reusable INTEGER NOT NULL, expires INTEGER, used INTEGER NOT NULL DEFAULT 0,
+                    revoked INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL);
+                 INSERT INTO nodes VALUES (7, 'alpha', '100.64.0.1', 'ssh-ed25519 A', 'alpha', 1, 2);
+                 INSERT INTO authkeys VALUES (3, 'h', 'tckey-x', 1, NULL, 1, 0, 1);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let n = db.node(7).unwrap();
+        assert_eq!((n.name.as_str(), n.account.as_str()), ("alpha", DEFAULT_ACCOUNT));
+        assert_eq!(db.authkeys().unwrap()[0].account, DEFAULT_ACCOUNT);
+        drop(db);
+        Db::open(&path).unwrap(); // idempotent
+        std::fs::remove_file(&path).unwrap();
     }
 }

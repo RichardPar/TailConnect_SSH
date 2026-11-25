@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 
 use crate::proto::Node;
 
-pub const DEFAULT_SOCKET: &str = "/run/tailconnect/tcd.sock";
+pub const DEFAULT_SOCKET: &str = "/run/tailconnect-ssh/tcd.sock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -51,12 +51,25 @@ pub struct Status {
     pub tun: Option<String>,
     pub direct_port: u16,
     pub last_error: Option<String>,
+    /// From the hub, for example when this machine's account is suspended.
+    #[serde(default)]
+    pub notice: Option<String>,
+    /// Packets the filter dropped since tcd started.
+    #[serde(default)]
+    pub filter_dropped: u64,
     pub peers: Vec<PeerStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub name: String,
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// What this peer may open on this machine (`["*"]` = everything).
+    #[serde(default)]
+    pub inbound: Vec<String>,
     pub ip: Ipv4Addr,
     pub online: bool,
     /// `direct`, `hub` or `-` (offline).

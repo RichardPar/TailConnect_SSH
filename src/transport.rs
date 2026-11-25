@@ -231,7 +231,9 @@ pub async fn accept(
     .map_err(|_| anyhow!("handshake timed out"))?
 }
 
-async fn accept_ssh<S>(stream: S, ssh: Arc<server::Config>, policy: KeyPolicy) -> Result<ServerConn>
+/// Run SSH on an already accepted stream (the hub accepts TLS itself, to
+/// choose between SSH and the web portal by ALPN).
+pub async fn accept_ssh<S>(stream: S, ssh: Arc<server::Config>, policy: KeyPolicy) -> Result<ServerConn>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {

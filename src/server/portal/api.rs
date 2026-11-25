@@ -1,0 +1,768 @@
+//! The portal's JSON API, under `/api`.
+//!
+//! Tenants act on their own account's machines, keys, rules and shares;
+//! operators on every account's. Objects of other accounts look like they
+//! don't exist (404).
+
+use std::sync::Arc;
+
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json, Router};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::{ConnInfo, Me, Portal, SESSION_COOKIE, SESSION_TTL, Signup, Who, cookie};
+use crate::now_unix;
+use crate::server::auth;
+use crate::server::db::{Role, Status};
+
+type P = State<Arc<Portal>>;
+type ApiResult = Result<Response, ApiError>;
+
+#[derive(Debug)]
+pub struct ApiError(StatusCode, String);
+
+impl ApiError {
+    fn bad(m: impl Into<String>) -> Self {
+        ApiError(StatusCode::BAD_REQUEST, m.into())
+    }
+    fn not_found() -> Self {
+        ApiError(StatusCode::NOT_FOUND, "not found".into())
+    }
+    fn forbidden() -> Self {
+        ApiError(StatusCode::FORBIDDEN, "operators only".into())
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::bad(format!("{e:#}"))
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+fn ok(v: Value) -> ApiResult {
+    Ok(Json(v).into_response())
+}
+
+impl FromRequestParts<Arc<Portal>> for Me {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, p: &Arc<Portal>) -> Result<Self, Self::Rejection> {
+        cookie(&parts.headers, SESSION_COOKIE)
+            .and_then(|t| p.resolve(&t))
+            .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "not signed in".into()))
+    }
+}
+
+/// Operators only.
+struct Op(Me);
+
+impl FromRequestParts<Arc<Portal>> for Op {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, p: &Arc<Portal>) -> Result<Self, Self::Rejection> {
+        let me = Me::from_request_parts(parts, p).await?;
+        if !me.operator {
+            return Err(ApiError::forbidden());
+        }
+        Ok(Op(me))
+    }
+}
+
+pub fn routes() -> Router<Arc<Portal>> {
+    Router::new()
+        .route("/info", get(info))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/signup", post(signup))
+        .route("/me", get(me))
+        .route("/me/password", post(change_password))
+        .route("/machines", get(machines))
+        .route("/machines/{id}", delete(remove_machine))
+        .route("/machines/{id}/tags", post(tag_machine))
+        .route("/machines/{id}/rename", post(rename_machine))
+        .route("/keys", get(keys).post(create_key))
+        .route("/keys/{id}/revoke", post(revoke_key))
+        .route("/rules", get(rules).post(add_rule))
+        .route("/rules/{id}", delete(delete_rule))
+        .route("/shares", get(shares).post(create_share))
+        .route("/shares/{id}", delete(end_share))
+        .route("/shares/{id}/accept", post(accept_share))
+        .route("/shares/{id}/ports", post(share_ports))
+        .route("/share-links", post(create_link))
+        .route("/share-links/{id}", delete(revoke_link))
+        .route("/share-links/redeem", post(redeem_link))
+        .route("/accounts", get(accounts).post(create_account))
+        .route("/accounts/{id}", delete(delete_account))
+        .route("/accounts/{id}/status", post(account_status))
+        .route("/accounts/{id}/role", post(account_role))
+        .route("/accounts/{id}/password", post(account_password))
+        .route("/invites", get(invites).post(create_invite))
+        .route("/invites/{id}", delete(revoke_invite))
+}
+
+fn session_cookie(token: &str, tls: bool, max_age: i64) -> HeaderValue {
+    let secure = if tls { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+    ))
+    .expect("valid cookie")
+}
+
+fn with_cookie(v: Value, token: &str, tls: bool, max_age: i64) -> Response {
+    let mut r = Json(v).into_response();
+    r.headers_mut()
+        .insert(header::SET_COOKIE, session_cookie(token, tls, max_age));
+    r
+}
+
+// ---- sign-in ----
+
+async fn info(State(p): P) -> ApiResult {
+    ok(json!({
+        "signup": p.cfg.signup.as_str(),
+        "domain": p.cfg.domain,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+#[derive(Deserialize)]
+struct Login {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    admin_token: String,
+}
+
+fn too_many() -> ApiError {
+    ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many attempts: wait a little and try again".into(),
+    )
+}
+
+async fn login(State(p): P, Extension(c): Extension<ConnInfo>, Json(b): Json<Login>) -> ApiResult {
+    if !p.by_client.take(&auth::client_key(c.peer.ip())) {
+        return Err(too_many());
+    }
+    let wrong = || ApiError(StatusCode::UNAUTHORIZED, "wrong name or password".into());
+    if !b.admin_token.trim().is_empty() {
+        if p.db.lock().unwrap().check_admin_token(b.admin_token.trim())? {
+            let t = p.new_session(Who::Admin);
+            return Ok(with_cookie(json!({ "ok": true }), &t, c.tls, SESSION_TTL));
+        }
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong admin token".into()));
+    }
+    let name = b.name.trim().to_ascii_lowercase();
+    if !p.by_account.take(&format!("account:{name}")) {
+        return Err(too_many());
+    }
+    let row = p.db.lock().unwrap().password_hash(&name)?;
+    let hash = row.as_ref().map(|(_, h)| h.clone());
+    let pw = b.password;
+    let good = p.hash(move || auth::verify_password(&pw, hash.as_deref())).await;
+    let Some((a, _)) = row.filter(|_| good) else {
+        return Err(wrong());
+    };
+    match a.status {
+        Status::Active => {}
+        Status::Pending => return Err(ApiError::bad("your account is waiting for an operator's approval")),
+        Status::Suspended => return Err(ApiError::bad("your account is suspended")),
+    }
+    let t = p.new_session(Who::Account(a.id));
+    Ok(with_cookie(json!({ "ok": true }), &t, c.tls, SESSION_TTL))
+}
+
+async fn logout(State(p): P, Extension(c): Extension<ConnInfo>, headers: HeaderMap) -> ApiResult {
+    if let Some(t) = cookie(&headers, SESSION_COOKIE) {
+        p.end_session(&t);
+    }
+    Ok(with_cookie(json!({ "ok": true }), "", c.tls, 0))
+}
+
+#[derive(Deserialize)]
+struct SignupReq {
+    name: String,
+    password: String,
+    #[serde(default)]
+    invite: String,
+}
+
+async fn signup(State(p): P, Extension(c): Extension<ConnInfo>, Json(b): Json<SignupReq>) -> ApiResult {
+    let invite = Some(b.invite.trim()).filter(|i| !i.is_empty()).map(String::from);
+    let status = match (p.cfg.signup, &invite) {
+        (Signup::Off, _) => return Err(ApiError::bad("sign-up is turned off on this server")),
+        (Signup::Invite, None) => return Err(ApiError::bad("an invite code is needed to sign up")),
+        (Signup::Approval, _) => Status::Pending,
+        (Signup::Invite | Signup::Open, _) => Status::Active,
+    };
+    if !p.by_client.take(&auth::client_key(c.peer.ip())) {
+        return Err(too_many());
+    }
+    auth::check_password_rules(&b.password)?;
+    let pw = b.password;
+    let hash = p.hash(move || auth::hash_password(&pw)).await?;
+    let a =
+        p.db.lock()
+            .unwrap()
+            .sign_up(&b.name, &hash, invite.as_deref(), status)?;
+    tracing::info!("portal: {} signed up ({})", a.name, a.status.as_str());
+    if a.status == Status::Active {
+        let t = p.new_session(Who::Account(a.id));
+        return Ok(with_cookie(json!({ "status": "active" }), &t, c.tls, SESSION_TTL));
+    }
+    ok(json!({ "status": a.status.as_str() }))
+}
+
+async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
+    let server = if p.cfg.public_server.is_empty() {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("SERVER");
+        host.strip_suffix(":443").unwrap_or(host).to_string()
+    } else {
+        p.cfg.public_server.clone()
+    };
+    ok(json!({
+        "name": me.account.as_ref().map(|a| a.name.clone()),
+        "operator": me.operator,
+        "admin_token": me.account.is_none(),
+        "domain": p.cfg.domain,
+        "signup": p.cfg.signup.as_str(),
+        "server": server,
+        "tls_fingerprint": p.cfg.tls_fingerprint,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PasswordChange {
+    current: String,
+    new: String,
+}
+
+async fn change_password(
+    State(p): P,
+    Extension(c): Extension<ConnInfo>,
+    me: Me,
+    Json(b): Json<PasswordChange>,
+) -> ApiResult {
+    let Some(a) = me.account else {
+        return Err(ApiError::bad(
+            "the admin token has no password; replace it with `tc-control admin-token`",
+        ));
+    };
+    if !p.by_client.take(&auth::client_key(c.peer.ip())) || !p.by_account.take(&format!("account:{}", a.name)) {
+        return Err(too_many());
+    }
+    auth::check_password_rules(&b.new)?;
+    let hash = p.db.lock().unwrap().password_hash(&a.name)?.map(|(_, h)| h);
+    let cur = b.current;
+    if !p.hash(move || auth::verify_password(&cur, hash.as_deref())).await {
+        return Err(ApiError::bad("the current password is wrong"));
+    }
+    let new = b.new;
+    let h = p.hash(move || auth::hash_password(&new)).await?;
+    p.db.lock().unwrap().set_password(&a.name, Some(&h))?;
+    // Every session of the account ends; this one carries on with a new one
+    // (sessions created in the second of the change, or later, are valid).
+    let t = p.new_session(Who::Account(a.id));
+    Ok(with_cookie(json!({ "ok": true }), &t, c.tls, SESSION_TTL))
+}
+
+// ---- machines ----
+
+async fn machines(State(p): P, me: Me) -> ApiResult {
+    let online = (p.online)();
+    let nodes = p.db.lock().unwrap().nodes()?;
+    let v: Vec<Value> = nodes
+        .into_iter()
+        .filter(|n| me.may(n.account_id))
+        .map(|n| {
+            json!({
+                "id": n.id,
+                "name": n.name,
+                "account": n.account,
+                "fqdn": format!("{}.{}.{}", n.name, n.account, p.cfg.domain),
+                "ip": n.ip.to_string(),
+                "tags": n.tags,
+                "hostname": n.hostname,
+                "online": online.contains(&n.ip),
+                "last_seen": n.last_seen,
+                "created": n.created,
+            })
+        })
+        .collect();
+    ok(json!(v))
+}
+
+/// The machine `id`, if `me` may act on it.
+fn own_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, ApiError> {
+    let n = p.db.lock().unwrap().node(id).map_err(|_| ApiError::not_found())?;
+    if !me.may(n.account_id) {
+        return Err(ApiError::not_found());
+    }
+    Ok(n)
+}
+
+#[derive(Deserialize)]
+struct Tags {
+    tags: String,
+}
+
+async fn tag_machine(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Tags>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    let tags: Vec<String> = b.tags.split(',').map(String::from).collect();
+    let set = p.db.lock().unwrap().set_tags(id, &tags)?;
+    ok(json!({ "tags": set }))
+}
+
+#[derive(Deserialize)]
+struct Name {
+    name: String,
+}
+
+async fn rename_machine(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Name>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    let n = p.db.lock().unwrap().rename_node(id, &b.name)?;
+    ok(json!({ "name": n }))
+}
+
+async fn remove_machine(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    p.db.lock().unwrap().remove_node(id)?;
+    ok(json!({ "ok": true }))
+}
+
+// ---- auth keys ----
+
+/// The account a tenant acts for, or the one an operator picked.
+fn target_account(p: &Portal, me: &Me, given: Option<&str>) -> Result<crate::server::db::AccountRow, ApiError> {
+    match (given.map(str::trim).filter(|s| !s.is_empty()), &me.account) {
+        (Some(name), _) if me.operator => p.db.lock().unwrap().account(name).map_err(|_| ApiError::not_found()),
+        (Some(name), Some(a)) if a.name == name => Ok(a.clone()),
+        (Some(_), _) => Err(ApiError::not_found()),
+        (None, Some(a)) => Ok(a.clone()),
+        (None, None) => Err(ApiError::bad("choose an account")),
+    }
+}
+
+async fn keys(State(p): P, me: Me) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let accounts: std::collections::HashMap<String, i64> = db.accounts()?.into_iter().map(|a| (a.name, a.id)).collect();
+    let now = now_unix();
+    let v: Vec<Value> = db
+        .authkeys()?
+        .into_iter()
+        .filter(|k| accounts.get(&k.account).is_some_and(|id| me.may(*id)))
+        .map(|k| {
+            let state = if k.revoked {
+                "revoked"
+            } else if k.expires.is_some_and(|e| e <= now) {
+                "expired"
+            } else if !k.reusable && k.used > 0 {
+                "used"
+            } else {
+                "active"
+            };
+            json!({
+                "id": k.id, "account": k.account, "prefix": k.prefix, "reusable": k.reusable,
+                "expires": k.expires, "used": k.used, "state": state, "created": k.created,
+            })
+        })
+        .collect();
+    ok(json!(v))
+}
+
+#[derive(Deserialize)]
+struct NewKey {
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    reusable: bool,
+    expires_hours: u32,
+}
+
+async fn create_key(State(p): P, me: Me, Json(b): Json<NewKey>) -> ApiResult {
+    if !(1..=24 * 365).contains(&b.expires_hours) {
+        return Err(ApiError::bad("keys expire after 1 hour to 1 year"));
+    }
+    let a = target_account(&p, &me, b.account.as_deref())?;
+    let exp = now_unix() + b.expires_hours as i64 * 3600;
+    let key = p.db.lock().unwrap().create_authkey(&a.name, b.reusable, Some(exp))?;
+    ok(json!({ "key": key, "account": a.name }))
+}
+
+async fn revoke_key(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let k = db
+        .authkeys()?
+        .into_iter()
+        .find(|k| k.id == id)
+        .ok_or_else(ApiError::not_found)?;
+    let a = db.account(&k.account)?;
+    if !me.may(a.id) {
+        return Err(ApiError::not_found());
+    }
+    db.revoke_authkey(id)?;
+    ok(json!({ "ok": true }))
+}
+
+// ---- access rules ----
+
+#[derive(Deserialize)]
+struct AccountQuery {
+    #[serde(default)]
+    account: Option<String>,
+}
+
+async fn rules(State(p): P, me: Me, Query(q): Query<AccountQuery>) -> ApiResult {
+    let a = target_account(&p, &me, q.account.as_deref())?;
+    let v: Vec<Value> =
+        p.db.lock()
+            .unwrap()
+            .rules()?
+            .into_iter()
+            .filter(|r| r.account_id == a.id)
+            .map(|r| json!({ "id": r.id, "account": r.account, "from": r.src, "to": r.dst, "ports": r.ports }))
+            .collect();
+    ok(json!({ "account": a.name, "rules": v }))
+}
+
+#[derive(Deserialize)]
+struct NewRule {
+    #[serde(default)]
+    account: Option<String>,
+    from: String,
+    to: String,
+    ports: String,
+}
+
+async fn add_rule(State(p): P, me: Me, Json(b): Json<NewRule>) -> ApiResult {
+    let a = target_account(&p, &me, b.account.as_deref())?;
+    let ports = if b.ports.trim().is_empty() {
+        "*"
+    } else {
+        b.ports.as_str()
+    };
+    let id = p.db.lock().unwrap().add_rule(&a.name, &b.from, &b.to, ports)?;
+    ok(json!({ "id": id }))
+}
+
+async fn delete_rule(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let r = db
+        .rules()?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(ApiError::not_found)?;
+    if !me.may(r.account_id) {
+        return Err(ApiError::not_found());
+    }
+    db.delete_rule(id)?;
+    ok(json!({ "ok": true }))
+}
+
+// ---- sharing ----
+
+async fn shares(State(p): P, me: Me) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let mine = me.account_id();
+    let row = |s: &crate::server::db::ShareRow| {
+        json!({
+            "id": s.id, "node_id": s.node_id, "machine": format!("{}.{}", s.node, s.owner),
+            "owner": s.owner, "account": s.account, "ports": s.ports,
+            "status": if s.accepted { "active" } else { "pending" }, "created": s.created,
+        })
+    };
+    let all = db.shares()?;
+    let by_me: Vec<Value> = all.iter().filter(|s| me.may(s.owner_id)).map(row).collect();
+    let with_me: Vec<Value> = all.iter().filter(|s| Some(s.account_id) == mine).map(row).collect();
+    let now = now_unix();
+    let links: Vec<Value> = db
+        .share_links()?
+        .into_iter()
+        .filter(|l| me.may(l.owner_id))
+        .map(|l| {
+            let state = match (&l.used_by, l.revoked, l.expires <= now) {
+                (Some(_), _, _) => "used",
+                (None, true, _) => "revoked",
+                (None, false, true) => "expired",
+                _ => "unused",
+            };
+            json!({
+                "id": l.id, "prefix": l.prefix, "machine": format!("{}.{}", l.node, l.owner),
+                "ports": l.ports, "expires": l.expires, "used_by": l.used_by, "state": state,
+            })
+        })
+        .collect();
+    ok(json!({ "by_me": by_me, "with_me": with_me, "links": links }))
+}
+
+#[derive(Deserialize)]
+struct NewShare {
+    node_id: i64,
+    account: String,
+    #[serde(default)]
+    ports: String,
+}
+
+fn ports_or_all(s: &str) -> &str {
+    if s.trim().is_empty() { "*" } else { s }
+}
+
+async fn create_share(State(p): P, me: Me, Json(b): Json<NewShare>) -> ApiResult {
+    own_node(&p, &me, b.node_id)?;
+    let db = p.db.lock().unwrap();
+    // Don't reveal whether an account exists beyond what the share needs:
+    // sharing with a name that doesn't exist fails the same way as a typo.
+    let id = db.create_share(b.node_id, b.account.trim(), ports_or_all(&b.ports))?;
+    ok(json!({ "id": id }))
+}
+
+async fn accept_share(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let s = db.share(id).map_err(|_| ApiError::not_found())?;
+    if Some(s.account_id) != me.account_id() && !me.operator {
+        return Err(ApiError::not_found());
+    }
+    db.accept_share(id)?;
+    ok(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct Ports {
+    ports: String,
+}
+
+async fn share_ports(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Ports>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let s = db.share(id).map_err(|_| ApiError::not_found())?;
+    if !me.may(s.owner_id) {
+        return Err(ApiError::not_found());
+    }
+    let ports = db.set_share_ports(id, ports_or_all(&b.ports))?;
+    ok(json!({ "ports": ports }))
+}
+
+/// The owner revokes, or the recipient removes or declines.
+async fn end_share(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let s = db.share(id).map_err(|_| ApiError::not_found())?;
+    if !me.may(s.owner_id) && Some(s.account_id) != me.account_id() {
+        return Err(ApiError::not_found());
+    }
+    db.revoke_share(id)?;
+    ok(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct NewLink {
+    node_id: i64,
+    #[serde(default)]
+    ports: String,
+    days: u32,
+}
+
+async fn create_link(State(p): P, me: Me, Json(b): Json<NewLink>) -> ApiResult {
+    if !(1..=90).contains(&b.days) {
+        return Err(ApiError::bad("links are valid for 1 to 90 days"));
+    }
+    own_node(&p, &me, b.node_id)?;
+    let exp = now_unix() + b.days as i64 * 86400;
+    let code =
+        p.db.lock()
+            .unwrap()
+            .create_share_link(b.node_id, ports_or_all(&b.ports), exp)?;
+    ok(json!({ "code": code }))
+}
+
+async fn revoke_link(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let l = db
+        .share_links()?
+        .into_iter()
+        .find(|l| l.id == id)
+        .ok_or_else(ApiError::not_found)?;
+    if !me.may(l.owner_id) {
+        return Err(ApiError::not_found());
+    }
+    db.revoke_share_link(id)?;
+    ok(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct Code {
+    code: String,
+}
+
+async fn redeem_link(State(p): P, Extension(c): Extension<ConnInfo>, me: Me, Json(b): Json<Code>) -> ApiResult {
+    let Some(a) = me.account_id() else {
+        return Err(ApiError::bad("sign in with an account to add a shared machine"));
+    };
+    if !p.by_client.take(&auth::client_key(c.peer.ip())) {
+        return Err(too_many());
+    }
+    let id = p.db.lock().unwrap().redeem_share_link(b.code.trim(), a)?;
+    ok(json!({ "id": id }))
+}
+
+// ---- accounts and invites (operators) ----
+
+async fn accounts(State(p): P, _op: Op) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let nodes = db.nodes()?;
+    let v: Vec<Value> = db
+        .accounts()?
+        .into_iter()
+        .map(|a| {
+            json!({
+                "id": a.id, "name": a.name, "status": a.status.as_str(), "role": a.role.as_str(),
+                "has_password": a.has_password,
+                "machines": nodes.iter().filter(|n| n.account_id == a.id).count(),
+                "created": a.created,
+            })
+        })
+        .collect();
+    ok(json!(v))
+}
+
+#[derive(Deserialize)]
+struct NewAccount {
+    name: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    operator: bool,
+}
+
+async fn create_account(State(p): P, _op: Op, Json(b): Json<NewAccount>) -> ApiResult {
+    let hash = if b.password.is_empty() {
+        None
+    } else {
+        let pw = b.password;
+        Some(p.hash(move || auth::hash_password(&pw)).await?)
+    };
+    let role = if b.operator { Role::Operator } else { Role::Tenant };
+    let a =
+        p.db.lock()
+            .unwrap()
+            .create_account_with(&b.name, Status::Active, role, hash.as_deref())?;
+    ok(json!({ "id": a.id, "name": a.name }))
+}
+
+fn account_name(p: &Portal, id: i64) -> Result<String, ApiError> {
+    Ok(p.db
+        .lock()
+        .unwrap()
+        .account_by_id(id)
+        .map_err(|_| ApiError::not_found())?
+        .name)
+}
+
+#[derive(Deserialize)]
+struct NewStatus {
+    status: String,
+}
+
+async fn account_status(State(p): P, Op(me): Op, Path(id): Path<i64>, Json(b): Json<NewStatus>) -> ApiResult {
+    let status = match b.status.as_str() {
+        "active" => Status::Active,
+        "suspended" => Status::Suspended,
+        _ => return Err(ApiError::bad("status must be active or suspended")),
+    };
+    if me.account_id() == Some(id) && status != Status::Active {
+        return Err(ApiError::bad("you can't suspend your own account"));
+    }
+    let name = account_name(&p, id)?;
+    p.db.lock().unwrap().set_account_status(&name, status)?;
+    ok(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct NewRole {
+    role: String,
+}
+
+async fn account_role(State(p): P, Op(me): Op, Path(id): Path<i64>, Json(b): Json<NewRole>) -> ApiResult {
+    let role = Role::parse(&b.role)?;
+    if me.account_id() == Some(id) && role != Role::Operator {
+        return Err(ApiError::bad("you can't remove your own operator role"));
+    }
+    let name = account_name(&p, id)?;
+    p.db.lock().unwrap().set_role(&name, role)?;
+    ok(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct NewPassword {
+    password: String,
+}
+
+async fn account_password(State(p): P, _op: Op, Path(id): Path<i64>, Json(b): Json<NewPassword>) -> ApiResult {
+    let name = account_name(&p, id)?;
+    let pw = b.password;
+    let h = p.hash(move || auth::hash_password(&pw)).await?;
+    p.db.lock().unwrap().set_password(&name, Some(&h))?;
+    ok(json!({ "ok": true }))
+}
+
+async fn delete_account(State(p): P, Op(me): Op, Path(id): Path<i64>) -> ApiResult {
+    if me.account_id() == Some(id) {
+        return Err(ApiError::bad("you can't delete your own account"));
+    }
+    let name = account_name(&p, id)?;
+    p.db.lock().unwrap().delete_account(&name)?;
+    ok(json!({ "ok": true }))
+}
+
+async fn invites(State(p): P, _op: Op) -> ApiResult {
+    let now = now_unix();
+    let v: Vec<Value> =
+        p.db.lock()
+            .unwrap()
+            .invites()?
+            .into_iter()
+            .map(|i| {
+                let state = match (&i.used_by, i.revoked, i.expires <= now) {
+                    (Some(_), _, _) => "used",
+                    (None, true, _) => "revoked",
+                    (None, false, true) => "expired",
+                    _ => "unused",
+                };
+                json!({ "id": i.id, "prefix": i.prefix, "expires": i.expires, "used_by": i.used_by,
+                    "state": state, "created": i.created })
+            })
+            .collect();
+    ok(json!(v))
+}
+
+#[derive(Deserialize)]
+struct NewInvite {
+    days: u32,
+}
+
+async fn create_invite(State(p): P, _op: Op, Json(b): Json<NewInvite>) -> ApiResult {
+    if !(1..=90).contains(&b.days) {
+        return Err(ApiError::bad("invites are valid for 1 to 90 days"));
+    }
+    let code = p.db.lock().unwrap().create_invite(now_unix() + b.days as i64 * 86400)?;
+    ok(json!({ "code": code }))
+}
+
+async fn revoke_invite(State(p): P, _op: Op, Path(id): Path<i64>) -> ApiResult {
+    p.db.lock().unwrap().revoke_invite(id)?;
+    ok(json!({ "ok": true }))
+}
