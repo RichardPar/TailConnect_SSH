@@ -24,6 +24,16 @@ This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It is a
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
 
+### Key expiry, machine approval, ephemeral machines
+
+| | |
+|---|---|
+| **Key expiry** | A machine's authorization lasts 180 days (the hub's `--key-expiry 180d`, or `never`). When it expires, the machine is cut off at that moment, with a notice in `tcs status`. `sudo tcs up --authkey KEY`, with a key of its own account, renews it. Owners and operators can set a machine's expiry or make it never expire: **Expiry** on the portal's Machines tab, or `tcs-control nodes expiry NODE never\|default\|90d`. `tcs status` warns two weeks ahead. Machines that joined before expiry existed never expire. |
+| **Machine approval** | An account can require approval for new machines: **My account → Require approval for new machines**, or `tcs-control accounts approval NAME on`. A new machine then stays cut off, with a notice, until the owner or an operator approves it: **Approve** on the Machines tab, or `tcs-control nodes approve NODE`. Keys created as **pre-approved** (`authkey create --preapproved`) skip this. |
+| **Ephemeral machines** | Machines that join with an **ephemeral** key (`authkey create --ephemeral`) are removed once they've been offline for the hub's `--ephemeral-timeout` (30 minutes by default). This suits CI runners and short-lived containers. Machines with an open connection are never removed. |
+
+**Cut off** (an expired key, waiting for approval, or a suspended account) means the machine keeps its keys and its connection to the hub, gets an empty network map with the reason as a notice, and is invisible to every other machine. When the reason goes away, it's back within a second, with nothing to redo.
+
 ### IPv6 and exit nodes
 
 **IPv6 inside the tunnel.**
@@ -231,11 +241,12 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control serve [--listen [::]:443] [--domain tc.internal] [--tls-cert F --tls-key F] [--tls-name NAME…]` | Run the hub |
 | `tc-control fingerprint` | Print the TLS fingerprint and SSH host key |
 | `tc-control serve … [--signup off\|approval\|invite\|open] [--public-url HOST] [--portal-host NAME…] [--portal-listen ADDR] [--no-portal]` | Web portal options |
-| `tc-control accounts create NAME [--operator] [--password]` / `list` / `passwd NAME` / `role NAME operator\|tenant` / `approve NAME` / `suspend NAME` / `activate NAME` / `delete NAME` | Accounts (deleting removes the account's machines, keys, rules and shares); passwords are asked for twice, or read from standard input |
+| `tc-control serve … [--key-expiry 180d\|never] [--ephemeral-timeout 30m]` | How long machines stay authorized; when ephemeral machines are removed |
+| `tc-control accounts create NAME [--operator] [--password]` / `list` / `passwd NAME` / `role NAME operator\|tenant` / `approve NAME` / `approval NAME on\|off` / `suspend NAME` / `activate NAME` / `delete NAME` | Accounts (deleting removes the account's machines, keys, rules and shares); passwords are asked for twice, or read from standard input |
 | `tc-control invites create [--days N]` / `list` / `revoke ID` | Invites for sign-up |
 | `tc-control admin-token` | New admin token for the portal (replaces the old one) |
-| `tc-control authkey create [--account NAME] [--reusable] [--expires-hours N]` / `list` / `revoke ID` | Pre-auth keys; machines join the key's account |
-| `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` / `exit-node NODE on\|off` | Machines; `NODE` is an ID or `name.account` |
+| `tc-control authkey create [--account NAME] [--reusable] [--expires-hours N] [--ephemeral] [--preapproved]` / `list` / `revoke ID` | Pre-auth keys; machines join the key's account |
+| `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` / `exit-node NODE on\|off` / `approve NODE` / `expiry NODE never\|default\|90d` | Machines; `NODE` is an ID or `name.account` |
 | `tc-control rules list [--account NAME]` / `add --account NAME FROM TO [PORTS]` / `delete ID` | Access rules |
 | `tc-control shares list` / `create NODE ACCOUNT [PORTS]` / `accept ID` / `ports ID PORTS` / `revoke ID` | Shares |
 | `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
@@ -267,6 +278,9 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 - ping, TCP and MagicDNS through the hub, with end-to-end sessions up both ways;
 - traffic counts in `tc status`, and in the portal with a per-peer breakdown;
 - IPv6 inside the tunnel (ping6 both ways, MagicDNS AAAA);
+- machine approval: a new machine is cut off and invisible until approved;
+- an ephemeral machine removed once offline;
+- a key that expires, cutting the machine off at once, and renewal with `tcs up --authkey`;
 - exit nodes, using an extra namespace as "the internet":
   - IPv4 and IPv6 leaving through the exit node with NAT, and DNS resolved there;
   - an exit node serving only its own account;
@@ -291,6 +305,7 @@ Done (Linux MVP):
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
 - IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node;
+- key expiry with renewal, machine approval, ephemeral machines;
 - an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
@@ -298,6 +313,6 @@ Done (Linux MVP):
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Key expiry, machine approval, ephemeral machines; per-account DNS domains
+1. Per-account DNS domains
 2. Sending exit traffic through another interface (a commercial VPN) with a kill switch
 3. Windows (Wintun) and Android (VpnService) clients

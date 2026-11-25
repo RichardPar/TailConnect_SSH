@@ -104,7 +104,7 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: none; background: transparent; }
 tr:last-child td { border-bottom: 0; }
-td.actions { text-align: right; white-space: nowrap; }
+td.actions { text-align: right; white-space: normal; min-width: 14rem; }
 td.empty { color: var(--muted); text-align: center; padding: 1.5rem; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
 .sub { color: var(--muted); font-size: 0.85em; }
@@ -132,7 +132,7 @@ button:hover { border-color: var(--muted); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 button.danger { color: var(--bad); }
 button.link { border: 0; background: none; color: var(--accent); padding: 0; }
-td.actions button { margin-left: 0.35rem; padding: 0.2rem 0.55rem; font-size: 0.85rem; }
+td.actions button { margin: 0.15rem 0 0.15rem 0.35rem; padding: 0.2rem 0.55rem; font-size: 0.85rem; white-space: nowrap; }
 
 form.inline { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end; padding: 0.9rem 1rem; }
 form.inline label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.8rem; color: var(--muted); }

@@ -5,6 +5,7 @@
 #   ns B: machine "bravo" (richard), reaching the hub over veth 10.99.0.0/24
 #   ns C: machine "charlie" (alice), reaching the hub over veth 10.98.0.0/24
 #
+#   ns D: machine "delta" (alice), over veth 10.97.0.0/24
 #   ns I: "the internet", linked only to ns A: a web address (203.0.113.10,
 #         2001:db8:1::10) and a DNS server. alpha can be the exit node to it.
 #
@@ -82,6 +83,17 @@ inC ip addr add 10.98.0.2/24 dev vC
 inC ip link set vC up
 
 unshare -n --fork --kill-child sleep infinity &
+DPID=$!
+PIDS+=("$DPID")
+sleep 0.3
+ip link add vA4 type veth peer name vD netns "$DPID"
+ip addr add 10.97.0.1/24 dev vA4
+ip link set vA4 up
+nsenter -n -t "$DPID" ip link set lo up
+nsenter -n -t "$DPID" ip addr add 10.97.0.2/24 dev vD
+nsenter -n -t "$DPID" ip link set vD up
+
+unshare -n --fork --kill-child sleep infinity &
 IPID=$!
 PIDS+=("$IPID")
 sleep 0.3
@@ -111,7 +123,7 @@ PIDS+=("$!")
 
 # Hub, with two accounts.
 ctl() { TC_STATE_DIR="$W/hub" "$BIN/tc-control" "$@"; }
-TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test >"$W/hub.log" 2>&1 &
+TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test --ephemeral-timeout 6s >"$W/hub.log" 2>&1 &
 PIDS+=("$!")
 wait_for 40 grep -q "listening on" "$W/hub.log" || fail "hub did not start"
 FP=$(ctl fingerprint | awk '/TLS fingerprint/ {print $3}')
@@ -156,7 +168,7 @@ RID=$(bear -H 'Content-Type: application/json' -d '{"account":"alice","from":"*"
 [[ $(curl_ -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tc-admin-wrong' https://127.0.0.1/api/v1/machines) == 401 ]] || fail "API: wrong token accepted"
 pass "admin HTTP API: bearer token from tc-control admin-token, /api/v1 status, rule created and deleted, wrong token refused"
 
-NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=B
+NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=D
 start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"
     # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
@@ -182,6 +194,7 @@ ns_prefix() { # A|B|C -> command prefix entering that namespace
         B) echo "nsenter -n -t $BPID" ;;
         C) echo "nsenter -n -t $CPID" ;;
         I) echo "nsenter -n -t $IPID" ;;
+        D) echo "nsenter -n -t $DPID" ;;
         *) echo "" ;;
     esac
 }
@@ -229,9 +242,9 @@ pass "joined: alpha=$A bravo=$B (richard), charlie=$C (alice, with the portal's 
 ONLINE=$(apic GET /api/machines | python3 -c "import json,sys; print(sorted(m['name']+'.'+m['account'] for m in json.load(sys.stdin) if m['online']))")
 [[ $ONLINE == "['alpha.richard', 'bravo.richard', 'charlie.alice']" ]] || fail "portal's online machines: $ONLINE"
 
-if tc_ delta up --server 10.99.0.1 --tls-fingerprint "$FP" --authkey "$KA" 2>"$W/err"; then fail "used single-use key accepted"; fi
+if tc_ delta up --server 10.97.0.1 --tls-fingerprint "$FP" --authkey "$KA" 2>"$W/err"; then fail "used single-use key accepted"; fi
 grep -q "already been used" "$W/err" || fail "unexpected error: $(cat "$W/err")"
-if tc_ delta up --server 10.99.0.1 --tls-fingerprint "$(printf '0%.0s' {1..64})" --authkey "$KR" 2>"$W/err"; then fail "wrong TLS pin accepted"; fi
+if tc_ delta up --server 10.97.0.1 --tls-fingerprint "$(printf '0%.0s' {1..64})" --authkey "$KR" 2>"$W/err"; then fail "wrong TLS pin accepted"; fi
 stop_tcd delta
 pass "used single-use key and wrong TLS fingerprint refused"
 
@@ -375,6 +388,35 @@ wait_status_not alpha "this machine forwards" "alpha still forwarding"
 ctl nodes exit-node alpha.richard on >/dev/null
 wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo didn't return to alpha"
 pass "turning the role off: bravo falls back to direct, and returns when it's back on"
+
+# ---- Machine approval and ephemeral machines ----
+ctl accounts approval alice on >/dev/null
+KE=$(ctl authkey create --account alice --ephemeral)
+start_tcd delta 0
+tc_ delta up --server 10.97.0.1 --tls-fingerprint "$FP" --authkey "$KE" >/dev/null || fail "delta up"
+wait_status delta "notice: this machine is waiting for approval" "delta not told it waits for approval"
+status_has charlie "delta.alice" && fail "charlie sees delta before it's approved"
+ctl nodes list | grep -q "delta.alice.*needs approval, ephemeral" || { ctl nodes list; fail "nodes list doesn't show delta waiting"; }
+ctl nodes approve delta.alice >/dev/null
+wait_status charlie "delta.alice" "approved delta not in charlie's map"
+can_ping delta "$C" || fail "delta can't reach charlie once approved"
+pass "machine approval: delta waits, cut off and invisible, until approved; then it joins"
+stop_tcd delta
+wait_for 40 sh -c "! TC_STATE_DIR='$W/hub' '$BIN/tc-control' nodes list | grep -q delta.alice" || fail "ephemeral delta not removed after going offline"
+grep -q "removed ephemeral machine delta.alice" "$W/hub.log" || fail "hub didn't log the removal"
+ctl accounts approval alice off >/dev/null
+pass "ephemeral: delta removed by the hub once offline longer than --ephemeral-timeout"
+
+# ---- Key expiry ----
+ctl nodes expiry bravo.richard 5s >/dev/null
+wait_status bravo "notice: this machine's key has expired" "bravo not told its key expired"
+wait_status_not alpha "bravo.richard" "alpha still sees bravo with an expired key"
+cant_ping alpha "$B" || fail "bravo reachable with an expired key"
+tc_ bravo up --authkey "$KR" >/dev/null || fail "renewing bravo with tcs up --authkey"
+wait_status alpha "bravo.richard" "renewed bravo not back in alpha's map"
+can_ping alpha "$B" || fail "renewed bravo not reachable"
+ctl nodes list | grep "bravo.richard" | grep -q "in 179d\|in 180d" || { ctl nodes list; fail "renewal didn't set a new expiry"; }
+pass "key expiry: bravo cut off the moment its key expired, with a notice; tcs up --authkey renewed it"
 
 # ---- Direct paths (filter still applies) ----
 for n in alpha bravo charlie; do stop_tcd "$n"; done

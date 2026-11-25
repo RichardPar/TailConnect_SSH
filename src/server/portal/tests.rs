@@ -797,3 +797,73 @@ async fn tenant_status_counts_only_their_machines() {
     );
     assert!(st.get("accounts").is_none());
 }
+
+#[tokio::test]
+async fn approval_expiry_and_key_options() {
+    let t = T::new(Signup::Off);
+    let ca = t.login("alice").await;
+    // Settings: require approval for new machines.
+    assert_eq!(t.get("/api/v1/me/settings", &ca).await.body["require_approval"], false);
+    let r = t
+        .post("/api/v1/me/settings", json!({"require_approval": true}), &ca)
+        .await;
+    assert_eq!(r.body["require_approval"], true);
+    // Key options.
+    let k = t
+        .post("/api/v1/keys", json!({"expires_hours": 1, "ephemeral": true}), &ca)
+        .await
+        .body["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let keys = t.get("/api/v1/keys", &ca).await.body;
+    assert_eq!(
+        (keys[0]["ephemeral"].clone(), keys[0]["preapproved"].clone()),
+        (json!(true), json!(false))
+    );
+    let id = t.db(|db| db.register("ssh-ed25519 Z", "z", &k).unwrap().id);
+    let m = t.get("/api/v1/machines", &ca).await.body;
+    assert_eq!(
+        (m[0]["approved"].clone(), m[0]["ephemeral"].clone()),
+        (json!(false), json!(true))
+    );
+    assert_eq!(t.get("/api/v1/status", &ca).await.body["awaiting_approval"], 1);
+    // Approve; set expiry.
+    t.post(&format!("/api/v1/machines/{id}/approve"), json!({}), &ca).await;
+    assert_eq!(t.get("/api/v1/machines", &ca).await.body[0]["approved"], true);
+    let r = t
+        .post(
+            &format!("/api/v1/machines/{id}/expiry"),
+            json!({"expiry": "never"}),
+            &ca,
+        )
+        .await;
+    assert!(r.body["expires"].is_null());
+    let r = t
+        .post(&format!("/api/v1/machines/{id}/expiry"), json!({"expiry": "90d"}), &ca)
+        .await;
+    assert!(r.body["expires"].as_i64().unwrap() > crate::now_unix() + 89 * 86400);
+    let r = t
+        .post(&format!("/api/v1/machines/{id}/expiry"), json!({"expiry": "soon"}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // Another account's machine: not found.
+    let cr = t.login("richard").await;
+    let kr = t.db(|db| db.create_authkey("richard", true, None).unwrap());
+    let rid = t.db(|db| db.register("ssh-ed25519 R", "r", &kr).unwrap().id);
+    assert_eq!(
+        t.post(&format!("/api/v1/machines/{rid}/approve"), json!({}), &ca)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Operators set it for any account.
+    let alice = t.db(|db| db.account("alice").unwrap().id);
+    t.post(
+        &format!("/api/v1/accounts/{alice}/approval"),
+        json!({"enabled": false}),
+        &cr,
+    )
+    .await;
+    assert_eq!(t.get("/api/v1/me/settings", &ca).await.body["require_approval"], false);
+}

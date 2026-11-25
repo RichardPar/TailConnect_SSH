@@ -47,6 +47,10 @@ pub struct Options {
     /// Get and renew the certificate from Let's Encrypt (or another ACME
     /// server). `tls` is then only served until the first one arrives.
     pub acme: Option<acme::Config>,
+    /// How long machines stay authorised (`None`: forever).
+    pub key_expiry: Option<i64>,
+    /// Ephemeral machines are removed after being offline this long (seconds).
+    pub ephemeral_timeout: i64,
 }
 
 pub struct PortalOptions {
@@ -134,6 +138,26 @@ impl Hub {
     }
 }
 
+/// Parse a duration: a number with s, m, h or d (180d, 12h, 30m, 90s).
+pub fn parse_duration(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("bad duration {s:?} (use e.g. 180d, 12h, 30m)"))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("bad duration {s:?} (use e.g. 180d, 12h, 30m)"),
+    };
+    if n <= 0 {
+        bail!("duration must be positive");
+    }
+    Ok(n * mult)
+}
+
 /// A machine's view of the network.
 struct MapView {
     me: Node,
@@ -175,6 +199,7 @@ impl Hub {
                 endpoints: s.map(|s| s.endpoints.clone()).unwrap_or_default(),
                 inbound,
                 exit_node,
+                expires: None,
             }
         };
         let (peers, notice) = match snap.peers_of(me) {
@@ -184,9 +209,11 @@ impl Hub {
                     .collect(),
                 None,
             ),
-            None => (vec![], Some(format!("account {} is suspended", me.account))),
+            None => (vec![], me.cutoff.clone()),
         };
+        let expires = me.expires;
         let mut me = node(me, vec![], me.exit_node && me.active);
+        me.expires = expires;
         me.endpoints.clear();
         Some(MapView { me, peers, notice })
     }
@@ -218,6 +245,42 @@ impl Hub {
         }
     }
 
+    /// Remove ephemeral machines that have been offline for `timeout` seconds.
+    /// Machines with a session are never removed.
+    async fn remove_ephemeral(self: Arc<Self>, timeout: i64) {
+        let every = Duration::from_secs((timeout / 2).clamp(1, 60) as u64);
+        loop {
+            tokio::time::sleep(every).await;
+            let now = crate::now_unix();
+            let online: HashSet<Ipv4Addr> = self.sessions.read().unwrap().keys().copied().collect();
+            let Ok(nodes) = self.db.lock().unwrap().nodes() else {
+                continue;
+            };
+            let mut removed = false;
+            for n in nodes {
+                let idle = now - n.last_seen.unwrap_or(n.created);
+                if n.ephemeral && !online.contains(&n.ip) && idle >= timeout {
+                    match self.db.lock().unwrap().remove_node(n.id) {
+                        Ok(()) => {
+                            info!(
+                                "removed ephemeral machine {}.{} ({}), offline for {idle}s",
+                                n.name, n.account, n.ip
+                            );
+                            removed = true;
+                        }
+                        Err(e) => warn!("removing ephemeral machine {}: {e:#}", n.name),
+                    }
+                }
+            }
+            if removed {
+                if let Err(e) = self.refresh() {
+                    warn!("reloading policy: {e:#}");
+                }
+                self.bump();
+            }
+        }
+    }
+
     /// Watch the database for changes made by other processes (the admin
     /// CLI), and cut off machines that were removed.
     async fn watch_db(self: Arc<Self>) {
@@ -232,7 +295,10 @@ impl Hub {
                     continue;
                 }
             };
-            if v == last {
+            // A key expiring changes who's in the network, though nothing in
+            // the database changes.
+            let expiry_due = self.snapshot().next_expiry.is_some_and(|e| e <= crate::now_unix());
+            if v == last && !expiry_due {
                 continue;
             }
             last = v;
@@ -256,6 +322,12 @@ pub async fn run(opts: Options) -> Result<()> {
     let host_key = crate::keys::load_or_create(&opts.state_dir.join("ssh_host_ed25519_key"))?;
     let mut db = db::Db::open(&opts.state_dir.join("tailconnect.db"))?;
     db.set_pool(opts.ip_pool);
+    db.set_key_expiry(opts.key_expiry);
+    // For the admin CLI's and the portal's "default" expiry.
+    db.set_setting(
+        "key_expiry",
+        &opts.key_expiry.map_or("never".to_string(), |s| s.to_string()),
+    )?;
     info!("SSH host key: {}", key_id(host_key.public_key()));
     info!("TLS certificate SHA-256: {}", opts.tls.fingerprint);
 
@@ -270,6 +342,7 @@ pub async fn run(opts: Options) -> Result<()> {
     });
     hub.refresh()?;
     tokio::spawn(hub.clone().watch_db());
+    tokio::spawn(hub.clone().remove_ephemeral(opts.ephemeral_timeout));
 
     let ssh = transport::server_ssh_config(host_key);
     let portal = match &opts.portal {
@@ -478,7 +551,28 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
 
     let registered = hub.db.lock().unwrap().node_by_key(&key)?;
     let node = match (registered, auth_key) {
-        (Some(n), _) => n,
+        // `tc up --authkey` on a registered machine: renew its authorisation.
+        (Some(_), Some(ak)) => {
+            let r = hub.db.lock().unwrap().reauthorize(&key, &ak);
+            match r {
+                Ok(n) => {
+                    info!("renewed {}.{} ({})", n.name, n.account, n.ip);
+                    hub.refresh()?;
+                    hub.bump();
+                    n
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Frame::control(&ServerMsg::Error { message: e.to_string() }))
+                        .await;
+                    drop(tx);
+                    let _ = writer.await;
+                    close().await;
+                    return Err(e.context("renewal refused"));
+                }
+            }
+        }
+        (Some(n), None) => n,
         (None, Some(ak)) => {
             let r = hub.db.lock().unwrap().register(&key, &hostname, &ak);
             match r {

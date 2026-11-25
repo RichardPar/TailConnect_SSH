@@ -121,6 +121,13 @@ enum Cmd {
         /// [::]:80), when --listen isn't reachable as port 443.
         #[arg(long, requires = "acme_domain", conflicts_with = "acme_dns")]
         acme_http_listen: Option<SocketAddr>,
+        /// How long machines stay authorised before they must be renewed with
+        /// `tcs up --authkey KEY`: a duration such as 180d, 12h, 30m, or never.
+        #[arg(long, default_value = "180d")]
+        key_expiry: String,
+        /// Ephemeral machines are removed after being offline this long.
+        #[arg(long, default_value = "30m")]
+        ephemeral_timeout: String,
     },
     /// Print the TLS fingerprint and SSH host key clients need to pin.
     Fingerprint,
@@ -185,6 +192,11 @@ enum AccountsCmd {
     Approve {
         name: String,
     },
+    /// Require approval for the account's new machines (on), or not (off).
+    Approval {
+        name: String,
+        state: String,
+    },
     List,
     /// Cut an account's machines off and stop its shares, keeping everything.
     Suspend {
@@ -213,6 +225,13 @@ enum AuthkeyCmd {
         /// Hours until it expires (default: never).
         #[arg(long)]
         expires_hours: Option<u64>,
+        /// Machines that join with it are removed after being offline for
+        /// a while (--ephemeral-timeout).
+        #[arg(long)]
+        ephemeral: bool,
+        /// Machines that join with it skip the account's machine approval.
+        #[arg(long)]
+        preapproved: bool,
     },
     List,
     Revoke {
@@ -244,6 +263,16 @@ enum NodesCmd {
         node: String,
         /// on or off
         state: String,
+    },
+    /// Let a machine that waits for its account's approval join.
+    Approve {
+        node: String,
+    },
+    /// When the machine's key expires: never, default (the server's key
+    /// lifetime from now), or a duration from now such as 90d.
+    Expiry {
+        node: String,
+        expiry: String,
     },
 }
 
@@ -412,6 +441,18 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                 db.set_role(&name, Role::parse(&role)?)?;
                 println!("{name} is now a {role}");
             }
+            AccountsCmd::Approval { name, state } => {
+                let on = match state.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => bail!("say on or off"),
+                };
+                db.set_require_approval(&name, on)?;
+                println!(
+                    "{name}: new machines {}",
+                    if on { "wait for approval" } else { "join at once" }
+                );
+            }
             AccountsCmd::Approve { name } => {
                 db.set_account_status(&name, Status::Active)?;
                 println!("approved {name}");
@@ -434,25 +475,37 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                 account,
                 reusable,
                 expires_hours,
+                ephemeral,
+                preapproved,
             } => {
                 let account = only_account(&db, account)?;
                 let exp = expires_hours.map(|h| tailconnect::now_unix() + (h as i64) * 3600);
-                println!("{}", db.create_authkey(&account, reusable, exp)?);
+                println!(
+                    "{}",
+                    db.create_authkey_with(&account, reusable, exp, ephemeral, preapproved)?
+                );
             }
             AuthkeyCmd::List => {
                 println!(
-                    "{:<4} {:<14} {:<16} {:<9} {:<5} {:<8} {:<12} CREATED",
-                    "ID", "ACCOUNT", "PREFIX", "REUSABLE", "USED", "REVOKED", "EXPIRES"
+                    "{:<4} {:<14} {:<16} {:<9} {:<5} {:<8} {:<22} {:<12} CREATED",
+                    "ID", "ACCOUNT", "PREFIX", "REUSABLE", "USED", "REVOKED", "OPTIONS", "EXPIRES"
                 );
                 for k in db.authkeys()? {
+                    let opts = match (k.ephemeral, k.preapproved) {
+                        (true, true) => "ephemeral,preapproved",
+                        (true, false) => "ephemeral",
+                        (false, true) => "preapproved",
+                        _ => "-",
+                    };
                     println!(
-                        "{:<4} {:<14} {:<16} {:<9} {:<5} {:<8} {:<12} {}",
+                        "{:<4} {:<14} {:<16} {:<9} {:<5} {:<8} {:<22} {:<12} {}",
                         k.id,
                         k.account,
                         format!("{}…", k.prefix),
                         k.reusable,
                         k.used,
                         k.revoked,
+                        opts,
                         fmt_time(k.expires),
                         fmt_time(Some(k.created))
                     );
@@ -468,8 +521,8 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Nodes(c) => match c {
             NodesCmd::List { account } => {
                 println!(
-                    "{:<4} {:<28} {:<15} {:<16} {:<5} {:<10} KEY",
-                    "ID", "NAME", "IP", "TAGS", "EXIT", "LAST SEEN"
+                    "{:<4} {:<28} {:<15} {:<16} {:<5} {:<20} {:<10} KEY",
+                    "ID", "NAME", "IP", "TAGS", "EXIT", "KEY EXPIRY", "LAST SEEN"
                 );
                 for n in db.nodes()? {
                     if account.as_ref().is_some_and(|a| *a != n.account) {
@@ -481,13 +534,26 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                     } else {
                         n.tags.join(",")
                     };
+                    let now = tailconnect::now_unix();
+                    let expiry = match (n.approved, n.expires) {
+                        (false, _) => "needs approval".to_string(),
+                        (true, None) => "never".to_string(),
+                        (true, Some(e)) if e <= now => "expired".to_string(),
+                        (true, Some(e)) => fmt_time(Some(e)),
+                    };
+                    let expiry = if n.ephemeral {
+                        format!("{expiry}, ephemeral")
+                    } else {
+                        expiry
+                    };
                     println!(
-                        "{:<4} {:<28} {:<15} {:<16} {:<5} {:<10} {key}…",
+                        "{:<4} {:<28} {:<15} {:<16} {:<5} {:<20} {:<10} {key}…",
                         n.id,
                         format!("{}.{}", n.name, n.account),
                         n.ip,
                         tags,
                         if n.exit_node { "yes" } else { "-" },
+                        expiry,
                         fmt_time(n.last_seen)
                     );
                 }
@@ -501,6 +567,30 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                 let n = db.find_node(&node)?;
                 let new = db.rename_node(n.id, &new_name)?;
                 println!("renamed {}.{} to {new}.{}", n.name, n.account, n.account);
+            }
+            NodesCmd::Approve { node } => {
+                let n = db.find_node(&node)?;
+                db.approve_node(n.id)?;
+                println!("approved {}.{}", n.name, n.account);
+            }
+            NodesCmd::Expiry { node, expiry } => {
+                let n = db.find_node(&node)?;
+                let now = tailconnect::now_unix();
+                let e = match expiry.as_str() {
+                    "never" => None,
+                    "default" => db.hub_key_expiry().map(|e| now + e),
+                    d => Some(now + server::parse_duration(d)?),
+                };
+                db.set_node_expiry(n.id, e)?;
+                println!(
+                    "{}.{}: key {}",
+                    n.name,
+                    n.account,
+                    e.map_or("never expires".to_string(), |e| format!(
+                        "expires {}",
+                        fmt_time(Some(e))
+                    ))
+                );
             }
             NodesCmd::ExitNode { node, state } => {
                 let n = db.find_node(&node)?;
@@ -670,6 +760,8 @@ async fn main() -> Result<()> {
             acme_ca_root,
             acme_dns,
             acme_http_listen,
+            key_expiry,
+            ephemeral_timeout,
         } => {
             let domain = domain.trim_matches('.').to_ascii_lowercase();
             if domain.is_empty() {
@@ -749,6 +841,11 @@ async fn main() -> Result<()> {
                 portal,
                 ip_pool: tailconnect::server::db::parse_pool(&ip_pool)?,
                 acme,
+                key_expiry: match key_expiry.trim() {
+                    "never" => None,
+                    d => Some(server::parse_duration(d)?),
+                },
+                ephemeral_timeout: server::parse_duration(&ephemeral_timeout)?,
             })
             .await
         }

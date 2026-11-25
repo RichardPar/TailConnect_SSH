@@ -37,6 +37,10 @@ pub struct Node {
     /// exit node.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_node: bool,
+    /// In a machine's own entry: when its key expires (Unix time; absent:
+    /// never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

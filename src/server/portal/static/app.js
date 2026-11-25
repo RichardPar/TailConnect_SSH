@@ -170,6 +170,33 @@ async function showTraffic(m) {
   d.showModal();
 }
 
+// A machine's key: waiting for approval, expired, expiring soon, never.
+function keyBadge(m) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!m.approved) return el("div", {}, badge("needs approval", "warn"));
+  if (m.expired) return el("div", {}, badge("key expired", "bad"));
+  if (m.expires === null || m.expires === undefined) return el("div", { class: "sub" }, "never expires");
+  const soon = m.expires - now < 14 * 86400;
+  return el("div", { class: "sub" }, soon ? badge("expires " + ago(m.expires), "warn") : "expires " + ago(m.expires));
+}
+
+function expiryDialog(m) {
+  const choose = (expiry, msg) => { d.close(); act(() => api("POST", "/machines/" + m.id + "/expiry", { expiry }), msg); };
+  const d = el("dialog", {},
+    el("h3", {}, "Key expiry for " + m.name),
+    el("p", { class: "hint" }, "An expired machine is cut off until it's renewed (here, or with sudo tcs up --authkey KEY on it). A later expiry brings it back at once."),
+    el("div", { class: "buttons", style: "flex-wrap:wrap;justify-content:flex-start" },
+      el("button", { onclick: () => choose("180d", "Expires in 6 months") }, "6 months"),
+      el("button", { onclick: () => choose("365d", "Expires in 12 months") }, "12 months"),
+      el("button", { onclick: () => choose("730d", "Expires in 24 months") }, "24 months"),
+      el("button", { onclick: () => choose("default", "Expiry set to the server's default") }, "Server default"),
+      el("button", { onclick: () => choose("never", "Never expires") }, "Never")),
+    el("div", { class: "buttons" }, el("button", { onclick: () => d.close() }, "Cancel")));
+  d.addEventListener("close", () => d.remove());
+  document.body.append(d);
+  d.showModal();
+}
+
 function badge(text, kind) {
   return el("span", { class: "badge " + (kind || "") }, text);
 }
@@ -375,7 +402,8 @@ async function machinesTab() {
   const cards = el("div", { class: "cards" },
     el("div", { class: "card" }, el("div", { class: "k" }, "Machines online"), el("div", { class: "v" }, online + " / " + ms.length)),
     ops ? el("div", { class: "card" }, el("div", { class: "k" }, "Accounts"), el("div", { class: "v" }, state.accounts.length)) : null,
-    ops ? el("div", { class: "card" }, el("div", { class: "k" }, "Waiting for approval"), el("div", { class: "v" }, state.accounts.filter((a) => a.status === "pending").length)) : null,
+    ops ? el("div", { class: "card" }, el("div", { class: "k" }, "Accounts waiting"), el("div", { class: "v" }, state.accounts.filter((a) => a.status === "pending").length)) : null,
+    el("div", { class: "card" }, el("div", { class: "k" }, "Machines waiting for approval"), el("div", { class: "v" }, ms.filter((m) => !m.approved).length)),
     el("div", { class: "card" }, el("div", { class: "k" }, "MagicDNS domain"), el("div", { class: "v mono", style: "font-size:1rem;padding-top:.3rem" }, state.me.domain)));
   const rows = ms.map((m) => el("tr", {},
     el("td", {}, el("span", { class: "dot" + (m.online ? " on" : ""), title: m.online ? "online" : "offline" })),
@@ -383,7 +411,9 @@ async function machinesTab() {
       el("div", {}, el("strong", {}, m.name)),
       el("div", { class: "sub mono" }, m.fqdn),
       m.tags.map((t) => el("span", { class: "chip" }, "tag:" + t)),
-      m.exit_node ? el("span", { class: "chip exit" }, "exit node") : null),
+      m.exit_node ? el("span", { class: "chip exit" }, "exit node") : null,
+      m.ephemeral ? el("span", { class: "chip" }, "ephemeral") : null,
+      keyBadge(m)),
     ops ? el("td", {}, m.account) : null,
     el("td", { class: "mono" }, m.ip),
     el("td", {}, m.hostname),
@@ -394,6 +424,8 @@ async function machinesTab() {
         const r = await ask("Tags for " + m.name, [{ name: "tags", label: "Tags, separated by commas (for example server, db)", value: m.tags.join(", ") }]);
         if (r) act(() => api("POST", "/machines/" + m.id + "/tags", { tags: r.tags }), "Tags saved");
       } }, "Tags"),
+      m.approved ? null : el("button", { class: "primary", onclick: () => act(() => api("POST", "/machines/" + m.id + "/approve"), "Approved: " + m.name + " joins the network") }, "Approve"),
+      el("button", { title: "When this machine's key expires", onclick: () => expiryDialog(m) }, "Expiry"),
       el("button", {
         title: m.exit_node
           ? "Stop routing internet traffic for this account's machines"
@@ -422,7 +454,7 @@ async function keysTab() {
       e.preventDefault();
       const f = fields(e.target);
       act(async () => {
-        const r = await api("POST", "/keys", { account: me.operator ? state.account : null, reusable: f.reusable, expires_hours: Number(f.expires) });
+        const r = await api("POST", "/keys", { account: me.operator ? state.account : null, reusable: f.reusable, ephemeral: f.ephemeral, preapproved: f.preapproved, expires_hours: Number(f.expires) });
         const fp = me.tls_fingerprint ? " --tls-fingerprint " + me.tls_fingerprint : "";
         state.secret = { title: "Auth key for " + r.account, value: r.key, extra: "sudo tc up --server " + me.server + fp + " --authkey " + r.key };
       });
@@ -432,11 +464,13 @@ async function keysTab() {
   el("label", {}, "Expires", el("select", { name: "expires" },
     [[1, "1 hour"], [24, "1 day"], [168, "7 days"], [720, "30 days"], [2160, "90 days"]].map(([v, t]) => el("option", { value: v, selected: v === 24 }, t)))),
   el("label", { class: "check" }, el("input", { type: "checkbox", name: "reusable" }), "Reusable"),
+  el("label", { class: "check", title: "Machines that join with it are removed after being offline for a while" }, el("input", { type: "checkbox", name: "ephemeral" }), "Ephemeral"),
+  el("label", { class: "check", title: "Machines that join with it skip the account's machine approval" }, el("input", { type: "checkbox", name: "preapproved" }), "Pre-approved"),
   el("button", { class: "primary", type: "submit" }, "Create key"));
   const rows = keys.map((k) => el("tr", {},
     el("td", { class: "mono" }, k.prefix + "…"),
     me.operator ? el("td", {}, k.account) : null,
-    el("td", {}, k.reusable ? "reusable" : "single use"),
+    el("td", {}, [k.reusable ? "reusable" : "single use", k.ephemeral ? "ephemeral" : null, k.preapproved ? "pre-approved" : null].filter(Boolean).join(", ")),
     el("td", {}, k.used),
     el("td", {}, badge(k.state, k.state === "active" ? "ok" : "")),
     el("td", {}, k.expires ? ago(k.expires) : "never"),
@@ -655,9 +689,16 @@ async function meTab() {
   el("label", {}, "New password", el("input", { name: "new", type: "password", required: true, minlength: 10, autocomplete: "new-password" })),
   el("label", {}, "Again", el("input", { name: "again", type: "password", required: true, minlength: 10, autocomplete: "new-password" })),
   el("button", { class: "primary", type: "submit" }, "Change password"));
+  const st = await api("GET", "/me/settings");
+  const approval = el("input", { type: "checkbox", checked: st.require_approval,
+    onchange: (e) => act(() => api("POST", "/me/settings", { require_approval: e.target.checked }),
+      e.target.checked ? "New machines now wait for your approval" : "New machines join at once") });
   return [
     el("h2", {}, "My account: " + state.me.name),
     el("p", { class: "hint" }, "Your machines are called NAME." + state.me.name + "." + state.me.domain + "."),
+    el("div", { class: "panel" }, el("form", { class: "inline" },
+      el("label", { class: "check" }, approval, "Require approval for new machines"),
+      el("span", { class: "sub", style: "padding-bottom:.45rem" }, "New machines stay cut off until approved on the Machines tab. Keys marked pre-approved skip this."))),
     el("h2", {}, "Change password"),
     el("div", { class: "panel" }, form),
   ];

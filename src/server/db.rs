@@ -8,6 +8,10 @@
 //! * 2: the web portal: account passwords and roles, the `pending` status,
 //!   invites, share links, settings (the admin token's hash).
 //! * 3: exit nodes (`nodes.exit_node`).
+//! * 4: key expiry, machine approval, ephemeral machines (`nodes.expires`,
+//!   `nodes.approved`, `nodes.ephemeral`, `accounts.require_approval`,
+//!   `authkeys.ephemeral`, `authkeys.preapproved`). Existing machines never
+//!   expire.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -22,6 +26,8 @@ use crate::now_unix;
 
 pub struct Db {
     conn: Connection,
+    /// How long new (and renewed) machines stay authorised; `None`: forever.
+    key_expiry: Option<i64>,
     /// Addresses new machines get, inclusive (within 100.64.0.0/10).
     pool: (u32, u32),
 }
@@ -112,6 +118,8 @@ pub struct AccountRow {
     /// When the password, role or status last changed: sessions from before
     /// then are no longer valid.
     pub changed: i64,
+    /// New machines wait for approval.
+    pub require_approval: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +161,18 @@ pub struct NodeRow {
     pub exit_node: bool,
     pub created: i64,
     pub last_seen: Option<i64>,
+    /// When the machine's authorisation ends (`None`: never).
+    pub expires: Option<i64>,
+    /// `false`: waiting for its account's approval.
+    pub approved: bool,
+    /// Removed automatically after being offline for a while.
+    pub ephemeral: bool,
+}
+
+impl NodeRow {
+    pub fn expired(&self, now: i64) -> bool {
+        self.expires.is_some_and(|e| e <= now)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +185,8 @@ pub struct AuthKeyRow {
     pub used: i64,
     pub revoked: bool,
     pub created: i64,
+    pub ephemeral: bool,
+    pub preapproved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +294,10 @@ CREATE TABLE settings(
 );
 ";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// How long a machine's authorisation lasts by default: 180 days.
+pub const DEFAULT_KEY_EXPIRY: i64 = 180 * 86400;
 
 /// Name of the account that machines from a version 0 database move into.
 pub const DEFAULT_ACCOUNT: &str = "default";
@@ -327,6 +352,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version < 3 {
         tx.execute_batch("ALTER TABLE nodes ADD COLUMN exit_node INTEGER NOT NULL DEFAULT 0;")?;
     }
+    if version < 4 {
+        tx.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN expires INTEGER;
+             ALTER TABLE nodes ADD COLUMN approved INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE nodes ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE accounts ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE authkeys ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE authkeys ADD COLUMN preapproved INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -360,7 +395,8 @@ fn split_tags(s: &str) -> Vec<String> {
 }
 
 const NODE_SELECT: &str =
-    "SELECT n.id, n.account_id, a.name, n.name, n.ip, n.key, n.hostname, n.tags, n.created, n.last_seen, n.exit_node
+    "SELECT n.id, n.account_id, a.name, n.name, n.ip, n.key, n.hostname, n.tags, n.created, n.last_seen, n.exit_node,
+            n.expires, n.approved, n.ephemeral
      FROM nodes n JOIN accounts a ON a.id = n.account_id";
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -378,10 +414,13 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         created: r.get(8)?,
         last_seen: r.get(9)?,
         exit_node: r.get(10)?,
+        expires: r.get(11)?,
+        approved: r.get(12)?,
+        ephemeral: r.get(13)?,
     })
 }
 
-const ACCOUNT_COLS: &str = "id, name, status, created, role, password_hash IS NOT NULL, changed";
+const ACCOUNT_COLS: &str = "id, name, status, created, role, password_hash IS NOT NULL, changed, require_approval";
 
 fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
     let status: String = r.get(2)?;
@@ -395,6 +434,7 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
         role: Role::parse(&role).unwrap_or(Role::Tenant),
         has_password: r.get(5)?,
         changed: r.get(6)?,
+        require_approval: r.get(7)?,
     })
 }
 
@@ -424,7 +464,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn)?;
-        Ok(Db { conn, pool: FULL_POOL })
+        Ok(Db {
+            conn,
+            pool: FULL_POOL,
+            key_expiry: Some(DEFAULT_KEY_EXPIRY),
+        })
     }
 
     #[cfg(test)]
@@ -432,7 +476,11 @@ impl Db {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         migrate(&mut conn).unwrap();
-        Db { conn, pool: FULL_POOL }
+        Db {
+            conn,
+            pool: FULL_POOL,
+            key_expiry: Some(DEFAULT_KEY_EXPIRY),
+        }
     }
 
     /// Hand out addresses from `pool` only (see [`parse_pool`]).
@@ -601,39 +649,107 @@ impl Db {
     }
 
     /// Register a machine, consuming `auth_key`. The machine joins the key's
-    /// account.
+    /// account, approved unless the account requires approval (and the key
+    /// isn't pre-approved), ephemeral if the key is.
     pub fn register(&mut self, key: &str, hostname: &str, auth_key: &str) -> Result<NodeRow> {
+        let key_expiry = self.key_expiry;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_unix();
-        let ak: Option<(i64, i64, bool, Option<i64>, i64, bool)> = tx
-            .query_row(
-                "SELECT id, account_id, reusable, expires, used, revoked FROM authkeys WHERE hash = ?1",
-                [hash_key(auth_key)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-            )
-            .optional()?;
-        let Some((ak_id, account_id, reusable, expires, used, revoked)) = ak else {
-            bail!("invalid auth key");
-        };
-        if revoked {
-            bail!("auth key has been revoked");
-        }
-        if expires.is_some_and(|e| e <= now) {
-            bail!("auth key has expired");
-        }
-        if !reusable && used > 0 {
-            bail!("auth key has already been used");
-        }
-        tx.execute("UPDATE authkeys SET used = used + 1 WHERE id = ?1", [ak_id])?;
-        let name = unique_name(&tx, account_id, hostname)?;
+        let k = use_authkey(&tx, auth_key, now)?;
+        let require: bool = tx.query_row(
+            "SELECT require_approval FROM accounts WHERE id = ?1",
+            [k.account_id],
+            |r| r.get(0),
+        )?;
+        let name = unique_name(&tx, k.account_id, hostname)?;
         let ip = next_ip(&tx, self.pool)?;
         tx.execute(
-            "INSERT INTO nodes(account_id, name, ip, key, hostname, created, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![account_id, name, ip.to_string(), key, hostname, now],
+            "INSERT INTO nodes(account_id, name, ip, key, hostname, created, last_seen, expires, approved, ephemeral)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
+            params![
+                k.account_id,
+                name,
+                ip.to_string(),
+                key,
+                hostname,
+                now,
+                key_expiry.map(|e| now + e),
+                !require || k.preapproved,
+                k.ephemeral
+            ],
         )?;
         tx.commit()?;
         self.node_by_key(key)?.context("node vanished after insert")
+    }
+
+    /// Renew a registered machine's authorisation with an auth key of its
+    /// own account (`tc up --authkey KEY`). A pre-approved key approves it too.
+    pub fn reauthorize(&mut self, key: &str, auth_key: &str) -> Result<NodeRow> {
+        let key_expiry = self.key_expiry;
+        let n = self.node_by_key(key)?.context("machine not registered")?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_unix();
+        let k = use_authkey(&tx, auth_key, now)?;
+        if k.account_id != n.account_id {
+            bail!("that auth key is for another account");
+        }
+        // A machine set to never expire stays that way.
+        let expires = n.expires.map(|_| key_expiry.map(|e| now + e)).unwrap_or(None);
+        tx.execute(
+            "UPDATE nodes SET expires = ?1, approved = (approved OR ?2) WHERE id = ?3",
+            params![expires, k.preapproved, n.id],
+        )?;
+        tx.commit()?;
+        self.node_by_key(key)?.context("node vanished")
+    }
+
+    /// Set how long new and renewed machines stay authorised.
+    pub fn set_key_expiry(&mut self, secs: Option<i64>) {
+        self.key_expiry = secs;
+    }
+
+    pub fn key_expiry(&self) -> Option<i64> {
+        self.key_expiry
+    }
+
+    /// The running hub's key lifetime (`--key-expiry`), as it recorded it;
+    /// the default if it never ran. `None`: never.
+    pub fn hub_key_expiry(&self) -> Option<i64> {
+        match self.setting("key_expiry").ok().flatten().as_deref() {
+            Some("never") => None,
+            Some(s) => s.parse().ok().or(Some(DEFAULT_KEY_EXPIRY)),
+            None => Some(DEFAULT_KEY_EXPIRY),
+        }
+    }
+
+    /// Set when a machine's authorisation ends (`None`: never).
+    pub fn set_node_expiry(&self, id: i64, expires: Option<i64>) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE nodes SET expires = ?1 WHERE id = ?2", params![expires, id])?
+            == 0
+        {
+            bail!("no machine with id {id}");
+        }
+        Ok(())
+    }
+
+    /// Let a machine that waits for approval join.
+    pub fn approve_node(&self, id: i64) -> Result<()> {
+        if self.conn.execute("UPDATE nodes SET approved = 1 WHERE id = ?1", [id])? == 0 {
+            bail!("no machine with id {id}");
+        }
+        Ok(())
+    }
+
+    /// Require (or stop requiring) approval for an account's new machines.
+    pub fn set_require_approval(&self, account: &str, on: bool) -> Result<()> {
+        let a = self.account(account)?;
+        self.conn.execute(
+            "UPDATE accounts SET require_approval = ?1 WHERE id = ?2",
+            params![on, a.id],
+        )?;
+        Ok(())
     }
 
     pub fn touch(&self, key: &str) -> Result<()> {
@@ -712,19 +828,43 @@ impl Db {
 
     /// Create a pre-auth key for `account`. Returns the secret, shown once.
     pub fn create_authkey(&self, account: &str, reusable: bool, expires: Option<i64>) -> Result<String> {
+        self.create_authkey_with(account, reusable, expires, false, false)
+    }
+
+    /// Create a pre-auth key. Ephemeral keys' machines are removed after
+    /// being offline for a while; pre-approved keys' machines skip the
+    /// account's machine approval. Returns the secret, shown once.
+    pub fn create_authkey_with(
+        &self,
+        account: &str,
+        reusable: bool,
+        expires: Option<i64>,
+        ephemeral: bool,
+        preapproved: bool,
+    ) -> Result<String> {
         let a = self.account(account)?;
         let secret = format!("tckey-{}", hex::encode(rand::random::<[u8; 24]>()));
         let prefix: String = secret.chars().take(14).collect();
         self.conn.execute(
-            "INSERT INTO authkeys(account_id, hash, prefix, reusable, expires, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![a.id, hash_key(&secret), prefix, reusable, expires, now_unix()],
+            "INSERT INTO authkeys(account_id, hash, prefix, reusable, expires, created, ephemeral, preapproved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                a.id,
+                hash_key(&secret),
+                prefix,
+                reusable,
+                expires,
+                now_unix(),
+                ephemeral,
+                preapproved
+            ],
         )?;
         Ok(secret)
     }
 
     pub fn authkeys(&self) -> Result<Vec<AuthKeyRow>> {
         let mut st = self.conn.prepare(
-            "SELECT k.id, a.name, k.prefix, k.reusable, k.expires, k.used, k.revoked, k.created
+            "SELECT k.id, a.name, k.prefix, k.reusable, k.expires, k.used, k.revoked, k.created, k.ephemeral, k.preapproved
              FROM authkeys k JOIN accounts a ON a.id = k.account_id ORDER BY k.id",
         )?;
         let rows = st
@@ -738,6 +878,8 @@ impl Db {
                     used: r.get(5)?,
                     revoked: r.get(6)?,
                     created: r.get(7)?,
+                    ephemeral: r.get(8)?,
+                    preapproved: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1096,6 +1238,42 @@ fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// An auth key's account and options, once checked and its use counted.
+struct UsedKey {
+    account_id: i64,
+    ephemeral: bool,
+    preapproved: bool,
+}
+
+fn use_authkey(tx: &Connection, auth_key: &str, now: i64) -> Result<UsedKey> {
+    type Row = (i64, i64, bool, Option<i64>, i64, bool, bool, bool);
+    let ak: Option<Row> = tx
+        .query_row(
+            "SELECT id, account_id, reusable, expires, used, revoked, ephemeral, preapproved FROM authkeys WHERE hash = ?1",
+            [hash_key(auth_key)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        )
+        .optional()?;
+    let Some((id, account_id, reusable, expires, used, revoked, ephemeral, preapproved)) = ak else {
+        bail!("invalid auth key");
+    };
+    if revoked {
+        bail!("auth key has been revoked");
+    }
+    if expires.is_some_and(|e| e <= now) {
+        bail!("auth key has expired");
+    }
+    if !reusable && used > 0 {
+        bail!("auth key has already been used");
+    }
+    tx.execute("UPDATE authkeys SET used = used + 1 WHERE id = ?1", [id])?;
+    Ok(UsedKey {
+        account_id,
+        ephemeral,
+        preapproved,
+    })
+}
+
 fn all_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
     let mut st = conn.prepare(&format!("{NODE_SELECT} ORDER BY a.name, n.name"))?;
     let rows = st.query_map([], row_to_node)?.collect::<rusqlite::Result<_>>()?;
@@ -1229,6 +1407,39 @@ mod tests {
             db.register("ssh-ed25519 A", "a", &k).unwrap().ip,
             Ipv4Addr::new(100, 96, 0, 1)
         );
+    }
+
+    #[test]
+    fn expiry_approval_and_ephemeral_keys() {
+        let mut db = db_with(&["r"]);
+        db.set_key_expiry(Some(3600));
+        let k = db.create_authkey("r", true, None).unwrap();
+        let a = db.register("ssh-ed25519 A", "a", &k).unwrap();
+        let now = now_unix();
+        assert!(a.expires.unwrap() > now + 3500 && a.approved && !a.ephemeral);
+        // Approval required: new machines wait, unless the key is pre-approved.
+        db.set_require_approval("r", true).unwrap();
+        assert!(!db.register("ssh-ed25519 B", "b", &k).unwrap().approved);
+        let pre = db.create_authkey_with("r", true, None, true, true).unwrap();
+        let c = db.register("ssh-ed25519 C", "c", &pre).unwrap();
+        assert!(c.approved && c.ephemeral);
+        // Expired: renewed by an auth key of its own account.
+        db.set_node_expiry(a.id, Some(now - 1)).unwrap();
+        assert!(db.node(a.id).unwrap().expired(now));
+        let renewed = db.reauthorize("ssh-ed25519 A", &k).unwrap();
+        assert!(!renewed.expired(now));
+        db.create_account("other").unwrap();
+        let ko = db.create_authkey("other", true, None).unwrap();
+        assert!(db.reauthorize("ssh-ed25519 A", &ko).is_err(), "another account's key");
+        // Never-expiring machines stay that way; approval with a pre-approved key.
+        db.set_node_expiry(a.id, None).unwrap();
+        assert_eq!(db.reauthorize("ssh-ed25519 A", &k).unwrap().expires, None);
+        let b = db.reauthorize("ssh-ed25519 B", &pre).unwrap();
+        assert!(b.approved);
+        // Keys without expiry for the server ("never").
+        db.set_key_expiry(None);
+        let d = db.register("ssh-ed25519 D", "d", &pre).unwrap();
+        assert_eq!(d.expires, None);
     }
 
     #[test]

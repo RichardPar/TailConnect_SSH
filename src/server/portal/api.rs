@@ -110,6 +110,10 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/machines/{id}/rename", post(rename_machine))
         .route("/machines/{id}/traffic", get(machine_traffic))
         .route("/machines/{id}/exit-node", post(exit_node))
+        .route("/machines/{id}/approve", post(approve_machine))
+        .route("/machines/{id}/expiry", post(machine_expiry))
+        .route("/me/settings", get(my_settings).post(set_my_settings))
+        .route("/accounts/{id}/approval", post(account_approval))
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}/revoke", post(revoke_key))
         .route("/rules", get(rules).post(add_rule))
@@ -279,6 +283,7 @@ async fn status(State(p): P, me: Me) -> ApiResult {
         "operator": me.operator,
         "machines": nodes.len(),
         "online": nodes.iter().filter(|n| online.contains(&n.ip)).count(),
+        "awaiting_approval": nodes.iter().filter(|n| !n.approved).count(),
     });
     if me.operator {
         let accounts = db.accounts()?;
@@ -341,6 +346,10 @@ async fn machines(State(p): P, me: Me) -> ApiResult {
                 "ip": n.ip.to_string(),
                 "tags": n.tags,
                 "exit_node": n.exit_node,
+                "expires": n.expires,
+                "expired": n.expired(crate::now_unix()),
+                "approved": n.approved,
+                "ephemeral": n.ephemeral,
                 "hostname": n.hostname,
                 "online": online.contains(&n.ip),
                 "traffic": traffic.get(&n.ip).map(|r| {
@@ -437,6 +446,64 @@ struct Enabled {
     enabled: bool,
 }
 
+/// Let a machine that waits for its account's approval join.
+async fn approve_machine(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    p.db.lock().unwrap().approve_node(id)?;
+    ok(json!({ "approved": true }))
+}
+
+#[derive(Deserialize)]
+struct Expiry {
+    /// `never`, `default` (the hub's key lifetime from now) or a duration
+    /// from now (`90d`, `12h`).
+    expiry: String,
+}
+
+async fn machine_expiry(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Expiry>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    let now = crate::now_unix();
+    let db = p.db.lock().unwrap();
+    let e = match b.expiry.trim() {
+        "never" => None,
+        "default" => db.hub_key_expiry().map(|e| now + e),
+        d => Some(now + crate::server::parse_duration(d)?),
+    };
+    db.set_node_expiry(id, e)?;
+    ok(json!({ "expires": e }))
+}
+
+async fn my_settings(me: Me) -> ApiResult {
+    let Some(a) = me.account else {
+        return Err(ApiError::bad("the admin token has no account"));
+    };
+    ok(json!({ "require_approval": a.require_approval }))
+}
+
+#[derive(Deserialize)]
+struct Settings {
+    #[serde(default)]
+    require_approval: Option<bool>,
+}
+
+/// An account's own settings: whether new machines need approval.
+async fn set_my_settings(State(p): P, me: Me, Json(b): Json<Settings>) -> ApiResult {
+    let Some(a) = me.account else {
+        return Err(ApiError::bad("the admin token has no account"));
+    };
+    if let Some(r) = b.require_approval {
+        p.db.lock().unwrap().set_require_approval(&a.name, r)?;
+    }
+    let a = p.db.lock().unwrap().account(&a.name)?;
+    ok(json!({ "require_approval": a.require_approval }))
+}
+
+async fn account_approval(State(p): P, _op: Op, Path(id): Path<i64>, Json(b): Json<Enabled>) -> ApiResult {
+    let name = account_name(&p, id)?;
+    p.db.lock().unwrap().set_require_approval(&name, b.enabled)?;
+    ok(json!({ "require_approval": b.enabled }))
+}
+
 /// Let a machine route internet traffic for its account's machines, or stop.
 async fn exit_node(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Enabled>) -> ApiResult {
     own_node(&p, &me, id)?;
@@ -490,6 +557,7 @@ async fn keys(State(p): P, me: Me) -> ApiResult {
             json!({
                 "id": k.id, "account": k.account, "prefix": k.prefix, "reusable": k.reusable,
                 "expires": k.expires, "used": k.used, "state": state, "created": k.created,
+                "ephemeral": k.ephemeral, "preapproved": k.preapproved,
             })
         })
         .collect();
@@ -503,6 +571,10 @@ struct NewKey {
     #[serde(default)]
     reusable: bool,
     expires_hours: u32,
+    #[serde(default)]
+    ephemeral: bool,
+    #[serde(default)]
+    preapproved: bool,
 }
 
 async fn create_key(State(p): P, me: Me, Json(b): Json<NewKey>) -> ApiResult {
@@ -511,7 +583,10 @@ async fn create_key(State(p): P, me: Me, Json(b): Json<NewKey>) -> ApiResult {
     }
     let a = target_account(&p, &me, b.account.as_deref())?;
     let exp = now_unix() + b.expires_hours as i64 * 3600;
-    let key = p.db.lock().unwrap().create_authkey(&a.name, b.reusable, Some(exp))?;
+    let key =
+        p.db.lock()
+            .unwrap()
+            .create_authkey_with(&a.name, b.reusable, Some(exp), b.ephemeral, b.preapproved)?;
     ok(json!({ "key": key, "account": a.name }))
 }
 
@@ -741,6 +816,7 @@ async fn accounts(State(p): P, _op: Op) -> ApiResult {
             json!({
                 "id": a.id, "name": a.name, "status": a.status.as_str(), "role": a.role.as_str(),
                 "has_password": a.has_password,
+                "require_approval": a.require_approval,
                 "machines": nodes.iter().filter(|n| n.account_id == a.id).count(),
                 "created": a.created,
             })

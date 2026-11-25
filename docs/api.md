@@ -62,17 +62,20 @@ curl -b jar https://hub.example.com/api/v1/machines
 
 | Method and path | Body | Result |
 |---|---|---|
-| `GET /api/v1/status` | | `{version, domain, signup, account, operator, machines, online}`; operators also get `accounts` and `pending` |
+| `GET /api/v1/status` | | `{version, domain, signup, account, operator, machines, online, awaiting_approval}`; operators also get `accounts` and `pending` |
 | `GET /api/v1/me` | | `{name, operator, admin_token, domain, signup, server, tls_fingerprint}`. `name` is `null` for the admin token. `server` and `tls_fingerprint` are what `tc up` needs. |
+| `GET /api/v1/me/settings`, `POST /api/v1/me/settings` | `{"require_approval": true}` | Your account's settings: whether new machines wait for approval (not for the admin token) |
 | `POST /api/v1/me/password` | `{"current", "new"}` | Changes your password and ends your other sessions (not for the admin token) |
-| `GET /api/v1/machines` | | `[{id, name, account, fqdn, ip, tags, exit_node, hostname, online, last_seen, created, traffic}]`. `traffic` is `{rx, tx, rx_rate, tx_rate, age}` (bytes, bytes/s, seconds since the report), or `null`. |
+| `GET /api/v1/machines` | | `[{id, name, account, fqdn, ip, tags, exit_node, expires, expired, approved, ephemeral, hostname, online, last_seen, created, traffic}]`. `expires` is `null` for never. `traffic` is `{rx, tx, rx_rate, tx_rate, age}` (bytes, bytes/s, seconds since the report), or `null`. |
 | `POST /api/v1/machines/{id}/tags` | `{"tags": "server, db"}` | `{tags}`. Replaces the machine's tags; `""` clears them. |
 | `POST /api/v1/machines/{id}/rename` | `{"name"}` | `{name}` |
+| `POST /api/v1/machines/{id}/approve` | | Lets a machine that waits for its account's approval join |
+| `POST /api/v1/machines/{id}/expiry` | `{"expiry": "never" \| "default" \| "90d"}` | `{expires}`. `default` is the hub's `--key-expiry` from now; a duration counts from now. An expired machine comes back at once. |
 | `POST /api/v1/machines/{id}/exit-node` | `{"enabled": true}` | `{exit_node}`. Lets the machine route internet traffic for its account's machines, or stops it. Off until turned on; Linux machines only. |
 | `GET /api/v1/machines/{id}/traffic` | | `{machine, reported, age, peers: [{peer, ip, rx, tx, rx_rate, tx_rate}]}`. For tenants, peers that aren't the account's own machines or linked by a share show as `another machine`, with no `ip`. |
 | `DELETE /api/v1/machines/{id}` | | Removes the machine and its shares. It's cut off within a second. |
-| `GET /api/v1/keys` | | `[{id, account, prefix, reusable, expires, used, state, created}]`; `state` is `active`, `used`, `expired` or `revoked` |
-| `POST /api/v1/keys` | `{"expires_hours": 24, "reusable"?, "account"?}` | `{key, account}`. The key is shown only here. It expires after 1 hour to 1 year. `account` defaults to your own; operators may name any account. |
+| `GET /api/v1/keys` | | `[{id, account, prefix, reusable, ephemeral, preapproved, expires, used, state, created}]`; `state` is `active`, `used`, `expired` or `revoked` |
+| `POST /api/v1/keys` | `{"expires_hours": 24, "reusable"?, "ephemeral"?, "preapproved"?, "account"?}` | `{key, account}`. The key is shown only here. It expires after 1 hour to 1 year. `account` defaults to your own; operators may name any account. |
 | `POST /api/v1/keys/{id}/revoke` | | Machines that joined with the key stay |
 | `GET /api/v1/rules?account=NAME` | | `{account, rules: [{id, account, from, to, ports}]}`. `account` defaults to your own; operators may name any account. |
 | `POST /api/v1/rules` | `{"from", "to", "ports", "account"?}` | `{id}`. `from` and `to` are `*`, `tag:NAME` or a machine name; `ports` defaults to `*`. An account's first rule switches it from "everything allowed" to "only what the rules allow". |
@@ -90,7 +93,8 @@ curl -b jar https://hub.example.com/api/v1/machines
 
 | Method and path | Body | Result |
 |---|---|---|
-| `GET /api/v1/accounts` | | `[{id, name, status, role, has_password, machines, created}]` |
+| `GET /api/v1/accounts` | | `[{id, name, status, role, has_password, require_approval, machines, created}]` |
+| `POST /api/v1/accounts/{id}/approval` | `{"enabled": true}` | Whether the account's new machines wait for approval |
 | `POST /api/v1/accounts` | `{"name", "password"?, "operator"?}` | `{id, name}`. Without a password, the account can't sign in to the portal and is only for machines. |
 | `POST /api/v1/accounts/{id}/status` | `{"status": "active" \| "suspended"}` | Approve a pending account, suspend, or reactivate. Suspending cuts the account's machines off and ends its sessions. |
 | `POST /api/v1/accounts/{id}/role` | `{"role": "operator" \| "tenant"}` | Ends the account's sessions |

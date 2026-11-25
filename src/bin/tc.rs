@@ -79,6 +79,14 @@ fn bytes(n: u64) -> String {
     }
 }
 
+fn span(s: i64) -> String {
+    match s {
+        ..3600 => format!("{} minutes", s / 60),
+        3600..172_800 => format!("{} hours", s / 3600),
+        _ => format!("{} days", s / 86400),
+    }
+}
+
 fn print_status(s: &Status) {
     match &s.me {
         Some(me) => println!(
@@ -99,6 +107,19 @@ fn print_status(s: &Status) {
     }
     if let Some(n) = &s.notice {
         println!("notice: {n}");
+    }
+    if let Some(me) = &s.me
+        && let Some(e) = me.expires
+    {
+        let left = e - tailconnect::now_unix();
+        match left {
+            ..=0 => println!("key: expired; renew with `sudo tcs up --authkey KEY`"),
+            1..=1_209_600 => println!(
+                "key: expires in {} (renew with `sudo tcs up --authkey KEY`)",
+                span(left)
+            ),
+            _ => {}
+        }
     }
     if s.exit_serving {
         println!("exit node: this machine forwards internet traffic for its account");

@@ -31,6 +31,12 @@ pub struct SNode {
     pub key: String,
     pub tags: Vec<String>,
     pub exit_node: bool,
+    /// Why the machine is cut off from the network (`active` is false):
+    /// its account is suspended or pending, it waits for approval, or its
+    /// key expired. It keeps its keys and connection, and gets an empty map
+    /// with this as the notice.
+    pub cutoff: Option<String>,
+    pub expires: Option<i64>,
 }
 
 /// An account's compiled rules. `None`: no rules, everything allowed.
@@ -45,6 +51,9 @@ pub struct Snapshot {
     policies: HashMap<i64, Policy>,
     /// Accepted shares between active accounts: (node, recipient account) → ports.
     shares: HashMap<(i64, i64), Access>,
+    /// The next moment a machine's key expires: the snapshot must be rebuilt
+    /// then, although nothing in the database changes.
+    pub next_expiry: Option<i64>,
 }
 
 /// One entry of a machine's network map.
@@ -58,20 +67,46 @@ pub struct Peer<'a> {
 
 impl Snapshot {
     pub fn load(db: &Db) -> Result<Self> {
+        let now = crate::now_unix();
+        let mut next_expiry: Option<i64> = None;
         let accounts: HashMap<i64, Status> = db.accounts()?.into_iter().map(|a| (a.id, a.status)).collect();
         let nodes: Vec<SNode> = db
             .nodes()?
             .into_iter()
-            .map(|n| SNode {
-                id: n.id,
-                active: accounts.get(&n.account_id) == Some(&Status::Active),
-                account_id: n.account_id,
-                account: n.account,
-                name: n.name,
-                ip: n.ip,
-                key: n.key,
-                tags: n.tags,
-                exit_node: n.exit_node,
+            .map(|n| {
+                let cutoff = match accounts.get(&n.account_id) {
+                    Some(Status::Active) => None,
+                    Some(Status::Pending) => Some(format!("account {} is waiting for approval", n.account)),
+                    _ => Some(format!("account {} is suspended", n.account)),
+                }
+                .or_else(|| {
+                    (!n.approved).then(|| {
+                        format!(
+                            "this machine is waiting for approval by account {} or an operator",
+                            n.account
+                        )
+                    })
+                })
+                .or_else(|| {
+                    n.expired(now)
+                        .then(|| "this machine's key has expired: renew it with `tcs up --authkey KEY`".to_string())
+                });
+                if let Some(e) = n.expires.filter(|e| *e > now) {
+                    next_expiry = Some(next_expiry.map_or(e, |x: i64| x.min(e)));
+                }
+                SNode {
+                    id: n.id,
+                    active: cutoff.is_none(),
+                    cutoff,
+                    expires: n.expires,
+                    account_id: n.account_id,
+                    account: n.account,
+                    name: n.name,
+                    ip: n.ip,
+                    key: n.key,
+                    tags: n.tags,
+                    exit_node: n.exit_node,
+                }
             })
             .collect();
         let mut policies: HashMap<i64, Policy> = HashMap::new();
@@ -114,6 +149,7 @@ impl Snapshot {
             by_key,
             policies,
             shares,
+            next_expiry,
         })
     }
 
@@ -308,6 +344,33 @@ mod tests {
         assert!(exits(tablet).is_empty());
         w.db.set_exit_node(gw, false).unwrap();
         assert!(exits(laptop).is_empty());
+    }
+
+    #[test]
+    fn unapproved_and_expired_machines_are_cut_off() {
+        let mut w = World::new(&["richard"]);
+        let a = w.add("richard", "a");
+        let b = w.add("richard", "b");
+        let c = w.add("richard", "c");
+        let now = crate::now_unix();
+        w.db.set_node_expiry(b, Some(now - 1)).unwrap();
+        w.db.set_node_expiry(c, Some(now + 3600)).unwrap();
+        w.db.set_require_approval("richard", true).unwrap();
+        let d = w.add("richard", "d");
+        let s = Snapshot::load(&w.db).unwrap();
+        let node = |id| s.nodes.iter().find(|n| n.id == id).unwrap();
+        assert!(node(b).cutoff.as_deref().unwrap().contains("expired"));
+        assert!(node(d).cutoff.as_deref().unwrap().contains("waiting for approval"));
+        assert!(s.peers_of(node(b)).is_none() && s.peers_of(node(d)).is_none());
+        assert_eq!(
+            w.map(a),
+            vec!["c.richard=*"],
+            "cut-off machines are invisible to others"
+        );
+        assert_eq!(s.next_expiry, Some(now + 3600), "the next expiry to rebuild at");
+        w.db.approve_node(d).unwrap();
+        w.db.set_node_expiry(b, None).unwrap();
+        assert_eq!(w.map(a), vec!["b.richard=*", "c.richard=*", "d.richard=*"]);
     }
 
     #[test]
