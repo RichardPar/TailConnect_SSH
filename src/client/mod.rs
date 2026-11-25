@@ -711,11 +711,11 @@ impl Daemon {
             } else {
                 me.zone.clone()
             };
-            (
-                search,
-                net.zone.routed_zones(),
-                self.exit_in_use.read().unwrap().is_some(),
-            )
+            // The search domain is routed here anyway. Listing it again as a
+            // routing-only domain (`~zone`) would make resolved drop it as a
+            // search domain, and short names would stop working.
+            let routes: Vec<String> = net.zone.routed_zones().into_iter().filter(|z| *z != search).collect();
+            (search, routes, self.exit_in_use.read().unwrap().is_some())
         };
         let mut applied = self.dns_applied.lock().unwrap();
         if applied.as_ref() == Some(&want) {
