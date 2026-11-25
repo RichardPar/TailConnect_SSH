@@ -53,14 +53,17 @@ pub struct ServerTls {
 /// ALPN protocol id for browsers: the web portal shares port 443 with SSH.
 pub const ALPN_HTTP: &[u8] = b"http/1.1";
 
-impl ServerTls {
-    /// The same certificate, also offering HTTP/1.1 for the web portal. SSH
-    /// clients ask for `tc-ssh/1` and still get it; browsers don't offer it.
-    pub fn with_http(&self) -> Arc<ServerConfig> {
-        let mut c = (*self.config).clone();
-        c.alpn_protocols = vec![crate::ALPN.to_vec(), ALPN_HTTP.to_vec()];
-        Arc::new(c)
-    }
+/// A server config whose certificate comes from `resolver` (Let's Encrypt).
+pub fn server_with_resolver(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    alpn: Vec<Vec<u8>>,
+) -> Result<Arc<ServerConfig>> {
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = alpn;
+    Ok(Arc::new(config))
 }
 
 fn build_server(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerTls> {

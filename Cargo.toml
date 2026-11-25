@@ -13,6 +13,7 @@ hex = "0.4.3"
 hyper = { version = "1.13.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service"] }
 if-addrs = "0.15.0"
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "x509-parser"] }
 rand = "0.10"
 rcgen = "0.14.10"
 rpassword = "7.5.5"
@@ -32,6 +33,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tun = { version = "0.8.15", features = ["async"] }
 webpki-roots = "1.0.12"
+x509-parser = "0.18"
 
 # Optimise dependencies (crypto) even in debug builds.
 [profile.dev.package."*"]

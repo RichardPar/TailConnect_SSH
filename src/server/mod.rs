@@ -11,6 +11,7 @@
 //! between machines that are in each other's maps; the receiving machine's
 //! packet filter enforces the rest.
 
+pub mod acme;
 pub mod auth;
 pub mod db;
 pub mod policy;
@@ -43,6 +44,9 @@ pub struct Options {
     pub portal: Option<PortalOptions>,
     /// Addresses new machines get (within 100.64.0.0/10).
     pub ip_pool: (u32, u32),
+    /// Get and renew the certificate from Let's Encrypt (or another ACME
+    /// server). `tls` is then only served until the first one arrives.
+    pub acme: Option<acme::Config>,
 }
 
 pub struct PortalOptions {
@@ -215,11 +219,41 @@ pub async fn run(opts: Options) -> Result<()> {
         Some(po) => Some(start_portal(&hub, &opts, po).await?),
         None => None,
     };
-    let tls = TlsAcceptor::from(if portal.is_some() {
-        opts.tls.with_http()
-    } else {
-        opts.tls.config.clone()
-    });
+    // ALPN: tcd asks for tc-ssh/1, browsers for http/1.1, ACME validators
+    // for acme-tls/1.
+    let mut alpn = vec![crate::ALPN.to_vec()];
+    if portal.is_some() {
+        alpn.push(crate::tls::ALPN_HTTP.to_vec());
+    }
+    let tls_config = match &opts.acme {
+        None => {
+            let mut c = (*opts.tls.config).clone();
+            c.alpn_protocols = alpn;
+            Arc::new(c)
+        }
+        Some(a) => {
+            // Serve the self-signed certificate until the first one arrives.
+            let fallback = acme::certified_key(
+                &std::fs::read(opts.state_dir.join("tls-cert.pem")).context("reading the fallback certificate")?,
+                &std::fs::read(opts.state_dir.join("tls-key.pem")).context("reading the fallback key")?,
+            )?;
+            let store = acme::CertStore::new(fallback);
+            if matches!(a.method, acme::Method::TlsAlpn) {
+                alpn.push(acme::ALPN_ACME.to_vec());
+            }
+            if let acme::Method::Http(addr) = a.method {
+                let s = store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = acme::serve_http01(addr, s).await {
+                        warn!("{e:#}");
+                    }
+                });
+            }
+            tokio::spawn(acme::run(Arc::new(a.clone()), store.clone()));
+            crate::tls::server_with_resolver(store, alpn)?
+        }
+    };
+    let tls = TlsAcceptor::from(tls_config);
     let listener = TcpListener::bind(opts.listen)
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
@@ -243,7 +277,12 @@ pub async fn run(opts: Options) -> Result<()> {
                 Err(_) => return debug!("{peer}: TLS handshake timed out"),
             };
             // tcd asks for tc-ssh/1; anything else (browsers) is the portal.
-            let is_ssh = tls.get_ref().1.alpn_protocol() == Some(crate::ALPN);
+            let alpn = tls.get_ref().1.alpn_protocol();
+            if alpn == Some(acme::ALPN_ACME) {
+                // A TLS-ALPN-01 validation: the handshake was the answer.
+                return;
+            }
+            let is_ssh = alpn == Some(crate::ALPN);
             if !is_ssh {
                 if let Some(router) = portal {
                     portal::serve_conn(router, tls, portal::ConnInfo { peer, tls: true }).await;
@@ -270,6 +309,9 @@ async fn start_portal(hub: &Arc<Hub>, opts: &Options, po: &PortalOptions) -> Res
     let db = db::Db::open(&opts.state_dir.join("tailconnect.db"))?;
     let mut hosts: Vec<String> = po.hosts.iter().map(|h| h.trim().to_ascii_lowercase()).collect();
     hosts.extend(opts.tls.names.iter().cloned());
+    if let Some(a) = &opts.acme {
+        hosts.extend(a.domains.iter().cloned());
+    }
     if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         hosts.push(h.trim().to_ascii_lowercase());
     }
@@ -293,8 +335,13 @@ async fn start_portal(hub: &Arc<Hub>, opts: &Options, po: &PortalOptions) -> Res
     let cfg = portal::Config {
         signup: po.signup,
         domain: opts.domain.clone(),
-        public_server: po.public_server.clone(),
-        tls_fingerprint: opts.tls.self_signed.then(|| opts.tls.fingerprint.clone()),
+        // With Let's Encrypt, join commands name the certificate's domain and
+        // need no fingerprint.
+        public_server: match (&opts.acme, po.public_server.is_empty()) {
+            (Some(a), true) => a.domains[0].clone(),
+            _ => po.public_server.clone(),
+        },
+        tls_fingerprint: (opts.tls.self_signed && opts.acme.is_none()).then(|| opts.tls.fingerprint.clone()),
         hosts,
     };
     info!(

@@ -81,6 +81,32 @@ A valid invite skips approval in every mode except `off`.
 - `--portal-listen 127.0.0.1:7741` also serves the portal over plain HTTP, for use through `ssh -L`. On any other address it warns that passwords would cross the network unencrypted.
 - `--no-portal` turns the portal off.
 
+### HTTPS with Let's Encrypt
+
+The hub can get a free, publicly trusted certificate from Let's Encrypt and renew it by itself: no certbot, no web server, no cron job. Machines then join with just `--server hub.example.com`, without `--tls-fingerprint`, and browsers trust the portal.
+
+**What you need:**
+- a DNS name pointing at the hub's public address;
+- one of the three ways for Let's Encrypt to check that the name is yours:
+
+| Check | Options | What must be reachable from the internet |
+|---|---|---|
+| TLS-ALPN-01 (default) | `--listen [::]:443 --acme-domain hub.example.com` | The hub's port 443. The check is answered on the same port as SSH and the portal. Behind a router that forwards 443 to another port, add `--public-url hub.example.com`. |
+| HTTP-01 | `--listen [::]:8443 --acme-http-listen [::]:80 --acme-domain hub.example.com` | Port 80, which answers the checks and redirects everything else to HTTPS |
+| DNS-01 with DuckDNS | `--acme-domain myhub.duckdns.org --acme-dns duckdns`, with `TC_DUCKDNS_TOKEN=…` in `/etc/default/tailconnect-ssh-control` | Nothing. The hub sets the TXT record through DuckDNS's API, and waits until DuckDNS's name servers serve it before asking Let's Encrypt to check. |
+
+`tc-control` refuses settings that can't work, such as TLS-ALPN-01 with `--listen` on another port and no `--public-url`, instead of failing later.
+
+**How it behaves:**
+- **Getting the certificate.** At start, the hub serves its self-signed certificate until the real one arrives, usually within a minute.
+- **Renewal.** It renews after two thirds of the certificate's lifetime (30 days before expiry), with no restart.
+- **Failures.** It retries after 2 minutes, 10 minutes, an hour, then every 6 hours, and logs why (`journalctl -u tailconnect-ssh-control | grep acme`).
+- **Test service.** Try `--acme-staging` first: Let's Encrypt's test service has generous rate limits, but its certificates aren't trusted. Test and real certificates are stored apart, so dropping `--acme-staging` needs no cleanup.
+- **Other options.** `--acme-email` sets the account's contact address. `--acme-directory URL` uses another ACME server, and `--acme-ca-root PEM` trusts its test CA.
+- **Storage.** Certificates and the ACME account are kept in `acme/` in the hub's state directory. Losing it only means fetching again.
+
+**Machines that joined with a pinned self-signed certificate** stop connecting once the hub serves the Let's Encrypt one, because the pin no longer matches. Point each at the name: `sudo tcs up --server hub.example.com`. A new server address drops the old pin, and the machine keeps its registration and address; no auth key is needed.
+
 ### Security notes
 
 - **All traffic between machines is end-to-end encrypted.** Direct paths are SSH sessions between the two machines. Relayed traffic is sealed with per-pair Noise sessions that the hub can't read or forge. The hub still sees metadata: which machines talk to each other, when, and how much.
@@ -178,7 +204,14 @@ The admin commands work on the database directly, whether or not the hub is runn
 ```sh
 cargo test                    # unit tests: framing, DNS, packets, database, keys, e2e crypto, ACLs, filter, policy, portal API
 cargo build && tests/e2e-netns.sh   # end to end, no root needed
+PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebble, no root needed
 ```
+
+`tests/acme-pebble.sh` tests built-in Let's Encrypt against [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test ACME server. Get `pebble` and `pebble-challtestsrv` from Pebble's releases and check their SHA-256 digests. The script checks:
+- all three ways of proving the name;
+- that port 80 redirects to HTTPS;
+- renewal of 90-second certificates, without a restart;
+- reuse of the saved certificate after a restart.
 
 `tests/e2e-netns.sh` runs a hub and three machines in two accounts, in unprivileged user and network namespaces linked by veth pairs. It checks:
 
@@ -201,11 +234,12 @@ Done (Linux MVP):
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
+- built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
 - an admin CLI, systemd units, and unit and end-to-end tests.
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Built-in Let's Encrypt; traffic reports in the portal; an admin HTTP API for scripts
+1. Traffic reports in the portal; an admin HTTP API for scripts
 2. IPv6 inside the tunnel, exit nodes
 3. Key expiry, machine approval, ephemeral machines; per-account DNS domains
 4. Windows (Wintun) and Android (VpnService) clients

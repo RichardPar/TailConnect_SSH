@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tailconnect::server::{
-    self,
+    self, acme,
     db::{Db, Role, Status},
     portal::Signup,
 };
@@ -51,6 +51,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Serve has many options; the enum is parsed once.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the hub.
@@ -93,6 +95,32 @@ enum Cmd {
         /// example 127.0.0.1:7741 for use through an SSH tunnel.
         #[arg(long)]
         portal_listen: Option<SocketAddr>,
+        /// Get the certificate from Let's Encrypt for these names
+        /// (comma-separated), and renew it automatically.
+        #[arg(long, conflicts_with = "tls_cert")]
+        acme_domain: Option<String>,
+        /// Contact address for the Let's Encrypt account (optional).
+        #[arg(long, requires = "acme_domain")]
+        acme_email: Option<String>,
+        /// Use Let's Encrypt's test service (untrusted certificates, generous limits).
+        #[arg(long, requires = "acme_domain", conflicts_with = "acme_directory")]
+        acme_staging: bool,
+        /// Another ACME server's directory URL.
+        #[arg(long, requires = "acme_domain")]
+        acme_directory: Option<String>,
+        /// PEM root certificate to trust for the ACME server's own HTTPS
+        /// (for test servers such as Pebble).
+        #[arg(long, requires = "acme_domain")]
+        acme_ca_root: Option<PathBuf>,
+        /// Prove the name through DNS instead of a connection: `duckdns`
+        /// (token in the TC_DUCKDNS_TOKEN environment variable). No port has
+        /// to be reachable for Let's Encrypt.
+        #[arg(long, requires = "acme_domain")]
+        acme_dns: Option<String>,
+        /// Answer Let's Encrypt's checks on this port-80 address (for example
+        /// [::]:80), when --listen isn't reachable as port 443.
+        #[arg(long, requires = "acme_domain", conflicts_with = "acme_dns")]
+        acme_http_listen: Option<SocketAddr>,
     },
     /// Print the TLS fingerprint and SSH host key clients need to pin.
     Fingerprint,
@@ -608,11 +636,73 @@ async fn main() -> Result<()> {
             public_url,
             portal_hosts,
             portal_listen,
+            acme_domain,
+            acme_email,
+            acme_staging,
+            acme_directory,
+            acme_ca_root,
+            acme_dns,
+            acme_http_listen,
         } => {
             let domain = domain.trim_matches('.').to_ascii_lowercase();
             if domain.is_empty() {
                 bail!("--domain must not be empty");
             }
+            let acme = match acme_domain {
+                None => None,
+                Some(d) => {
+                    let domains = acme::parse_domains(&d)?;
+                    let method = match (acme_dns.as_deref(), acme_http_listen) {
+                        (Some("duckdns"), _) => {
+                            let token = std::env::var("TC_DUCKDNS_TOKEN").unwrap_or_default();
+                            if token.trim().is_empty() {
+                                bail!("--acme-dns duckdns needs the DuckDNS token in TC_DUCKDNS_TOKEN");
+                            }
+                            if domains.len() != 1 || !domains[0].ends_with(".duckdns.org") {
+                                bail!("--acme-dns duckdns takes one NAME.duckdns.org domain");
+                            }
+                            acme::Method::DuckDns {
+                                token: token.trim().to_string(),
+                            }
+                        }
+                        (Some(other), _) => bail!("--acme-dns: unknown provider {other:?} (only duckdns)"),
+                        (None, Some(addr)) => acme::Method::Http(addr),
+                        (None, None) => {
+                            // TLS-ALPN-01: Let's Encrypt connects to port 443.
+                            let public_443 = !public_url.is_empty()
+                                && tailconnect::client::parse_server(&public_url).is_ok_and(|(_, p)| p == 443);
+                            if listen.port() != 443 && !public_443 {
+                                bail!(
+                                    "Let's Encrypt checks the name on port 443, but --listen is port {}: listen on 443, \
+                                     forward port 443 to this one and say so with --public-url HOST, use \
+                                     --acme-http-listen [::]:80, or --acme-dns duckdns",
+                                    listen.port()
+                                );
+                            }
+                            acme::Method::TlsAlpn
+                        }
+                    };
+                    let directory = match (acme_staging, acme_directory) {
+                        (true, _) => acme::LETS_ENCRYPT_STAGING.to_string(),
+                        (false, Some(d)) => d,
+                        (false, None) => acme::LETS_ENCRYPT.to_string(),
+                    };
+                    Some(acme::Config {
+                        domains,
+                        email: acme_email.filter(|e| !e.trim().is_empty()),
+                        directory,
+                        ca_root: acme_ca_root,
+                        method,
+                        dir: cli.state_dir.join("acme"),
+                    })
+                }
+            };
+            // With Let's Encrypt, the self-signed certificate (for its names)
+            // is served only until the first real one arrives.
+            let tls_names = match (&acme, tls_names.is_empty()) {
+                (Some(a), true) => a.domains.clone(),
+                _ => tls_names,
+            };
             let tls = load_tls(&cli.state_dir, tls_cert, tls_key, tls_names)?;
             let portal = if no_portal {
                 None
@@ -631,6 +721,7 @@ async fn main() -> Result<()> {
                 tls,
                 portal,
                 ip_pool: tailconnect::server::db::parse_pool(&ip_pool)?,
+                acme,
             })
             .await
         }

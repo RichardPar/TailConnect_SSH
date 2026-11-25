@@ -51,8 +51,9 @@ hub)
     ln -sf "$PREFIX/bin/tc-control" /usr/local/bin/tcs-control
     install -m 0644 "$HERE/tailconnect-ssh-control.service" "$UNITS/"
     if [ ! -f /etc/default/tailconnect-ssh-control ]; then
-        printf '# Arguments for `tc-control serve` (see `tc-control serve --help`).\nTC_CONTROL_ARGS="%s"\n' "$*" \
-            >/etc/default/tailconnect-ssh-control
+        # Readable by root only: it may hold TC_DUCKDNS_TOKEN.
+        (umask 077 && printf '# Arguments for `tc-control serve` (see `tc-control serve --help`).\nTC_CONTROL_ARGS="%s"\n# For --acme-dns duckdns:\n#TC_DUCKDNS_TOKEN=\n' "$*" \
+            >/etc/default/tailconnect-ssh-control)
     elif [ $# -gt 0 ]; then
         echo "keeping /etc/default/tailconnect-ssh-control (edit it to change the hub's arguments)"
     fi
