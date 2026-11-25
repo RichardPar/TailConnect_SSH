@@ -138,6 +138,8 @@ pub struct Daemon {
     /// What each peer may open on this machine; enforced on every packet
     /// that arrives.
     filter: Mutex<crate::filter::Filter>,
+    /// Bytes (received, sent) per peer since the tunnel started.
+    traffic: Mutex<HashMap<Ipv4Addr, (u64, u64)>>,
     next_link: AtomicU64,
 }
 
@@ -169,6 +171,7 @@ impl Daemon {
             next_link: AtomicU64::new(1),
             e2e,
             filter: Mutex::new(Default::default()),
+            traffic: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -232,6 +235,7 @@ impl Daemon {
         *self.tun_tx.write().unwrap() = None;
         *self.hub_tx.write().unwrap() = None;
         self.filter.lock().unwrap().set_peers([]);
+        self.traffic.lock().unwrap().clear();
         *self.net.write().unwrap() = Net::default();
         self.e2e.sync(&[]);
         self.set_phase(phase);
@@ -387,6 +391,41 @@ impl Daemon {
         });
         let _ep_guard = scopeguard(move || ep_task.abort());
 
+        // Traffic counts for the portal, while they change.
+        let tx_tr = tx.clone();
+        let d = self.clone();
+        let every = std::env::var("TC_TRAFFIC_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30u64)
+            .max(1);
+        let tr_task = tokio::spawn(async move {
+            let mut last: Vec<crate::proto::PeerTraffic> = Vec::new();
+            loop {
+                tokio::time::sleep(Duration::from_secs(every)).await;
+                let mut now: Vec<crate::proto::PeerTraffic> = d
+                    .traffic
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(ip, (rx, tx))| crate::proto::PeerTraffic {
+                        ip: *ip,
+                        rx: *rx,
+                        tx: *tx,
+                    })
+                    .collect();
+                now.sort_by_key(|p| p.ip);
+                if now != last {
+                    let m = ClientMsg::Traffic { peers: now.clone() };
+                    if tx_tr.send(Frame::control(&m)).await.is_err() {
+                        break;
+                    }
+                    last = now;
+                }
+            }
+        });
+        let _tr_guard = scopeguard(move || tr_task.abort());
+
         // End-to-end session housekeeping: handshake retries and expiry.
         let tx_tick = tx.clone();
         let d = self.clone();
@@ -528,6 +567,8 @@ impl Daemon {
         if let Some(old) = tun.take() {
             old.cancel.cancel();
         }
+        // Totals count from when the tunnel started.
+        self.traffic.lock().unwrap().clear();
         let mask = if prefix_len == 0 {
             0
         } else {
@@ -602,6 +643,7 @@ impl Daemon {
             return;
         }
         self.filter.lock().unwrap().outbound(&pkt, Instant::now());
+        self.traffic.lock().unwrap().entry(dst).or_default().1 += pkt.len() as u64;
         let pkt = match direct {
             Some(tx) => match tx.try_send(Frame::packet(pkt)) {
                 Ok(()) => return,
@@ -659,6 +701,7 @@ impl Daemon {
         if !self.filter.lock().unwrap().inbound(&pkt, Instant::now()) {
             return;
         }
+        self.traffic.lock().unwrap().entry(via).or_default().0 += pkt.len() as u64;
         let tun = self.tun_tx.read().unwrap().clone();
         if let Some(tx) = tun {
             let _ = tx.try_send(pkt);
@@ -696,6 +739,7 @@ impl Daemon {
     }
 
     fn status(&self) -> api::Status {
+        let traffic = self.traffic.lock().unwrap().clone();
         let st = self.state.lock().unwrap().clone();
         let net = self.net.read().unwrap();
         let mut peers: Vec<api::PeerStatus> = net
@@ -717,6 +761,8 @@ impl Daemon {
                 },
                 endpoints: p.node.endpoints.clone(),
                 e2e: self.e2e.established(p.node.ip),
+                rx: traffic.get(&p.node.ip).map_or(0, |t| t.0),
+                tx: traffic.get(&p.node.ip).map_or(0, |t| t.1),
             })
             .collect();
         peers.sort_by_key(|p| p.ip);

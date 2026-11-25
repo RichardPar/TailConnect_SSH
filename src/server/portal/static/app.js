@@ -133,6 +133,43 @@ function table(headers, rows, empty) {
       el("tbody", {}, rows.length ? rows : el("tr", {}, el("td", { class: "empty", colspan: headers.length }, empty)))));
 }
 
+function fmtBytes(n) {
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + u[i];
+}
+function fmtRate(n) { return fmtBytes(n) + "/s"; }
+
+// Traffic cell: current speeds, and totals since the machine's tunnel started.
+function trafficCell(m) {
+  if (!m.traffic) return el("td", { class: "sub", title: "No report: idle, offline, or an older tcd" }, "–");
+  const t = m.traffic;
+  return el("td", {},
+    el("button", { class: "link traffic", title: "Traffic per peer", onclick: () => showTraffic(m) },
+      el("div", {}, "↓ " + fmtRate(t.rx_rate) + "  ↑ " + fmtRate(t.tx_rate)),
+      el("div", { class: "sub" }, fmtBytes(t.rx) + " / " + fmtBytes(t.tx))));
+}
+
+async function showTraffic(m) {
+  let r;
+  try { r = await api("GET", "/machines/" + m.id + "/traffic"); } catch (e) { toast(e.message, true); return; }
+  const rows = r.peers.map((x) => el("tr", {},
+    el("td", {}, x.peer, x.ip ? el("div", { class: "sub mono" }, x.ip) : null),
+    el("td", {}, fmtRate(x.rx_rate)), el("td", {}, fmtRate(x.tx_rate)),
+    el("td", {}, fmtBytes(x.rx)), el("td", {}, fmtBytes(x.tx))));
+  const d = el("dialog", { class: "wide" },
+    el("h3", {}, "Traffic of " + r.machine),
+    el("p", { class: "hint" }, r.reported
+      ? "From " + m.name + "'s point of view: ↓ received, ↑ sent. Speeds are averages over its last report interval; totals count from when its tunnel started. Last report " + ago(Math.floor(Date.now() / 1000) - r.age) + "."
+      : "This machine hasn't reported any traffic."),
+    table(["Peer", "↓ speed", "↑ speed", "↓ total", "↑ total"], rows, "No traffic."),
+    el("div", { class: "buttons" }, el("button", { class: "primary", onclick: () => d.close() }, "Close")));
+  d.addEventListener("close", () => d.remove());
+  document.body.append(d);
+  d.showModal();
+}
+
 function badge(text, kind) {
   return el("span", { class: "badge " + (kind || "") }, text);
 }
@@ -350,6 +387,7 @@ async function machinesTab() {
     el("td", { class: "mono" }, m.ip),
     el("td", {}, m.hostname),
     el("td", {}, m.online ? "now" : ago(m.last_seen)),
+    trafficCell(m),
     el("td", { class: "actions" },
       el("button", { onclick: async () => {
         const r = await ask("Tags for " + m.name, [{ name: "tags", label: "Tags, separated by commas (for example server, db)", value: m.tags.join(", ") }]);
@@ -362,7 +400,7 @@ async function machinesTab() {
       el("button", { class: "danger", onclick: async () => {
         if (await confirmDo("Remove " + m.name + "? It needs a new auth key to join again.")) act(() => api("DELETE", "/machines/" + m.id), "Removed");
       } }, "Remove"))));
-  return [cards, table(["", "Name", ops ? "Account" : null, "Address", "Hostname", "Last seen", ""].filter((h) => h !== null), rows, "No machines yet: create an auth key and join one.")];
+  return [cards, table(["", "Name", ops ? "Account" : null, "Address", "Hostname", "Last seen", "Traffic", ""].filter((h) => h !== null), rows, "No machines yet: create an auth key and join one.")];
 }
 
 // ---------- auth keys ----------

@@ -170,6 +170,10 @@ input[type=checkbox] { min-width: 0; }
 .auth .err { color: var(--bad); min-height: 1.2em; }
 
 dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text); padding: 1.25rem; min-width: 320px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+dialog.wide { min-width: min(640px, 92vw); }
+dialog .panel { margin: 0.5rem 0; }
+button.link.traffic { text-align: left; color: var(--text); white-space: nowrap; }
+button.link.traffic:hover { color: var(--accent); }
 dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 dialog h3 { margin: 0 0 0.75rem; font-size: 1rem; }
 dialog form { display: flex; flex-direction: column; gap: 0.75rem; }

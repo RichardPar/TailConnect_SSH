@@ -78,6 +78,11 @@ pub struct PeerStatus {
     /// An end-to-end session for relayed traffic is established.
     #[serde(default)]
     pub e2e: bool,
+    /// Bytes received from and sent to the peer since the tunnel started.
+    #[serde(default)]
+    pub rx: u64,
+    #[serde(default)]
+    pub tx: u64,
 }
 
 /// Send one request to `tcd`.

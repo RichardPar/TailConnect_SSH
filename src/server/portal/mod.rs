@@ -98,6 +98,9 @@ struct Session {
 /// Addresses with a session to the hub right now.
 pub type OnlineFn = Arc<dyn Fn() -> HashSet<Ipv4Addr> + Send + Sync>;
 
+/// The machines' latest traffic reports, by address.
+pub type TrafficFn = Arc<dyn Fn() -> HashMap<Ipv4Addr, crate::server::TrafficReport> + Send + Sync>;
+
 pub struct Portal {
     cfg: Config,
     db: Mutex<Db>,
@@ -106,6 +109,7 @@ pub struct Portal {
     by_account: Limiter,
     hashing: Semaphore,
     online: OnlineFn,
+    traffic: TrafficFn,
 }
 
 /// The connection a request arrived on.
@@ -139,7 +143,7 @@ fn hash_token(t: &str) -> String {
 }
 
 impl Portal {
-    pub fn new(cfg: Config, db: Db, online: OnlineFn) -> Arc<Self> {
+    pub fn new(cfg: Config, db: Db, online: OnlineFn, traffic: TrafficFn) -> Arc<Self> {
         Arc::new(Portal {
             cfg,
             db: Mutex::new(db),
@@ -148,6 +152,7 @@ impl Portal {
             by_account: Limiter::new(20, Duration::from_secs(60)),
             hashing: Semaphore::new(4),
             online,
+            traffic,
         })
     }
 

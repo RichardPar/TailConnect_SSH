@@ -91,6 +91,7 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/machines/{id}", delete(remove_machine))
         .route("/machines/{id}/tags", post(tag_machine))
         .route("/machines/{id}/rename", post(rename_machine))
+        .route("/machines/{id}/traffic", get(machine_traffic))
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}/revoke", post(revoke_key))
         .route("/rules", get(rules).post(add_rule))
@@ -286,6 +287,7 @@ async fn change_password(
 
 async fn machines(State(p): P, me: Me) -> ApiResult {
     let online = (p.online)();
+    let traffic = (p.traffic)();
     let nodes = p.db.lock().unwrap().nodes()?;
     let v: Vec<Value> = nodes
         .into_iter()
@@ -300,6 +302,13 @@ async fn machines(State(p): P, me: Me) -> ApiResult {
                 "tags": n.tags,
                 "hostname": n.hostname,
                 "online": online.contains(&n.ip),
+                "traffic": traffic.get(&n.ip).map(|r| {
+                    let (rx, tx, rr, tr) = r.peers.values().fold((0u64, 0u64, 0f64, 0f64), |a, v| {
+                        (a.0 + v.0, a.1 + v.1, a.2 + v.2, a.3 + v.3)
+                    });
+                    json!({ "rx": rx, "tx": tx, "rx_rate": rr.round(), "tx_rate": tr.round(),
+                            "age": r.at.elapsed().as_secs() })
+                }),
                 "last_seen": n.last_seen,
                 "created": n.created,
             })
@@ -315,6 +324,54 @@ fn own_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, 
         return Err(ApiError::not_found());
     }
     Ok(n)
+}
+
+/// Whom one of `me`'s machines exchanges data with. Peers are named if
+/// `me` may know them: operators see all; tenants see their own account's
+/// machines and machines linked to theirs by a share. Others show as
+/// "another machine" (a machine since removed, or a share that ended).
+async fn machine_traffic(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
+    let n = own_node(&p, &me, id)?;
+    let report = (p.traffic)().remove(&n.ip);
+    let Some(report) = report else {
+        return ok(json!({ "machine": format!("{}.{}", n.name, n.account), "reported": false, "peers": [] }));
+    };
+    let db = p.db.lock().unwrap();
+    let nodes: std::collections::HashMap<std::net::Ipv4Addr, crate::server::db::NodeRow> =
+        db.nodes()?.into_iter().map(|x| (x.ip, x)).collect();
+    let shares: Vec<(i64, i64)> = db
+        .shares()?
+        .into_iter()
+        .filter(|s| s.accepted)
+        .map(|s| (s.node_id, s.account_id))
+        .collect();
+    drop(db);
+    let named = |peer: &crate::server::db::NodeRow| {
+        me.operator
+            || peer.account_id == n.account_id
+            || shares.contains(&(peer.id, n.account_id))
+            || shares.contains(&(n.id, peer.account_id))
+    };
+    let mut peers: Vec<(String, Value)> = report
+        .peers
+        .iter()
+        .map(|(ip, (rx, tx, rr, tr))| {
+            let (name, addr) = match nodes.get(ip).filter(|x| named(x)) {
+                Some(x) => (format!("{}.{}", x.name, x.account), Some(ip.to_string())),
+                None => ("another machine".to_string(), None),
+            };
+            let v =
+                json!({ "peer": name, "ip": addr, "rx": rx, "tx": tx, "rx_rate": rr.round(), "tx_rate": tr.round() });
+            (name, v)
+        })
+        .collect();
+    peers.sort_by(|a, b| a.0.cmp(&b.0));
+    ok(json!({
+        "machine": format!("{}.{}", n.name, n.account),
+        "reported": true,
+        "age": report.at.elapsed().as_secs(),
+        "peers": peers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    }))
 }
 
 #[derive(Deserialize)]

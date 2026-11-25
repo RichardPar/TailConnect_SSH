@@ -82,6 +82,56 @@ pub struct Hub {
     next_conn: AtomicU64,
     /// Accounts, machines, rules and shares, from one read of the database.
     snapshot: RwLock<Arc<policy::Snapshot>>,
+    /// The latest traffic report of each machine, by address. In memory only.
+    traffic: Mutex<HashMap<Ipv4Addr, TrafficReport>>,
+}
+
+/// A machine's latest traffic report, with speeds from the one before.
+#[derive(Clone, Debug)]
+pub struct TrafficReport {
+    pub at: std::time::Instant,
+    /// Peer address → (received, sent, receive rate, send rate), bytes and bytes/s.
+    pub peers: HashMap<Ipv4Addr, (u64, u64, f64, f64)>,
+}
+
+/// Speeds older than this are shown as zero: the machine stopped reporting,
+/// so its traffic stopped.
+pub const TRAFFIC_STALE: Duration = Duration::from_secs(90);
+
+impl Hub {
+    fn record_traffic(&self, ip: Ipv4Addr, peers: Vec<crate::proto::PeerTraffic>) {
+        let now = std::time::Instant::now();
+        let mut all = self.traffic.lock().unwrap();
+        let prev = all.get(&ip).cloned();
+        let mut map = HashMap::new();
+        for p in peers.into_iter().take(4096) {
+            let (rr, tr) = match prev.as_ref().and_then(|r| r.peers.get(&p.ip).map(|o| (r.at, *o))) {
+                Some((at, (orx, otx, _, _))) if p.rx >= orx && p.tx >= otx => {
+                    let dt = now.duration_since(at).as_secs_f64().max(1.0);
+                    ((p.rx - orx) as f64 / dt, (p.tx - otx) as f64 / dt)
+                }
+                // First report, or the tunnel restarted: no speed yet.
+                _ => (0.0, 0.0),
+            };
+            map.insert(p.ip, (p.rx, p.tx, rr, tr));
+        }
+        all.insert(ip, TrafficReport { at: now, peers: map });
+    }
+
+    /// Traffic reports, with stale speeds zeroed.
+    fn traffic(&self) -> HashMap<Ipv4Addr, TrafficReport> {
+        let now = std::time::Instant::now();
+        let mut out = self.traffic.lock().unwrap().clone();
+        for r in out.values_mut() {
+            if now.duration_since(r.at) > TRAFFIC_STALE {
+                for v in r.peers.values_mut() {
+                    v.2 = 0.0;
+                    v.3 = 0.0;
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A machine's view of the network.
@@ -210,6 +260,7 @@ pub async fn run(opts: Options) -> Result<()> {
         map_version: watch::channel(0).0,
         next_conn: AtomicU64::new(1),
         snapshot: RwLock::new(Arc::default()),
+        traffic: Mutex::new(HashMap::new()),
     });
     hub.refresh()?;
     tokio::spawn(hub.clone().watch_db());
@@ -355,7 +406,9 @@ async fn start_portal(hub: &Arc<Hub>, opts: &Options, po: &PortalOptions) -> Res
     );
     let h = hub.clone();
     let online: portal::OnlineFn = Arc::new(move || h.sessions.read().unwrap().keys().copied().collect());
-    let router = portal::router(portal::Portal::new(cfg, db, online));
+    let h = hub.clone();
+    let traffic: portal::TrafficFn = Arc::new(move || h.traffic());
+    let router = portal::router(portal::Portal::new(cfg, db, online, traffic));
     if let Some(addr) = po.plain_listen {
         let l = TcpListener::bind(addr)
             .await
@@ -540,12 +593,16 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
                 }
             }
             Some(m) = ctl_rx.recv() => {
-                if let ClientMsg::Endpoints { endpoints, listen_port } = m {
-                    if let Some(s) = hub.sessions.write().unwrap().get_mut(&ip)
-                        && s.conn_id == conn_id {
-                            s.endpoints = with_observed(endpoints, observed, listen_port);
-                        }
-                    hub.bump();
+                match m {
+                    ClientMsg::Endpoints { endpoints, listen_port } => {
+                        if let Some(s) = hub.sessions.write().unwrap().get_mut(&ip)
+                            && s.conn_id == conn_id {
+                                s.endpoints = with_observed(endpoints, observed, listen_port);
+                            }
+                        hub.bump();
+                    }
+                    ClientMsg::Traffic { peers } => hub.record_traffic(ip, peers),
+                    ClientMsg::Hello { .. } => {}
                 }
             }
         }
@@ -586,4 +643,78 @@ fn with_observed(mut eps: Vec<SocketAddr>, observed: IpAddr, port: u16) -> Vec<S
     }
     eps.truncate(16);
     eps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::PeerTraffic;
+
+    fn hub() -> Hub {
+        Hub {
+            db: Mutex::new(db::Db::memory()),
+            domain: "tc.internal".into(),
+            sessions: RwLock::new(HashMap::new()),
+            map_version: watch::channel(0).0,
+            next_conn: AtomicU64::new(1),
+            snapshot: RwLock::new(Arc::default()),
+            traffic: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn traffic_speeds_from_consecutive_reports() {
+        let h = hub();
+        let me = Ipv4Addr::new(100, 64, 0, 1);
+        let peer = Ipv4Addr::new(100, 64, 0, 2);
+        h.record_traffic(
+            me,
+            vec![PeerTraffic {
+                ip: peer,
+                rx: 1000,
+                tx: 500,
+            }],
+        );
+        assert_eq!(
+            h.traffic()[&me].peers[&peer],
+            (1000, 500, 0.0, 0.0),
+            "first report: no speed yet"
+        );
+        // Pretend the first report was 10 seconds ago.
+        h.traffic.lock().unwrap().get_mut(&me).unwrap().at -= Duration::from_secs(10);
+        h.record_traffic(
+            me,
+            vec![PeerTraffic {
+                ip: peer,
+                rx: 21000,
+                tx: 1500,
+            }],
+        );
+        let (rx, tx, rr, tr) = h.traffic()[&me].peers[&peer];
+        assert_eq!((rx, tx), (21000, 1500));
+        assert!((rr - 2000.0).abs() < 50.0 && (tr - 100.0).abs() < 5.0, "{rr} {tr}");
+        // A restarted tunnel (smaller totals) has no speed, not a negative one.
+        h.traffic.lock().unwrap().get_mut(&me).unwrap().at -= Duration::from_secs(10);
+        h.record_traffic(
+            me,
+            vec![PeerTraffic {
+                ip: peer,
+                rx: 10,
+                tx: 10,
+            }],
+        );
+        assert_eq!(h.traffic()[&me].peers[&peer].2, 0.0);
+        // A machine that stopped reporting: speeds drop to zero, totals stay.
+        h.traffic
+            .lock()
+            .unwrap()
+            .get_mut(&me)
+            .unwrap()
+            .peers
+            .get_mut(&peer)
+            .unwrap()
+            .2 = 99.0;
+        h.traffic.lock().unwrap().get_mut(&me).unwrap().at -= TRAFFIC_STALE + Duration::from_secs(1);
+        assert_eq!(h.traffic()[&me].peers[&peer], (10, 10, 0.0, 0.0));
+    }
 }

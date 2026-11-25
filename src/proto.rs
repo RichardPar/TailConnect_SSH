@@ -57,6 +57,19 @@ pub enum ClientMsg {
         endpoints: Vec<SocketAddr>,
         listen_port: u16,
     },
+    /// Bytes exchanged with each peer since the tunnel started, for the
+    /// portal's traffic view. Sent every 30 seconds while the counts change.
+    /// Only counts: nothing about what the traffic is.
+    Traffic { peers: Vec<PeerTraffic> },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerTraffic {
+    pub ip: Ipv4Addr,
+    /// Bytes received from the peer.
+    pub rx: u64,
+    /// Bytes sent to the peer.
+    pub tx: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -60,6 +60,21 @@ fn relation(me_account: &str, p: &api::PeerStatus) -> Option<String> {
     })
 }
 
+fn bytes(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n}B")
+    } else {
+        format!("{v:.1}{}", U[i])
+    }
+}
+
 fn print_status(s: &Status) {
     match &s.me {
         Some(me) => println!(
@@ -92,9 +107,14 @@ fn print_status(s: &Status) {
             (_, path, _) => path,
         };
         let name = format!("{}.{}", p.name, p.account);
+        let counts = if p.rx > 0 || p.tx > 0 {
+            format!("; rx {} tx {}", bytes(p.rx), bytes(p.tx))
+        } else {
+            String::new()
+        };
         match relation(me_account, p) {
-            Some(r) => println!("{:<15} {:<28} {path}; {r}", p.ip, name),
-            None => println!("{:<15} {:<28} {path}", p.ip, name),
+            Some(r) => println!("{:<15} {:<28} {path}; {r}{counts}", p.ip, name),
+            None => println!("{:<15} {:<28} {path}{counts}", p.ip, name),
         }
     }
     if s.filter_dropped > 0 {

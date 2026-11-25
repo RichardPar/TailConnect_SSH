@@ -118,7 +118,8 @@ pass "portal on :443 beside SSH: sign-in, key for alice, host/origin checks, sig
 NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=B
 start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"
-    local cmd=("$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
+    # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
+    local cmd=(env TC_TRAFFIC_INTERVAL=2 "$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
         --hostname "$name" --direct-port "$port" --no-dns)
     # Not through a shell function: $! must be the process itself (nsenter
     # execs into tcd), or cleanup would leave it running.
@@ -210,6 +211,23 @@ serve_tcp bravo "$B" 9000
 sleep 0.5
 can_tcp alpha "$B" 9000 || fail "TCP alpha -> bravo"
 pass "TCP over the hub"
+
+# ---- Traffic reports ----
+python3 -c "
+import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(200): s.sendto(b'x'*1000, ('$B', 9999))"
+wait_for 20 status_has alpha "bravo.richard.*tx [0-9.]*[KM]iB" || { tc_ alpha status; fail "tc status shows no traffic counts"; }
+traffic_ok() {
+    apic GET /api/machines | python3 -c "
+import json,sys; m=[m for m in json.load(sys.stdin) if m['name']=='alpha'][0]
+t=m['traffic']; sys.exit(0 if t and t['tx'] >= 200000 else 1)"
+}
+wait_for 20 traffic_ok || fail "portal shows no traffic for alpha: $(apic GET /api/machines)"
+AID=$(apic GET /api/machines | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin) if m['name']=='alpha'][0])")
+apic GET "/api/machines/$AID/traffic" | python3 -c "
+import json,sys; r=json.load(sys.stdin); p={x['peer']: x for x in r['peers']}
+assert r['reported'] and p['bravo.richard']['tx'] >= 200000, r" || fail "traffic breakdown for alpha"
+pass "traffic: counted by tcd, shown in tc status, reported to the portal with a per-peer breakdown"
 
 # ---- Isolation ----
 status_has alpha charlie && fail "alpha sees charlie (another account)"

@@ -1,6 +1,6 @@
 //! Portal API tests, in process (no network).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -29,6 +29,10 @@ struct Resp {
 
 impl T {
     fn new(signup: Signup) -> Self {
+        Self::with_traffic(signup, Arc::new(HashMap::new))
+    }
+
+    fn with_traffic(signup: Signup, traffic: TrafficFn) -> Self {
         let db = Db::memory();
         let h = hash_password(PW).unwrap();
         db.create_account_with("richard", Status::Active, Role::Operator, Some(&h))
@@ -42,7 +46,7 @@ impl T {
             tls_fingerprint: Some("ab".repeat(32)),
             hosts: vec![HOST.into()],
         };
-        let portal = Portal::new(cfg, db, Arc::new(HashSet::new));
+        let portal = Portal::new(cfg, db, Arc::new(HashSet::new), traffic);
         T {
             router: router(portal.clone()),
             portal,
@@ -636,5 +640,77 @@ async fn admin_token() {
         t.get("/api/me", &c).await.status,
         StatusCode::UNAUTHORIZED,
         "replacing the token ends its sessions"
+    );
+}
+
+#[tokio::test]
+async fn traffic_reports_name_only_related_peers() {
+    use std::net::Ipv4Addr;
+    let ip = |n: u8| Ipv4Addr::new(100, 64, 0, n);
+    // nas (alice) talked to web (richard, shared with alice) and laptop
+    // (richard, not shared): alice may know web, not laptop.
+    let traffic: TrafficFn = Arc::new(move || {
+        let mut peers = HashMap::new();
+        peers.insert(ip(1), (5_000_000, 1_000, 250_000.0, 50.0));
+        peers.insert(ip(2), (300, 200, 0.0, 0.0));
+        HashMap::from([(
+            ip(3),
+            crate::server::TrafficReport {
+                at: std::time::Instant::now(),
+                peers,
+            },
+        )])
+    });
+    let t = T::with_traffic(Signup::Off, traffic);
+    t.db(|db| {
+        let kr = db.create_authkey("richard", true, None).unwrap();
+        let ka = db.create_authkey("alice", true, None).unwrap();
+        let web = db.register("ssh-ed25519 W", "web", &kr).unwrap();
+        db.register("ssh-ed25519 L", "laptop", &kr).unwrap();
+        let nas = db.register("ssh-ed25519 N", "nas", &ka).unwrap();
+        assert_eq!((web.ip, nas.ip), (ip(1), ip(3)));
+        let s = db.create_share(web.id, "alice", "*").unwrap();
+        db.accept_share(s).unwrap();
+    });
+    let ca = t.login("alice").await;
+    let ms = t.get("/api/machines", &ca).await.body;
+    let nas = &ms[0];
+    assert_eq!(nas["traffic"]["rx"], 5_000_300);
+    assert_eq!(nas["traffic"]["rx_rate"], 250_000.0);
+    let id = nas["id"].as_i64().unwrap();
+    let r = t.get(&format!("/api/machines/{id}/traffic"), &ca).await.body;
+    let names: Vec<&str> = r["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["peer"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["another machine", "web.richard"]);
+    assert!(r["peers"][0]["ip"].is_null(), "unrelated peer's address hidden too");
+    // The operator sees every name.
+    let cr = t.login("richard").await;
+    let r = t.get(&format!("/api/machines/{id}/traffic"), &cr).await.body;
+    let names: Vec<&str> = r["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["peer"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["laptop.richard", "web.richard"]);
+    // Another account's machine: not found.
+    let web_id = t.db(|db| db.find_node("web.richard").unwrap().id);
+    assert_eq!(
+        t.get(&format!("/api/machines/{web_id}/traffic"), &ca).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // No report: a dash in the list.
+    assert!(
+        t.get("/api/machines", &cr)
+            .await
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["traffic"].is_null())
     );
 }

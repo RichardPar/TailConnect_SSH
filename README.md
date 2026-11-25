@@ -48,7 +48,7 @@ The hub serves a web portal on the same port, 443. During the TLS handshake, `tc
 
 | Tab | Who | What's there |
 |---|---|---|
-| Machines | everyone | Machines with online status, address, MagicDNS name and tags; set tags, rename, remove. Operators see every account's. |
+| Machines | everyone | Machines with online status, address, MagicDNS name, tags and **traffic** (current speeds and totals; click for the breakdown per peer); set tags, rename, remove. Operators see every account's. |
 | Auth keys | everyone | Create keys (1 hour to 90 days, single-use or reusable). A new key is shown once, with the full `tc up` command, including `--tls-fingerprint` for a self-signed certificate. Revoke keys. |
 | Access rules | everyone | Add and delete rules (operators pick the account) |
 | Sharing | everyone | Share a machine with an account, or create a single-use **share link**; change ports; revoke. Accept, decline or remove shares offered to you, and redeem links. |
@@ -106,6 +106,15 @@ The hub can get a free, publicly trusted certificate from Let's Encrypt and rene
 - **Storage.** Certificates and the ACME account are kept in `acme/` in the hub's state directory. Losing it only means fetching again.
 
 **Machines that joined with a pinned self-signed certificate** stop connecting once the hub serves the Let's Encrypt one, because the pin no longer matches. Point each at the name: `sudo tcs up --server hub.example.com`. A new server address drops the old pin, and the machine keeps its registration and address; no auth key is needed.
+
+**Traffic reports:**
+- **What's reported.** Every machine counts the bytes it exchanges with each peer, over direct paths and through the hub alike. It sends the counts to the hub every 30 seconds while they change, over its control connection: only counts, nothing about what the traffic is.
+- **What the hub keeps.** Only each machine's latest report, in memory: nothing goes to disk or into history.
+- **Speeds** are the change between two reports. They drop to zero when a machine stops reporting.
+- **Totals** count from when the machine's tunnel last started.
+- **Direction.** ↓ is what the machine received and ↑ what it sent, from its own point of view. Packets its packet filter drops aren't counted as received.
+- **Who sees what.** Tenants see their own machines' traffic. In the per-peer breakdown, a peer is named only if it's one of the account's own machines or linked by a share; any other peer, such as a removed machine, shows as "another machine". Operators see everything.
+- **On the machine.** `tcs status` shows the same counts per peer.
 
 ### Security notes
 
@@ -217,6 +226,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 
 - joining, and refusal of a used single-use key or a wrong TLS fingerprint;
 - ping, TCP and MagicDNS through the hub, with end-to-end sessions up both ways;
+- traffic counts in `tc status`, and in the portal with a per-peer breakdown;
 - isolation between accounts (maps, DNS, traffic);
 - a share that's one-way and limited to some ports, including changing the ports live;
 - suspending and reactivating an account;
@@ -233,13 +243,14 @@ Done (Linux MVP):
 - `tcd` with a TUN device, direct SSH paths with fallback to the hub, MagicDNS (A and PTR records), the local API and the `tc` CLI;
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
+- traffic reports per machine and peer in the portal and `tcs status`;
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
 - an admin CLI, systemd units, and unit and end-to-end tests.
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Traffic reports in the portal; an admin HTTP API for scripts
+1. An admin HTTP API for scripts
 2. IPv6 inside the tunnel, exit nodes
 3. Key expiry, machine approval, ephemeral machines; per-account DNS domains
 4. Windows (Wintun) and Android (VpnService) clients
