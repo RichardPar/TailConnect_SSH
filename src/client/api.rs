@@ -78,6 +78,9 @@ pub struct Status {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub name: String,
+    /// Full MagicDNS name.
+    #[serde(default)]
+    pub fqdn: String,
     #[serde(default)]
     pub account: String,
     #[serde(default)]

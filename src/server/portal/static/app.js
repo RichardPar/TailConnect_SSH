@@ -632,6 +632,7 @@ async function accountsTab() {
       el("td", {}, a.role),
       el("td", {}, badge(a.status, a.status === "active" ? "ok" : a.status === "pending" ? "warn" : "bad")),
       el("td", {}, a.has_password ? "yes" : "no"),
+      el("td", { class: "mono" }, a.dns_domain || el("span", { class: "sub" }, a.name + "." + me.domain)),
       el("td", {}, a.machines),
       el("td", {}, ago(a.created)),
       el("td", { class: "actions" },
@@ -643,6 +644,10 @@ async function accountsTab() {
           const r = await ask((a.has_password ? "Reset password for " : "Set password for ") + a.name, [{ name: "password", label: "New password (at least 10 characters)", type: "password" }]);
           if (r) act(() => api("POST", "/accounts/" + a.id + "/password", { password: r.password }), "Password set");
         } }, a.has_password ? "Reset password" : "Set password"),
+        el("button", { onclick: async () => {
+          const r = await ask("MagicDNS domain for " + a.name, [{ name: "domain", label: "A domain such as acme.internal; empty for the default (" + a.name + "." + me.domain + ")", value: a.dns_domain || "" }]);
+          if (r) act(() => api("POST", "/accounts/" + a.id + "/dns-domain", { domain: r.domain }), "Domain saved");
+        } }, "DNS domain"),
         self ? null : el("button", { class: "danger", onclick: async () => {
           if (await confirmDo("Delete " + a.name + " with its machines, keys, rules and shares, for good?")) act(() => api("DELETE", "/accounts/" + a.id), "Deleted");
         } }, "Delete")));
@@ -665,7 +670,7 @@ async function accountsTab() {
     el("h2", {}, "Accounts"),
     el("p", { class: "hint" }, "Sign-up: " + me.signup + ". Each account is a private network; suspending one cuts its machines off and stops its shares."),
     el("div", { class: "panel" }, add),
-    table(["Name", "Role", "Status", "Password", "Machines", "Created", ""], rows, "No accounts."),
+    table(["Name", "Role", "Status", "Password", "DNS domain", "Machines", "Created", ""], rows, "No accounts."),
     el("h2", {}, "Invites"),
     el("p", { class: "hint" }, "An invite lets someone create an account without waiting for approval. Each works once."),
     el("div", { class: "panel" }, inviteForm, secretBox()),
@@ -695,10 +700,28 @@ async function meTab() {
       e.target.checked ? "New machines now wait for your approval" : "New machines join at once") });
   return [
     el("h2", {}, "My account: " + state.me.name),
-    el("p", { class: "hint" }, "Your machines are called NAME." + state.me.name + "." + state.me.domain + "."),
+    el("p", { class: "hint" }, "Your machines are called NAME." + st.zone + "."),
     el("div", { class: "panel" }, el("form", { class: "inline" },
       el("label", { class: "check" }, approval, "Require approval for new machines"),
       el("span", { class: "sub", style: "padding-bottom:.45rem" }, "New machines stay cut off until approved on the Machines tab. Keys marked pre-approved skip this."))),
+    el("h2", {}, "MagicDNS domain"),
+    el("p", { class: "hint" },
+      "By default your machines are NAME." + st.default_zone + ". You can give them a domain of your own" +
+      (state.me.operator ? "" : ", ending in ." + st.allowed_suffixes.join(" or .")) + ", for example laptop.acme." + (st.allowed_suffixes[0] || "internal") + "."),
+    el("div", { class: "panel" }, el("form", {
+      class: "inline",
+      onsubmit: (e) => {
+        e.preventDefault();
+        const d = fields(e.target).dns_domain;
+        act(async () => {
+          const r = await api("POST", "/me/settings", { dns_domain: d });
+          toast("Your machines are now NAME." + r.zone);
+        });
+      },
+    },
+    el("label", {}, "Domain", el("input", { name: "dns_domain", value: st.dns_domain || "", placeholder: st.default_zone, size: 28 })),
+    el("button", { class: "primary", type: "submit" }, "Save"),
+    st.dns_domain ? el("button", { type: "button", onclick: () => act(() => api("POST", "/me/settings", { dns_domain: "" }), "Back to NAME." + st.default_zone) }, "Use the default") : null)),
     el("h2", {}, "Change password"),
     el("div", { class: "panel" }, form),
   ];

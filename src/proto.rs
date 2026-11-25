@@ -41,6 +41,11 @@ pub struct Node {
     /// never).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<i64>,
+    /// The machine's MagicDNS zone: `ACCOUNT.<hub domain>`, or its account's
+    /// own domain. Its full name is `NAME.ZONE`. (Empty from older hubs: use
+    /// `ACCOUNT.<domain>`.)
+    #[serde(default)]
+    pub zone: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

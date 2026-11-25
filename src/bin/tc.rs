@@ -90,11 +90,14 @@ fn span(s: i64) -> String {
 fn print_status(s: &Status) {
     match &s.me {
         Some(me) => println!(
-            "{} {}.{}.{} ({})  via {}  [{}]",
+            "{} {}.{} ({})  via {}  [{}]",
             me.ip,
             me.name,
-            me.account,
-            s.domain,
+            if me.zone.is_empty() {
+                format!("{}.{}", me.account, s.domain)
+            } else {
+                me.zone.clone()
+            },
             s.tun.as_deref().unwrap_or("no tun"),
             s.server.as_deref().unwrap_or("?"),
             s.phase
@@ -193,15 +196,15 @@ async fn main() -> Result<()> {
             let ip = match name {
                 None => status.me.map(|m| m.ip),
                 Some(n) => {
-                    // NAME (own account), NAME.ACCOUNT or NAME.ACCOUNT.DOMAIN
+                    // NAME (own account), NAME.ACCOUNT, or a full name.
                     let n = n.to_ascii_lowercase();
-                    let rel = n.strip_suffix(&format!(".{}", status.domain)).unwrap_or(&n);
+                    let n = n.trim_end_matches('.');
                     let mine = status.me.as_ref().map(|m| m.account.clone()).unwrap_or_default();
-                    let (name, account) = rel.split_once('.').unwrap_or((rel, mine.as_str()));
+                    let (name, account) = n.split_once('.').unwrap_or((n, mine.as_str()));
                     status
                         .peers
                         .iter()
-                        .find(|p| p.name == name && p.account == account)
+                        .find(|p| p.fqdn == n || (p.name == name && p.account == account))
                         .map(|p| p.ip)
                 }
             };

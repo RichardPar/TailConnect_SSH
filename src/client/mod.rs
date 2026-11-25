@@ -113,10 +113,10 @@ impl Net {
             ..Default::default()
         };
         for p in self.peers.values() {
-            z.insert(&p.node.name, &p.node.account, p.node.ip);
+            z.insert(&p.node.name, &p.node.account, &p.node.zone, p.node.ip);
         }
         if let Some(me) = &self.me {
-            z.insert(&me.name, &me.account, me.ip);
+            z.insert(&me.name, &me.account, &me.zone, me.ip);
         }
         self.zone = z;
     }
@@ -156,6 +156,8 @@ pub struct Daemon {
     exit_in_use: RwLock<Option<Ipv4Addr>>,
     /// Why the chosen exit node isn't in use.
     exit_problem: RwLock<Option<String>>,
+    /// The DNS configuration last applied: (search zone, routed zones, all).
+    dns_applied: Mutex<Option<(String, Vec<String>, bool)>>,
     /// DNS queries forwarded to the exit node, awaiting answers.
     dns_pending: Mutex<exit::Pending>,
     /// The hub's addresses from the last successful lookup.
@@ -196,6 +198,7 @@ impl Daemon {
             exit_in_use: RwLock::new(None),
             exit_problem: RwLock::new(None),
             dns_pending: Mutex::new(Default::default()),
+            dns_applied: Mutex::new(None),
             hub_addrs: Mutex::new(Vec::new()),
         }))
     }
@@ -524,7 +527,7 @@ impl Daemon {
                         net.domain = domain.clone();
                         net.rebuild_zone();
                     }
-                    if let Err(e) = self.ensure_tun(node.ip, prefix_len, &domain, &node.account) {
+                    if let Err(e) = self.ensure_tun(node.ip, prefix_len) {
                         break Err(HubError::Fatal(format!("creating TUN device: {e:#}")));
                     }
                     self.set_role(node.exit_node);
@@ -604,6 +607,7 @@ impl Daemon {
         drop(net);
         self.e2e.sync(&keys);
         self.reconcile_exit();
+        self.update_dns();
         self.map_changed.notify_one();
     }
 
@@ -681,10 +685,7 @@ impl Daemon {
                         *self.exit_problem.write().unwrap() = None;
                         self.e2e.set_exit(Some(ip));
                         info!("exit node: internet traffic goes through {n}");
-                        if self.opts.dns {
-                            let (d, a) = self.dns_names();
-                            exit_dns_routing(&self.opts.tun_name, true, &d, &a);
-                        }
+                        self.update_dns();
                         return;
                     }
                     Err(e) => Some(format!("routing through {n}: {e:#}")),
@@ -694,13 +695,34 @@ impl Daemon {
         self.stop_using_exit(problem);
     }
 
-    /// The MagicDNS domain and this machine's account.
-    fn dns_names(&self) -> (String, String) {
-        let net = self.net.read().unwrap();
-        (
-            net.domain.clone(),
-            net.me.as_ref().map(|m| m.account.clone()).unwrap_or_default(),
-        )
+    /// Point systemd-resolved at MagicDNS: this machine's own zone as the
+    /// search domain (`laptop` → `laptop.<zone>`), every zone with machines
+    /// routed here, and everything while an exit node is in use. Applied
+    /// only when that changes.
+    fn update_dns(&self) {
+        if !self.opts.dns || self.tun.lock().unwrap().is_none() {
+            return;
+        }
+        let want = {
+            let net = self.net.read().unwrap();
+            let Some(me) = &net.me else { return };
+            let search = if me.zone.is_empty() {
+                format!("{}.{}", me.account, net.domain)
+            } else {
+                me.zone.clone()
+            };
+            (
+                search,
+                net.zone.routed_zones(),
+                self.exit_in_use.read().unwrap().is_some(),
+            )
+        };
+        let mut applied = self.dns_applied.lock().unwrap();
+        if applied.as_ref() == Some(&want) {
+            return;
+        }
+        *applied = Some(want.clone());
+        apply_dns(&self.opts.tun_name, want.0, want.1, want.2);
     }
 
     /// Stop sending internet traffic through an exit node.
@@ -714,16 +736,13 @@ impl Daemon {
         if self.exit_in_use.write().unwrap().take().is_some() {
             exit::unroute();
             self.e2e.set_exit(None);
-            if self.opts.dns {
-                let (d, a) = self.dns_names();
-                exit_dns_routing(&self.opts.tun_name, false, &d, &a);
-            }
+            self.update_dns();
             info!("exit node: no longer in use");
         }
     }
 
     /// Create the TUN device, or recreate it if our address changed.
-    fn ensure_tun(self: &Arc<Self>, ip: Ipv4Addr, prefix_len: u8, domain: &str, account: &str) -> Result<()> {
+    fn ensure_tun(self: &Arc<Self>, ip: Ipv4Addr, prefix_len: u8) -> Result<()> {
         let mut tun = self.tun.lock().unwrap();
         if tun.as_ref().is_some_and(|t| t.ip == ip) {
             return Ok(());
@@ -806,9 +825,9 @@ impl Daemon {
         );
         *tun = Some(Tun { ip, v6, cancel });
         drop(tun);
-        if self.opts.dns {
-            configure_dns(&self.opts.tun_name, domain, account);
-        }
+        // A new interface: configure its DNS from scratch.
+        *self.dns_applied.lock().unwrap() = None;
+        self.update_dns();
         Ok(())
     }
 
@@ -1014,6 +1033,15 @@ impl Daemon {
             .map(|p| api::PeerStatus {
                 name: p.node.name.clone(),
                 account: p.node.account.clone(),
+                fqdn: format!(
+                    "{}.{}",
+                    p.node.name,
+                    if p.node.zone.is_empty() {
+                        format!("{}.{}", p.node.account, net.domain)
+                    } else {
+                        p.node.zone.clone()
+                    }
+                ),
                 tags: p.node.tags.clone(),
                 inbound: crate::acl::Access::from_wire(&p.node.inbound).to_wire(),
                 ip: p.node.ip,
@@ -1112,21 +1140,25 @@ fn local_endpoints(port: u16) -> Vec<SocketAddr> {
     out
 }
 
-/// Point systemd-resolved at the in-tunnel resolver for our domain.
-/// Our own account's names are searched (`laptop` → `laptop.richard.tc.internal`);
-/// the whole domain is routed here.
-fn configure_dns(tun: &str, domain: &str, account: &str) {
+/// Configure systemd-resolved for `tun`: MagicDNS as its server, `search`
+/// as its search domain, `routes` (and `.` with `all`) routed to it.
+fn apply_dns(tun: &str, search: String, routes: Vec<String>, all: bool) {
     let tun = tun.to_string();
-    let search = format!("{account}.{domain}");
-    let route = format!("~{domain}");
-    let domain = domain.to_string();
     tokio::task::spawn_blocking(move || {
         let run = |args: &[&str]| std::process::Command::new("resolvectl").args(args).output();
         let dns = crate::MAGIC_DNS_IP.to_string();
         match run(&["dns", &tun, &dns]) {
             Ok(o) if o.status.success() => {
-                let _ = run(&["domain", &tun, &search, &route]);
-                info!("MagicDNS: *.{domain} via {dns} on {tun}");
+                let mut domains: Vec<String> = vec![search.clone()];
+                domains.extend(routes.iter().map(|z| format!("~{z}")));
+                if all {
+                    domains.push("~.".into());
+                }
+                let mut args = vec!["domain", tun.as_str()];
+                args.extend(domains.iter().map(String::as_str));
+                let _ = run(&args);
+                let _ = run(&["default-route", &tun, if all { "yes" } else { "no" }]);
+                info!("MagicDNS: {} via {dns} on {tun} (search {search})", routes.join(", "));
             }
             Ok(o) => warn!(
                 "MagicDNS not configured (resolvectl: {}); names still resolve with `dig @{dns}`",
@@ -1134,23 +1166,6 @@ fn configure_dns(tun: &str, domain: &str, account: &str) {
             ),
             Err(e) => warn!("MagicDNS not configured (resolvectl: {e}); names still resolve with `dig @{dns}`"),
         }
-    });
-}
-
-/// While an exit node is in use, send every name to MagicDNS (which passes
-/// names outside it to the exit node); otherwise only MagicDNS names.
-fn exit_dns_routing(tun: &str, all: bool, domain: &str, account: &str) {
-    let tun = tun.to_string();
-    let search = format!("{account}.{domain}");
-    let route = format!("~{domain}");
-    tokio::task::spawn_blocking(move || {
-        let run = |args: &[&str]| std::process::Command::new("resolvectl").args(args).output();
-        let mut domains = vec!["domain", tun.as_str(), search.as_str(), route.as_str()];
-        if all {
-            domains.push("~.");
-        }
-        let _ = run(&domains);
-        let _ = run(&["default-route", &tun, if all { "yes" } else { "no" }]);
     });
 }
 
@@ -1169,6 +1184,17 @@ fn find_peer<'a>(net: &'a Net, s: &str) -> Option<&'a PeerState> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         let m = crate::machine_of(ip)?;
         return net.peers.get(&m);
+    }
+    // A full name, in any account's zone.
+    if let Some(p) = net.peers.values().find(|p| {
+        let zone = if p.node.zone.is_empty() {
+            format!("{}.{}", p.node.account, net.domain)
+        } else {
+            p.node.zone.clone()
+        };
+        s == format!("{}.{zone}", p.node.name)
+    }) {
+        return Some(p);
     }
     let rel = s.strip_suffix(&format!(".{}", net.domain)).unwrap_or(&s);
     let my_account = net.me.as_ref().map(|m| m.account.as_str()).unwrap_or("");

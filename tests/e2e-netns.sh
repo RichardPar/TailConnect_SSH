@@ -312,6 +312,22 @@ ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 alpha.richard A)
 wait_status charlie "filter: [0-9]* packets dropped" "charlie's filter didn't count alpha's pings"
 pass "share: charlie -> alpha on icmp,tcp:9000 only; alpha can't open connections back; bravo not exposed"
 
+# ---- Per-account DNS domains ----
+ctl accounts domain alice acme.internal >/dev/null
+wait_status charlie "charlie.acme.internal" "charlie's name didn't move to acme.internal"
+ANS=$(dig +short +time=2 +tries=2 @100.100.100.100 charlie.acme.internal A)
+[[ "$ANS" == "$C" ]] || fail "alpha: charlie.acme.internal -> '$ANS'"
+ANS=$(dig +short +time=2 +tries=1 @100.100.100.100 charlie.alice.tc.internal A)
+[[ -z "$ANS" ]] || fail "the old name still resolves: '$ANS'"
+ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 charlie A)
+[[ "$ANS" == "$C" ]] || fail "charlie: short name under its own domain -> '$ANS'"
+ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 alpha.richard.tc.internal A)
+[[ "$ANS" == "$A" ]] || fail "charlie: other accounts keep their names -> '$ANS'"
+[[ "$(tc_ alpha ip charlie.acme.internal)" == "$C" ]] || fail "tc ip charlie.acme.internal"
+ctl accounts domain alice default >/dev/null
+wait_status charlie "charlie.alice.tc.internal" "charlie's name didn't return to the default"
+pass "per-account DNS domains: alice's machines become NAME.acme.internal for everyone, and back"
+
 ctl shares ports "$SID" tcp:9001 >/dev/null
 wait_status alpha "charlie.alice.*on tcp:9001" "share ports not updated"
 can_tcp charlie "$A" 9001 || fail "new share port 9001 not reachable"

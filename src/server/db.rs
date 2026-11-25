@@ -12,6 +12,7 @@
 //!   `nodes.approved`, `nodes.ephemeral`, `accounts.require_approval`,
 //!   `authkeys.ephemeral`, `authkeys.preapproved`). Existing machines never
 //!   expire.
+//! * 5: per-account MagicDNS domains (`accounts.dns_domain`).
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -120,6 +121,8 @@ pub struct AccountRow {
     pub changed: i64,
     /// New machines wait for approval.
     pub require_approval: bool,
+    /// The account's own MagicDNS domain (`None`: `ACCOUNT.<hub domain>`).
+    pub dns_domain: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +297,7 @@ CREATE TABLE settings(
 );
 ";
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// How long a machine's authorisation lasts by default: 180 days.
 pub const DEFAULT_KEY_EXPIRY: i64 = 180 * 86400;
@@ -362,6 +365,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              ALTER TABLE authkeys ADD COLUMN preapproved INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if version < 5 {
+        tx.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN dns_domain TEXT;
+             CREATE UNIQUE INDEX accounts_dns_domain ON accounts(dns_domain) WHERE dns_domain IS NOT NULL;",
+        )?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -420,7 +429,8 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
     })
 }
 
-const ACCOUNT_COLS: &str = "id, name, status, created, role, password_hash IS NOT NULL, changed, require_approval";
+const ACCOUNT_COLS: &str =
+    "id, name, status, created, role, password_hash IS NOT NULL, changed, require_approval, dns_domain";
 
 fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
     let status: String = r.get(2)?;
@@ -435,6 +445,7 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
         has_password: r.get(5)?,
         changed: r.get(6)?,
         require_approval: r.get(7)?,
+        dns_domain: r.get(8)?,
     })
 }
 
@@ -743,6 +754,42 @@ impl Db {
     }
 
     /// Require (or stop requiring) approval for an account's new machines.
+    /// Set an account's own MagicDNS domain (`None`: back to the default,
+    /// `ACCOUNT.<hub domain>`). `hub_domain` is the hub's `--domain`; with
+    /// `suffixes`, the domain must end in one of them (tenants); without,
+    /// any domain will do (operators).
+    pub fn set_dns_domain(
+        &self,
+        account: &str,
+        domain: Option<&str>,
+        hub_domain: &str,
+        suffixes: Option<&[String]>,
+    ) -> Result<Option<String>> {
+        let a = self.account(account)?;
+        let d = match domain.map(str::trim).filter(|d| !d.is_empty() && *d != "default") {
+            None => None,
+            Some(d) => Some(valid_dns_domain(d, hub_domain, suffixes)?),
+        };
+        let r = self
+            .conn
+            .execute("UPDATE accounts SET dns_domain = ?1 WHERE id = ?2", params![d, a.id]);
+        match r {
+            Ok(_) => Ok(d),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                bail!("another account already uses {}", d.unwrap_or_default())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The hub's MagicDNS domain, as it recorded it when it last started.
+    pub fn hub_domain(&self) -> String {
+        self.setting("domain")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "tc.internal".into())
+    }
+
     pub fn set_require_approval(&self, account: &str, on: bool) -> Result<()> {
         let a = self.account(account)?;
         self.conn.execute(
@@ -1224,6 +1271,36 @@ impl Db {
     }
 }
 
+/// The MagicDNS zone of an account: its own domain, or `ACCOUNT.<hub domain>`.
+pub fn account_zone(account: &str, dns_domain: Option<&str>, hub_domain: &str) -> String {
+    match dns_domain {
+        Some(d) => d.to_string(),
+        None => format!("{account}.{hub_domain}"),
+    }
+}
+
+/// Check an account's MagicDNS domain: a DNS name of at least two labels,
+/// not the hub's domain nor under it (that's where every account's default
+/// zone lives), and, for tenants, ending in an allowed suffix.
+pub fn valid_dns_domain(d: &str, hub_domain: &str, suffixes: Option<&[String]>) -> Result<String> {
+    let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = d.split('.').collect();
+    if labels.len() < 2 || d.len() > 200 || labels.iter().any(|l| valid_label(l, "label").is_err()) {
+        bail!("{d:?} isn't a valid domain (at least two labels of a-z, 0-9 and -)");
+    }
+    if d == hub_domain || d.ends_with(&format!(".{hub_domain}")) {
+        bail!("{d} is inside the hub's own domain {hub_domain}; choose another one");
+    }
+    if let Some(suffixes) = suffixes
+        && !suffixes
+            .iter()
+            .any(|s| d.ends_with(&format!(".{}", s.trim_matches('.'))))
+    {
+        bail!("choose a domain ending in .{}", suffixes.join(" or ."));
+    }
+    Ok(d)
+}
+
 /// Account names are DNS labels of at most 32 characters (they're part of
 /// every machine's name).
 pub fn valid_account_name(s: &str) -> Result<String> {
@@ -1440,6 +1517,56 @@ mod tests {
         db.set_key_expiry(None);
         let d = db.register("ssh-ed25519 D", "d", &pre).unwrap();
         assert_eq!(d.expires, None);
+    }
+
+    #[test]
+    fn account_dns_domains() {
+        let db = db_with(&["alice", "bob"]);
+        let tenant = vec!["internal".to_string()];
+        let t = Some(tenant.as_slice());
+        assert_eq!(
+            db.set_dns_domain("alice", Some("Acme.Internal."), "tc.internal", t)
+                .unwrap(),
+            Some("acme.internal".into())
+        );
+        assert_eq!(
+            db.account("alice").unwrap().dns_domain.as_deref(),
+            Some("acme.internal")
+        );
+        assert!(
+            db.set_dns_domain("bob", Some("acme.internal"), "tc.internal", t)
+                .is_err(),
+            "taken"
+        );
+        assert!(
+            db.set_dns_domain("bob", Some("bob.example.com"), "tc.internal", t)
+                .is_err(),
+            "tenant suffix"
+        );
+        assert!(
+            db.set_dns_domain("bob", Some("bob.example.com"), "tc.internal", None)
+                .is_ok(),
+            "operators: any"
+        );
+        assert!(
+            db.set_dns_domain("bob", Some("x.tc.internal"), "tc.internal", None)
+                .is_err(),
+            "inside the hub's domain"
+        );
+        assert!(
+            db.set_dns_domain("bob", Some("internal"), "tc.internal", None).is_err(),
+            "one label"
+        );
+        assert_eq!(
+            db.set_dns_domain("alice", Some(""), "tc.internal", t).unwrap(),
+            None,
+            "back to default"
+        );
+        assert_eq!(account_zone("alice", None, "tc.internal"), "alice.tc.internal");
+        assert_eq!(
+            account_zone("alice", Some("acme.internal"), "tc.internal"),
+            "acme.internal"
+        );
     }
 
     #[test]

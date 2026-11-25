@@ -37,6 +37,8 @@ pub struct SNode {
     /// with this as the notice.
     pub cutoff: Option<String>,
     pub expires: Option<i64>,
+    /// MagicDNS zone: `ACCOUNT.<hub domain>` or the account's own domain.
+    pub zone: String,
 }
 
 /// An account's compiled rules. `None`: no rules, everything allowed.
@@ -69,7 +71,18 @@ impl Snapshot {
     pub fn load(db: &Db) -> Result<Self> {
         let now = crate::now_unix();
         let mut next_expiry: Option<i64> = None;
-        let accounts: HashMap<i64, Status> = db.accounts()?.into_iter().map(|a| (a.id, a.status)).collect();
+        let all_accounts = db.accounts()?;
+        let hub_domain = db.hub_domain();
+        let zones: HashMap<i64, String> = all_accounts
+            .iter()
+            .map(|a| {
+                (
+                    a.id,
+                    super::db::account_zone(&a.name, a.dns_domain.as_deref(), &hub_domain),
+                )
+            })
+            .collect();
+        let accounts: HashMap<i64, Status> = all_accounts.into_iter().map(|a| (a.id, a.status)).collect();
         let nodes: Vec<SNode> = db
             .nodes()?
             .into_iter()
@@ -99,6 +112,7 @@ impl Snapshot {
                     active: cutoff.is_none(),
                     cutoff,
                     expires: n.expires,
+                    zone: zones.get(&n.account_id).cloned().unwrap_or_default(),
                     account_id: n.account_id,
                     account: n.account,
                     name: n.name,

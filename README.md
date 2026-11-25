@@ -24,6 +24,18 @@ This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It is a
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
 
+### Per-account DNS domains
+
+By default, an account's machines are `NAME.ACCOUNT.tc.internal`, under the hub's `--domain`. An account can choose a domain of its own instead, such as `acme.internal`, and its machines become `laptop.acme.internal` for everyone who can see them.
+- **Setting it:**
+  - an account: **My account → MagicDNS domain** in the portal;
+  - an operator, for any account: `tcs-control accounts domain NAME acme.internal`, or **DNS domain** on the Accounts tab;
+  - `default` (or an empty value) goes back to `NAME.ACCOUNT.tc.internal`.
+- **Which domains are allowed:**
+  - accounts may choose only domains ending in one of the hub's `--tenant-domain-suffixes` (default `internal`, as in `acme.internal`); operators may set any domain;
+  - a domain can't be the hub's own domain or under it, and two accounts can't share one.
+- **On the machines:** MagicDNS answers for every account's domain it knows of. `tcd` routes each such domain to it through systemd-resolved, and makes the machine's own zone its search domain, so `laptop` still works. The account-relative form `laptop.acme` works when asking MagicDNS directly.
+
 ### Key expiry, machine approval, ephemeral machines
 
 | | |
@@ -241,8 +253,8 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control serve [--listen [::]:443] [--domain tc.internal] [--tls-cert F --tls-key F] [--tls-name NAME…]` | Run the hub |
 | `tc-control fingerprint` | Print the TLS fingerprint and SSH host key |
 | `tc-control serve … [--signup off\|approval\|invite\|open] [--public-url HOST] [--portal-host NAME…] [--portal-listen ADDR] [--no-portal]` | Web portal options |
-| `tc-control serve … [--key-expiry 180d\|never] [--ephemeral-timeout 30m]` | How long machines stay authorized; when ephemeral machines are removed |
-| `tc-control accounts create NAME [--operator] [--password]` / `list` / `passwd NAME` / `role NAME operator\|tenant` / `approve NAME` / `approval NAME on\|off` / `suspend NAME` / `activate NAME` / `delete NAME` | Accounts (deleting removes the account's machines, keys, rules and shares); passwords are asked for twice, or read from standard input |
+| `tc-control serve … [--key-expiry 180d\|never] [--ephemeral-timeout 30m] [--tenant-domain-suffixes internal]` | How long machines stay authorized; when ephemeral machines are removed; which domains accounts may choose |
+| `tc-control accounts create NAME [--operator] [--password]` / `list` / `passwd NAME` / `role NAME operator\|tenant` / `approve NAME` / `approval NAME on\|off` / `domain NAME DOMAIN\|default` / `suspend NAME` / `activate NAME` / `delete NAME` | Accounts (deleting removes the account's machines, keys, rules and shares); passwords are asked for twice, or read from standard input |
 | `tc-control invites create [--days N]` / `list` / `revoke ID` | Invites for sign-up |
 | `tc-control admin-token` | New admin token for the portal (replaces the old one) |
 | `tc-control authkey create [--account NAME] [--reusable] [--expires-hours N] [--ephemeral] [--preapproved]` / `list` / `revoke ID` | Pre-auth keys; machines join the key's account |
@@ -278,6 +290,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 - ping, TCP and MagicDNS through the hub, with end-to-end sessions up both ways;
 - traffic counts in `tc status`, and in the portal with a per-peer breakdown;
 - IPv6 inside the tunnel (ping6 both ways, MagicDNS AAAA);
+- an account moving to its own DNS domain and back;
 - machine approval: a new machine is cut off and invisible until approved;
 - an ephemeral machine removed once offline;
 - a key that expires, cutting the machine off at once, and renewal with `tcs up --authkey`;
@@ -306,6 +319,7 @@ Done (Linux MVP):
 - traffic reports per machine and peer in the portal and `tcs status`;
 - IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node;
 - key expiry with renewal, machine approval, ephemeral machines;
+- per-account MagicDNS domains;
 - an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
@@ -313,6 +327,5 @@ Done (Linux MVP):
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Per-account DNS domains
-2. Sending exit traffic through another interface (a commercial VPN) with a kill switch
-3. Windows (Wintun) and Android (VpnService) clients
+1. Sending exit traffic through another interface (a commercial VPN) with a kill switch
+2. Windows (Wintun) and Android (VpnService) clients

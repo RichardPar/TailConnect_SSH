@@ -45,6 +45,7 @@ impl T {
             public_server: String::new(),
             tls_fingerprint: Some("ab".repeat(32)),
             hosts: vec![HOST.into()],
+            tenant_domain_suffixes: vec!["internal".into()],
         };
         let portal = Portal::new(cfg, db, Arc::new(HashSet::new), traffic);
         T {
@@ -866,4 +867,59 @@ async fn approval_expiry_and_key_options() {
     )
     .await;
     assert_eq!(t.get("/api/v1/me/settings", &ca).await.body["require_approval"], false);
+}
+
+#[tokio::test]
+async fn account_dns_domains() {
+    let t = T::new(Signup::Off);
+    t.db(|db| {
+        db.set_setting("domain", "tc.internal").unwrap();
+        let ka = db.create_authkey("alice", true, None).unwrap();
+        db.register("ssh-ed25519 A", "laptop", &ka).unwrap();
+    });
+    let ca = t.login("alice").await;
+    let st = t.get("/api/v1/me/settings", &ca).await.body;
+    assert_eq!(
+        (st["zone"].clone(), st["dns_domain"].clone()),
+        (json!("alice.tc.internal"), Value::Null)
+    );
+    // Tenants: only the allowed suffixes.
+    let r = t
+        .post("/api/v1/me/settings", json!({"dns_domain": "acme.example.com"}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = t
+        .post("/api/v1/me/settings", json!({"dns_domain": "acme.internal"}), &ca)
+        .await;
+    assert_eq!(r.body["zone"], "acme.internal");
+    assert_eq!(
+        t.get("/api/v1/machines", &ca).await.body[0]["fqdn"],
+        "laptop.acme.internal"
+    );
+    assert_eq!(t.get("/api/v1/me", &ca).await.body["zone"], "acme.internal");
+    // Operators: any domain, for any account; not one already taken.
+    let cr = t.login("richard").await;
+    let richard = t.db(|db| db.account("richard").unwrap().id);
+    let r = t
+        .post(
+            &format!("/api/v1/accounts/{richard}/dns-domain"),
+            json!({"domain": "acme.internal"}),
+            &cr,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "taken");
+    let r = t
+        .post(
+            &format!("/api/v1/accounts/{richard}/dns-domain"),
+            json!({"domain": "home.example.org"}),
+            &cr,
+        )
+        .await;
+    assert_eq!(r.body["zone"], "home.example.org");
+    // Back to the default.
+    t.post("/api/v1/me/settings", json!({"dns_domain": ""}), &ca).await;
+    assert_eq!(
+        t.get("/api/v1/machines", &ca).await.body[0]["fqdn"],
+        "laptop.alice.tc.internal"
+    );
 }

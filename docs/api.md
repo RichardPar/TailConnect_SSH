@@ -63,8 +63,8 @@ curl -b jar https://hub.example.com/api/v1/machines
 | Method and path | Body | Result |
 |---|---|---|
 | `GET /api/v1/status` | | `{version, domain, signup, account, operator, machines, online, awaiting_approval}`; operators also get `accounts` and `pending` |
-| `GET /api/v1/me` | | `{name, operator, admin_token, domain, signup, server, tls_fingerprint}`. `name` is `null` for the admin token. `server` and `tls_fingerprint` are what `tc up` needs. |
-| `GET /api/v1/me/settings`, `POST /api/v1/me/settings` | `{"require_approval": true}` | Your account's settings: whether new machines wait for approval (not for the admin token) |
+| `GET /api/v1/me` | | `{name, operator, admin_token, domain, zone, signup, server, tls_fingerprint}`; `zone` is your account's MagicDNS zone. `name` is `null` for the admin token. `server` and `tls_fingerprint` are what `tc up` needs. |
+| `GET /api/v1/me/settings`, `POST /api/v1/me/settings` | `{"require_approval": true, "dns_domain": "acme.internal"}` | Your account's settings (not for the admin token): whether new machines wait for approval, and its own MagicDNS domain (`""` for the default; tenants must use one of the hub's `--tenant-domain-suffixes`). Fields left out are unchanged. Returns `{require_approval, dns_domain, zone, default_zone, allowed_suffixes}`. |
 | `POST /api/v1/me/password` | `{"current", "new"}` | Changes your password and ends your other sessions (not for the admin token) |
 | `GET /api/v1/machines` | | `[{id, name, account, fqdn, ip, tags, exit_node, expires, expired, approved, ephemeral, hostname, online, last_seen, created, traffic}]`. `expires` is `null` for never. `traffic` is `{rx, tx, rx_rate, tx_rate, age}` (bytes, bytes/s, seconds since the report), or `null`. |
 | `POST /api/v1/machines/{id}/tags` | `{"tags": "server, db"}` | `{tags}`. Replaces the machine's tags; `""` clears them. |
@@ -93,7 +93,8 @@ curl -b jar https://hub.example.com/api/v1/machines
 
 | Method and path | Body | Result |
 |---|---|---|
-| `GET /api/v1/accounts` | | `[{id, name, status, role, has_password, require_approval, machines, created}]` |
+| `GET /api/v1/accounts` | | `[{id, name, status, role, has_password, require_approval, dns_domain, machines, created}]` |
+| `POST /api/v1/accounts/{id}/dns-domain` | `{"domain": "acme.internal"}` | `{dns_domain, zone}`. Any domain (not the hub's own, nor one another account uses); `""` for the default. |
 | `POST /api/v1/accounts/{id}/approval` | `{"enabled": true}` | Whether the account's new machines wait for approval |
 | `POST /api/v1/accounts` | `{"name", "password"?, "operator"?}` | `{id, name}`. Without a password, the account can't sign in to the portal and is only for machines. |
 | `POST /api/v1/accounts/{id}/status` | `{"status": "active" \| "suspended"}` | Approve a pending account, suspend, or reactivate. Suspending cuts the account's machines off and ends its sessions. |

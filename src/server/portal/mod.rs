@@ -81,6 +81,8 @@ pub struct Config {
     pub tls_fingerprint: Option<String>,
     /// Host names the portal answers to, besides IP addresses and `localhost`.
     pub hosts: Vec<String>,
+    /// Domains tenants may choose for their account end in one of these.
+    pub tenant_domain_suffixes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]

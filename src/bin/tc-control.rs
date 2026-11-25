@@ -128,6 +128,10 @@ enum Cmd {
         /// Ephemeral machines are removed after being offline this long.
         #[arg(long, default_value = "30m")]
         ephemeral_timeout: String,
+        /// Domains accounts may choose for themselves (in the portal) must
+        /// end in one of these, comma-separated. Operators may set any.
+        #[arg(long, default_value = "internal", value_delimiter = ',')]
+        tenant_domain_suffixes: Vec<String>,
     },
     /// Print the TLS fingerprint and SSH host key clients need to pin.
     Fingerprint,
@@ -196,6 +200,12 @@ enum AccountsCmd {
     Approval {
         name: String,
         state: String,
+    },
+    /// Give the account its own MagicDNS domain (machines become
+    /// NAME.DOMAIN), or `default` for ACCOUNT.<hub domain>.
+    Domain {
+        name: String,
+        domain: String,
     },
     List,
     /// Cut an account's machines off and stop its shares, keeping everything.
@@ -440,6 +450,12 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
             AccountsCmd::Role { name, role } => {
                 db.set_role(&name, Role::parse(&role)?)?;
                 println!("{name} is now a {role}");
+            }
+            AccountsCmd::Domain { name, domain } => {
+                let hub = db.hub_domain();
+                let d = db.set_dns_domain(&name, Some(&domain), &hub, None)?;
+                let zone = server::db::account_zone(&name, d.as_deref(), &hub);
+                println!("{name}: machines are now NAME.{zone}");
             }
             AccountsCmd::Approval { name, state } => {
                 let on = match state.as_str() {
@@ -762,6 +778,7 @@ async fn main() -> Result<()> {
             acme_http_listen,
             key_expiry,
             ephemeral_timeout,
+            tenant_domain_suffixes,
         } => {
             let domain = domain.trim_matches('.').to_ascii_lowercase();
             if domain.is_empty() {
@@ -846,6 +863,11 @@ async fn main() -> Result<()> {
                     d => Some(server::parse_duration(d)?),
                 },
                 ephemeral_timeout: server::parse_duration(&ephemeral_timeout)?,
+                tenant_domain_suffixes: tenant_domain_suffixes
+                    .into_iter()
+                    .map(|s| s.trim().trim_matches('.').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             })
             .await
         }

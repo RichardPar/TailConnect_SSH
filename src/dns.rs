@@ -1,11 +1,12 @@
 //! MagicDNS: a tiny resolver answering for tailnet names, reached in-tunnel
 //! at 100.100.100.100:53, from the local network map only.
 //!
-//! Every machine is `name.account.<domain>`. Relative names work too:
-//! `name.account`, and plain `name` for machines of this machine's own
-//! account.
+//! Every machine is `name.ZONE`, where its account's zone is
+//! `account.<domain>` or the account's own domain (`acme.internal`).
+//! Relative names work too: `name.account`, and plain `name` for machines
+//! of this machine's own account.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 const TYPE_A: u16 = 1;
@@ -19,42 +20,63 @@ const TTL: u32 = 60;
 /// Names this machine can resolve.
 #[derive(Debug, Default, Clone)]
 pub struct Zone {
+    /// The hub's domain: every account's default zone is under it.
     pub domain: String,
-    /// `name.account` → address.
-    pub names: HashMap<String, Ipv4Addr>,
     /// This machine's account: its machines also resolve by bare name.
     pub account: String,
+    /// Full names (`name.zone`) → address.
+    pub fqdns: HashMap<String, Ipv4Addr>,
+    /// Relative names (`name.account`, and `name` for our own account) → address.
+    pub relative: HashMap<String, Ipv4Addr>,
+    /// Every zone with a machine in it.
+    pub zones: HashSet<String>,
 }
 
 impl Zone {
-    pub fn insert(&mut self, name: &str, account: &str, ip: Ipv4Addr) {
-        self.names.insert(format!("{name}.{account}"), ip);
+    pub fn insert(&mut self, name: &str, account: &str, zone: &str, ip: Ipv4Addr) {
+        let zone = if zone.is_empty() {
+            format!("{account}.{}", self.domain)
+        } else {
+            zone.to_string()
+        };
+        self.fqdns.insert(format!("{name}.{zone}"), ip);
+        self.relative.insert(format!("{name}.{account}"), ip);
+        if account == self.account {
+            self.relative.insert(name.to_string(), ip);
+        }
+        self.zones.insert(zone);
     }
 
-    fn get(&self, rel: &str) -> Option<Ipv4Addr> {
-        if !rel.contains('.') {
-            return self.names.get(&format!("{rel}.{}", self.account)).copied();
-        }
-        self.names.get(rel).copied()
+    /// The zones names should be routed here for: the hub's domain (it holds
+    /// every default zone) and every account's own domain outside it.
+    pub fn routed_zones(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .zones
+            .iter()
+            .filter(|z| **z != self.domain && !z.ends_with(&format!(".{}", self.domain)))
+            .cloned()
+            .collect();
+        v.sort();
+        v.insert(0, self.domain.clone());
+        v
     }
 
     fn lookup(&self, qname: &str) -> Lookup {
         let q = qname.trim_end_matches('.').to_ascii_lowercase();
-        if q == self.domain {
+        if let Some(ip) = self.fqdns.get(&q) {
+            return Lookup::Found(*ip);
+        }
+        // A zone itself exists (it holds machines) but has no address.
+        if q == self.domain || self.zones.contains(&q) {
             return Lookup::NoData;
         }
-        if let Some(rel) = q.strip_suffix(&format!(".{}", self.domain)) {
-            // `account.domain` itself exists (it holds machines) but has no address.
-            if !rel.contains('.') && self.names.keys().any(|k| k.ends_with(&format!(".{rel}"))) {
-                return Lookup::NoData;
-            }
-            return match rel.matches('.').count() {
-                1 => self.get(rel).map_or(Lookup::NxDomain, Lookup::Found),
-                _ => Lookup::NxDomain,
-            };
+        let ours =
+            q.ends_with(&format!(".{}", self.domain)) || self.zones.iter().any(|z| q.ends_with(&format!(".{z}")));
+        if ours {
+            return Lookup::NxDomain;
         }
-        match self.get(&q) {
-            Some(ip) => Lookup::Found(ip),
+        match self.relative.get(&q) {
+            Some(ip) => Lookup::Found(*ip),
             None if !q.contains('.') => Lookup::NxDomain,
             None => Lookup::NotOurs,
         }
@@ -68,10 +90,7 @@ impl Zone {
             return None;
         }
         let ip = Ipv4Addr::new(o[0], o[1], o[2], o[3]);
-        self.names
-            .iter()
-            .find(|(_, v)| **v == ip)
-            .map(|(k, _)| format!("{k}.{}", self.domain))
+        self.fqdns.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
     }
 }
 
@@ -222,8 +241,8 @@ mod tests {
             account: "richard".into(),
             ..Default::default()
         };
-        z.insert("laptop", "richard", Ipv4Addr::new(100, 64, 0, 2));
-        z.insert("nas", "alice", Ipv4Addr::new(100, 64, 0, 9));
+        z.insert("laptop", "richard", "", Ipv4Addr::new(100, 64, 0, 2));
+        z.insert("nas", "alice", "", Ipv4Addr::new(100, 64, 0, 9));
         z
     }
 
@@ -264,6 +283,24 @@ mod tests {
         assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN);
         let r = answer(&zone(), &query("alice.tc.internal", TYPE_A)).unwrap();
         assert_eq!((r[3] & 0x0f, r[7]), (0, 0), "account name: no data");
+    }
+
+    #[test]
+    fn accounts_with_their_own_domain() {
+        let mut z = zone();
+        z.insert("web", "acme", "acme.internal", Ipv4Addr::new(100, 64, 0, 7));
+        for n in ["web.acme.internal", "web.acme"] {
+            let r = answer(&z, &query(n, TYPE_A)).unwrap();
+            assert_eq!(&r[r.len() - 4..], &[100, 64, 0, 7], "{n}");
+        }
+        let r = answer(&z, &query("web.acme.tc.internal", TYPE_A)).unwrap();
+        assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN, "not under the default zone any more");
+        let r = answer(&z, &query("nope.acme.internal", TYPE_A)).unwrap();
+        assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN, "the account's domain is ours");
+        assert!(is_local(&z, &query("nope.acme.internal", TYPE_A)));
+        assert_eq!(z.routed_zones(), vec!["tc.internal", "acme.internal"]);
+        let r = answer(&z, &query("7.0.64.100.in-addr.arpa", TYPE_PTR)).unwrap();
+        assert!(r.windows(4).any(|w| w == b"acme"), "PTR gives the full name");
     }
 
     #[test]

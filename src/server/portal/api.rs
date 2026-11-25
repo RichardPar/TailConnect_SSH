@@ -114,6 +114,7 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/machines/{id}/expiry", post(machine_expiry))
         .route("/me/settings", get(my_settings).post(set_my_settings))
         .route("/accounts/{id}/approval", post(account_approval))
+        .route("/accounts/{id}/dns-domain", post(account_dns_domain))
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}/revoke", post(revoke_key))
         .route("/rules", get(rules).post(add_rule))
@@ -264,6 +265,7 @@ async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
         "operator": me.operator,
         "admin_token": me.account.is_none(),
         "domain": p.cfg.domain,
+        "zone": me.account.as_ref().map(|a| crate::server::db::account_zone(&a.name, a.dns_domain.as_deref(), &p.cfg.domain)),
         "signup": p.cfg.signup.as_str(),
         "server": server,
         "tls_fingerprint": p.cfg.tls_fingerprint,
@@ -330,10 +332,27 @@ async fn change_password(
 
 // ---- machines ----
 
+/// Each account's MagicDNS zone, by account id.
+fn account_zones(db: &crate::server::db::Db, domain: &str) -> anyhow::Result<std::collections::HashMap<i64, String>> {
+    Ok(db
+        .accounts()?
+        .into_iter()
+        .map(|a| {
+            (
+                a.id,
+                crate::server::db::account_zone(&a.name, a.dns_domain.as_deref(), domain),
+            )
+        })
+        .collect())
+}
+
 async fn machines(State(p): P, me: Me) -> ApiResult {
     let online = (p.online)();
     let traffic = (p.traffic)();
-    let nodes = p.db.lock().unwrap().nodes()?;
+    let (nodes, zones) = {
+        let db = p.db.lock().unwrap();
+        (db.nodes()?, account_zones(&db, &p.cfg.domain)?)
+    };
     let v: Vec<Value> = nodes
         .into_iter()
         .filter(|n| me.may(n.account_id))
@@ -342,7 +361,7 @@ async fn machines(State(p): P, me: Me) -> ApiResult {
                 "id": n.id,
                 "name": n.name,
                 "account": n.account,
-                "fqdn": format!("{}.{}.{}", n.name, n.account, p.cfg.domain),
+                "fqdn": format!("{}.{}", n.name, zones.get(&n.account_id).cloned().unwrap_or_default()),
                 "ip": n.ip.to_string(),
                 "tags": n.tags,
                 "exit_node": n.exit_node,
@@ -473,17 +492,30 @@ async fn machine_expiry(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<
     ok(json!({ "expires": e }))
 }
 
-async fn my_settings(me: Me) -> ApiResult {
+async fn my_settings(State(p): P, me: Me) -> ApiResult {
     let Some(a) = me.account else {
         return Err(ApiError::bad("the admin token has no account"));
     };
-    ok(json!({ "require_approval": a.require_approval }))
+    ok(settings_json(&p, &a))
+}
+
+fn settings_json(p: &Portal, a: &crate::server::db::AccountRow) -> Value {
+    json!({
+        "require_approval": a.require_approval,
+        "dns_domain": a.dns_domain,
+        "zone": crate::server::db::account_zone(&a.name, a.dns_domain.as_deref(), &p.cfg.domain),
+        "default_zone": format!("{}.{}", a.name, p.cfg.domain),
+        "allowed_suffixes": p.cfg.tenant_domain_suffixes,
+    })
 }
 
 #[derive(Deserialize)]
 struct Settings {
     #[serde(default)]
     require_approval: Option<bool>,
+    /// The account's own MagicDNS domain; "" for the default.
+    #[serde(default)]
+    dns_domain: Option<String>,
 }
 
 /// An account's own settings: whether new machines need approval.
@@ -494,8 +526,30 @@ async fn set_my_settings(State(p): P, me: Me, Json(b): Json<Settings>) -> ApiRes
     if let Some(r) = b.require_approval {
         p.db.lock().unwrap().set_require_approval(&a.name, r)?;
     }
+    if let Some(d) = &b.dns_domain {
+        // Tenants choose within the allowed suffixes; operators may set any.
+        let suffixes = (!me.operator).then_some(p.cfg.tenant_domain_suffixes.as_slice());
+        p.db.lock()
+            .unwrap()
+            .set_dns_domain(&a.name, Some(d), &p.cfg.domain, suffixes)?;
+    }
     let a = p.db.lock().unwrap().account(&a.name)?;
-    ok(json!({ "require_approval": a.require_approval }))
+    ok(settings_json(&p, &a))
+}
+
+#[derive(Deserialize)]
+struct Domain {
+    domain: String,
+}
+
+/// An operator sets an account's MagicDNS domain (any domain; "" for the default).
+async fn account_dns_domain(State(p): P, _op: Op, Path(id): Path<i64>, Json(b): Json<Domain>) -> ApiResult {
+    let name = account_name(&p, id)?;
+    let d =
+        p.db.lock()
+            .unwrap()
+            .set_dns_domain(&name, Some(&b.domain), &p.cfg.domain, None)?;
+    ok(json!({ "dns_domain": d, "zone": crate::server::db::account_zone(&name, d.as_deref(), &p.cfg.domain) }))
 }
 
 async fn account_approval(State(p): P, _op: Op, Path(id): Path<i64>, Json(b): Json<Enabled>) -> ApiResult {
@@ -817,6 +871,7 @@ async fn accounts(State(p): P, _op: Op) -> ApiResult {
                 "id": a.id, "name": a.name, "status": a.status.as_str(), "role": a.role.as_str(),
                 "has_password": a.has_password,
                 "require_approval": a.require_approval,
+                "dns_domain": a.dns_domain,
                 "machines": nodes.iter().filter(|n| n.account_id == a.id).count(),
                 "created": a.created,
             })

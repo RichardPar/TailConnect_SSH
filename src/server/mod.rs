@@ -51,6 +51,8 @@ pub struct Options {
     pub key_expiry: Option<i64>,
     /// Ephemeral machines are removed after being offline this long (seconds).
     pub ephemeral_timeout: i64,
+    /// Domains tenants may choose for their account must end in one of these.
+    pub tenant_domain_suffixes: Vec<String>,
 }
 
 pub struct PortalOptions {
@@ -200,6 +202,7 @@ impl Hub {
                 inbound,
                 exit_node,
                 expires: None,
+                zone: n.zone.clone(),
             }
         };
         let (peers, notice) = match snap.peers_of(me) {
@@ -328,6 +331,10 @@ pub async fn run(opts: Options) -> Result<()> {
         "key_expiry",
         &opts.key_expiry.map_or("never".to_string(), |s| s.to_string()),
     )?;
+    // For the policy snapshot (machines' DNS zones), the admin CLI and the
+    // portal.
+    db.set_setting("domain", &opts.domain)?;
+    db.set_setting("tenant_domain_suffixes", &opts.tenant_domain_suffixes.join(","))?;
     info!("SSH host key: {}", key_id(host_key.public_key()));
     info!("TLS certificate SHA-256: {}", opts.tls.fingerprint);
 
@@ -473,6 +480,7 @@ async fn start_portal(hub: &Arc<Hub>, opts: &Options, po: &PortalOptions) -> Res
         },
         tls_fingerprint: (opts.tls.self_signed && opts.acme.is_none()).then(|| opts.tls.fingerprint.clone()),
         hosts,
+        tenant_domain_suffixes: opts.tenant_domain_suffixes.clone(),
     };
     info!(
         "portal: sign-up {}; answers to IP addresses, localhost and {}",
