@@ -55,6 +55,8 @@ The hub serves a web portal on the same port, 443. During the TLS handshake, `tc
 | Accounts | operators | Add accounts (with or without a portal password, tenant or operator); approve sign-ups; suspend and reactivate; change role; reset passwords; delete. Create and revoke **invites**. |
 | My account | everyone | Change your password (this signs you out everywhere else) |
 
+**Scripts** use the same API, under `/api/v1`, with the admin token as a bearer token: `curl -H "Authorization: Bearer $TC_ADMIN_TOKEN" https://hub.example.com/api/v1/machines`. Every endpoint is in [docs/api.md](docs/api.md).
+
 **Signing in.** Accounts sign in with a name and password. Accounts without a password only own machines. The **admin token** (`tc-control admin-token`) signs in as an operator without an account, for recovery.
 
 **Sign-up** (`--signup`):
@@ -227,6 +229,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 - joining, and refusal of a used single-use key or a wrong TLS fingerprint;
 - ping, TCP and MagicDNS through the hub, with end-to-end sessions up both ways;
 - traffic counts in `tc status`, and in the portal with a per-peer breakdown;
+- the admin HTTP API with a bearer token;
 - isolation between accounts (maps, DNS, traffic);
 - a share that's one-way and limited to some ports, including changing the ports live;
 - suspending and reactivating an account;
@@ -244,13 +247,13 @@ Done (Linux MVP):
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
+- an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
 - an admin CLI, systemd units, and unit and end-to-end tests.
 
 Roadmap toward parity with the Go TailConnect:
 
-1. An admin HTTP API for scripts
-2. IPv6 inside the tunnel, exit nodes
-3. Key expiry, machine approval, ephemeral machines; per-account DNS domains
-4. Windows (Wintun) and Android (VpnService) clients
+1. IPv6 inside the tunnel, exit nodes
+2. Key expiry, machine approval, ephemeral machines; per-account DNS domains
+3. Windows (Wintun) and Android (VpnService) clients

@@ -7,7 +7,8 @@
 //!   `HttpOnly`, `SameSite=Strict` cookie, valid for 12 hours; a password,
 //!   role or status change ends the account's sessions, even when made with
 //!   the CLI, and replacing the admin token ends token sessions;
-//! * writes are accepted only as JSON from the portal's own origin;
+//! * writes are accepted only as JSON from the portal's own origin, or with
+//!   the admin token as a bearer token (scripts, see docs/api.md);
 //! * the portal answers only to host names it knows (DNS rebinding);
 //! * a strict Content Security Policy, and the UI builds pages from text,
 //!   never from HTML;
@@ -228,6 +229,16 @@ fn strip_port(h: &str) -> &str {
     }
 }
 
+/// The token of an `Authorization: Bearer TOKEN` header.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = v.trim().split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
+}
+
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
@@ -261,7 +272,14 @@ async fn guard(State(p): State<Arc<Portal>>, req: Request, next: Next) -> Respon
             StatusCode::MISDIRECTED_REQUEST,
             "unknown host name: open the portal by the server's address or a name given with --portal-host",
         )
-    } else if !matches!(*req.method(), Method::GET | Method::HEAD) && !same_origin_json(req.headers(), &host, tls) {
+    } else if !matches!(*req.method(), Method::GET | Method::HEAD)
+        && bearer(req.headers()).is_none()
+        && !same_origin_json(req.headers(), &host, tls)
+    {
+        // Requests with a bearer token can't be forged by another site:
+        // browsers never add Authorization by themselves, and a page can't
+        // add it cross-origin without a CORS preflight, which we never
+        // answer. The token itself is checked by the handler.
         plain(StatusCode::FORBIDDEN, "cross-site or non-JSON request refused")
     } else {
         next.run(req).await
@@ -332,6 +350,8 @@ pub fn router(p: Arc<Portal>) -> Router {
             "/app.css",
             axum::routing::get(|| async { asset("text/css; charset=utf-8", APP_CSS) }),
         )
+        // `/api/v1` is the stable path for scripts; the UI uses `/api`.
+        .nest("/api/v1", api::routes())
         .nest("/api", api::routes())
         .fallback(|| async { plain(StatusCode::NOT_FOUND, "not found") })
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))

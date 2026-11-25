@@ -714,3 +714,86 @@ async fn traffic_reports_name_only_related_peers() {
             .any(|m| m["traffic"].is_null())
     );
 }
+
+#[tokio::test]
+async fn scripts_use_the_admin_token_as_a_bearer_token() {
+    let t = T::new(Signup::Off);
+    let tok = t.db(|db| db.new_admin_token().unwrap());
+    let auth = format!("Bearer {tok}");
+    let h = [("authorization", auth.as_str())];
+    // Operator access on the stable path, with no cookie.
+    let r = t.call("GET", "/api/v1/accounts", None, None, &h).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let st = t.call("GET", "/api/v1/status", None, None, &h).await.body;
+    assert_eq!(
+        (st["operator"].clone(), st["accounts"].clone()),
+        (json!(true), json!(2))
+    );
+    // Writes: JSON bodies as usual; a DELETE needs no body or content type.
+    let r = t
+        .call(
+            "POST",
+            "/api/v1/rules",
+            Some(json!({"account": "alice", "from": "*", "to": "*", "ports": "icmp"})),
+            None,
+            &h,
+        )
+        .await;
+    let id = r.body["id"].as_i64().unwrap();
+    let r = t.call("DELETE", &format!("/api/v1/rules/{id}"), None, None, &h).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = t
+        .call(
+            "POST",
+            "/api/v1/keys",
+            Some(json!({"account": "alice", "expires_hours": 1})),
+            None,
+            &h,
+        )
+        .await;
+    assert!(r.body["key"].as_str().unwrap().starts_with("tckey-"));
+    // Without a token, a body-less DELETE is still refused (cookies need JSON).
+    let c = t.login("richard").await;
+    let r = t.call("DELETE", "/api/v1/rules/1", None, Some(&c), &[]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // A replaced token stops working at once.
+    t.db(|db| db.new_admin_token().unwrap());
+    assert_eq!(
+        t.call("GET", "/api/v1/accounts", None, None, &h).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // Wrong tokens: 401, then limited like password guesses.
+    let bad = [("authorization", "Bearer tc-admin-wrong")];
+    assert_eq!(
+        t.call("GET", "/api/v1/machines", None, None, &bad).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let mut last = StatusCode::OK;
+    for _ in 0..12 {
+        last = t.call("GET", "/api/v1/machines", None, None, &bad).await.status;
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    // A bearer token isn't a cookie: a wrong one doesn't fall back to the session.
+    let r = t
+        .call("GET", "/api/v1/me", None, Some(&c), &[("authorization", "Bearer nope")])
+        .await;
+    assert_ne!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn tenant_status_counts_only_their_machines() {
+    let t = T::new(Signup::Off);
+    t.db(|db| {
+        let ka = db.create_authkey("alice", true, None).unwrap();
+        let kr = db.create_authkey("richard", true, None).unwrap();
+        db.register("ssh-ed25519 A", "a", &ka).unwrap();
+        db.register("ssh-ed25519 R", "r", &kr).unwrap();
+    });
+    let c = t.login("alice").await;
+    let st = t.get("/api/v1/status", &c).await.body;
+    assert_eq!(
+        (st["account"].clone(), st["machines"].clone()),
+        (json!("alice"), json!(1))
+    );
+    assert!(st.get("accounts").is_none());
+}

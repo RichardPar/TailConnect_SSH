@@ -115,6 +115,16 @@ R=$(curl_ -X POST -H 'Content-Type: application/json' -d "{\"name\":\"mallory\",
 ctl accounts list | grep -q "mallory.*pending" || fail "pending account not in the database"
 pass "portal on :443 beside SSH: sign-in, key for alice, host/origin checks, sign-up pending approval"
 
+# ---- Admin HTTP API with a bearer token ----
+TOK=$(ctl admin-token 2>/dev/null)
+bear() { curl_ -H "Authorization: Bearer $TOK" "$@"; }
+bear https://127.0.0.1/api/v1/status | grep -q '"operator":true' || fail "API: status with the admin token"
+RID=$(bear -H 'Content-Type: application/json' -d '{"account":"alice","from":"*","to":"*","ports":"icmp"}' https://127.0.0.1/api/v1/rules | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+[[ -n $RID ]] || fail "API: creating a rule"
+[[ $(bear -o /dev/null -w '%{http_code}' -X DELETE https://127.0.0.1/api/v1/rules/$RID) == 200 ]] || fail "API: DELETE with a bearer token"
+[[ $(curl_ -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tc-admin-wrong' https://127.0.0.1/api/v1/machines) == 401 ]] || fail "API: wrong token accepted"
+pass "admin HTTP API: bearer token from tc-control admin-token, /api/v1 status, rule created and deleted, wrong token refused"
+
 NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=B
 start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"

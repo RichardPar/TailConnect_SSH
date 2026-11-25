@@ -15,7 +15,7 @@ use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ConnInfo, Me, Portal, SESSION_COOKIE, SESSION_TTL, Signup, Who, cookie};
+use super::{ConnInfo, Me, Portal, SESSION_COOKIE, SESSION_TTL, Signup, Who, bearer, cookie};
 use crate::now_unix;
 use crate::server::auth;
 use crate::server::db::{Role, Status};
@@ -58,6 +58,22 @@ impl FromRequestParts<Arc<Portal>> for Me {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, p: &Arc<Portal>) -> Result<Self, Self::Rejection> {
+        // Scripts: the admin token as a bearer token acts as an operator.
+        if let Some(token) = bearer(&parts.headers) {
+            if p.db.lock().unwrap().check_admin_token(token).unwrap_or(false) {
+                return Ok(Me {
+                    account: None,
+                    operator: true,
+                });
+            }
+            let ip = parts.extensions.get::<ConnInfo>().map(|c| c.peer.ip());
+            if let Some(ip) = ip
+                && !p.by_client.take(&auth::client_key(ip))
+            {
+                return Err(too_many());
+            }
+            return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token".into()));
+        }
         cookie(&parts.headers, SESSION_COOKIE)
             .and_then(|t| p.resolve(&t))
             .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "not signed in".into()))
@@ -86,6 +102,7 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/logout", post(logout))
         .route("/signup", post(signup))
         .route("/me", get(me))
+        .route("/status", get(status))
         .route("/me/password", post(change_password))
         .route("/machines", get(machines))
         .route("/machines/{id}", delete(remove_machine))
@@ -246,6 +263,28 @@ async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
         "server": server,
         "tls_fingerprint": p.cfg.tls_fingerprint,
     }))
+}
+
+/// A summary: the server, and counts of what `me` may see.
+async fn status(State(p): P, me: Me) -> ApiResult {
+    let online = (p.online)();
+    let db = p.db.lock().unwrap();
+    let nodes: Vec<_> = db.nodes()?.into_iter().filter(|n| me.may(n.account_id)).collect();
+    let mut v = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "domain": p.cfg.domain,
+        "signup": p.cfg.signup.as_str(),
+        "account": me.account.as_ref().map(|a| a.name.clone()),
+        "operator": me.operator,
+        "machines": nodes.len(),
+        "online": nodes.iter().filter(|n| online.contains(&n.ip)).count(),
+    });
+    if me.operator {
+        let accounts = db.accounts()?;
+        v["accounts"] = json!(accounts.len());
+        v["pending"] = json!(accounts.iter().filter(|a| a.status == Status::Pending).count());
+    }
+    ok(v)
 }
 
 #[derive(Deserialize)]
