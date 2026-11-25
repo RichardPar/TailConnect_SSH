@@ -65,9 +65,10 @@ curl -b jar https://hub.example.com/api/v1/machines
 | `GET /api/v1/status` | | `{version, domain, signup, account, operator, machines, online}`; operators also get `accounts` and `pending` |
 | `GET /api/v1/me` | | `{name, operator, admin_token, domain, signup, server, tls_fingerprint}`. `name` is `null` for the admin token. `server` and `tls_fingerprint` are what `tc up` needs. |
 | `POST /api/v1/me/password` | `{"current", "new"}` | Changes your password and ends your other sessions (not for the admin token) |
-| `GET /api/v1/machines` | | `[{id, name, account, fqdn, ip, tags, hostname, online, last_seen, created, traffic}]`. `traffic` is `{rx, tx, rx_rate, tx_rate, age}` (bytes, bytes/s, seconds since the report), or `null`. |
+| `GET /api/v1/machines` | | `[{id, name, account, fqdn, ip, tags, exit_node, hostname, online, last_seen, created, traffic}]`. `traffic` is `{rx, tx, rx_rate, tx_rate, age}` (bytes, bytes/s, seconds since the report), or `null`. |
 | `POST /api/v1/machines/{id}/tags` | `{"tags": "server, db"}` | `{tags}`. Replaces the machine's tags; `""` clears them. |
 | `POST /api/v1/machines/{id}/rename` | `{"name"}` | `{name}` |
+| `POST /api/v1/machines/{id}/exit-node` | `{"enabled": true}` | `{exit_node}`. Lets the machine route internet traffic for its account's machines, or stops it. Off until turned on; Linux machines only. |
 | `GET /api/v1/machines/{id}/traffic` | | `{machine, reported, age, peers: [{peer, ip, rx, tx, rx_rate, tx_rate}]}`. For tenants, peers that aren't the account's own machines or linked by a share show as `another machine`, with no `ip`. |
 | `DELETE /api/v1/machines/{id}` | | Removes the machine and its shares. It's cut off within a second. |
 | `GET /api/v1/keys` | | `[{id, account, prefix, reusable, expires, used, state, created}]`; `state` is `active`, `used`, `expired` or `revoked` |

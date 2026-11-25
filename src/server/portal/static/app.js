@@ -382,7 +382,8 @@ async function machinesTab() {
     el("td", {},
       el("div", {}, el("strong", {}, m.name)),
       el("div", { class: "sub mono" }, m.fqdn),
-      m.tags.map((t) => el("span", { class: "chip" }, "tag:" + t))),
+      m.tags.map((t) => el("span", { class: "chip" }, "tag:" + t)),
+      m.exit_node ? el("span", { class: "chip exit" }, "exit node") : null),
     ops ? el("td", {}, m.account) : null,
     el("td", { class: "mono" }, m.ip),
     el("td", {}, m.hostname),
@@ -393,6 +394,13 @@ async function machinesTab() {
         const r = await ask("Tags for " + m.name, [{ name: "tags", label: "Tags, separated by commas (for example server, db)", value: m.tags.join(", ") }]);
         if (r) act(() => api("POST", "/machines/" + m.id + "/tags", { tags: r.tags }), "Tags saved");
       } }, "Tags"),
+      el("button", {
+        title: m.exit_node
+          ? "Stop routing internet traffic for this account's machines"
+          : "Let this account's machines send their internet traffic through this machine (Linux)",
+        onclick: () => act(() => api("POST", "/machines/" + m.id + "/exit-node", { enabled: !m.exit_node }),
+          m.exit_node ? "Exit node off" : "Exit node on: machines of " + m.account + " can use it with tcs up --exit-node " + m.name),
+      }, m.exit_node ? "Exit node: on" : "Exit node: off"),
       el("button", { onclick: async () => {
         const r = await ask("Rename " + m.name, [{ name: "name", label: "New name", value: m.name }]);
         if (r) act(() => api("POST", "/machines/" + m.id + "/rename", { name: r.name }), "Renamed");

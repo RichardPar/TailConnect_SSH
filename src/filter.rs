@@ -47,10 +47,14 @@ struct FlowKey {
 }
 
 struct L4 {
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    /// The machines (by IPv4 address) the source and destination belong to,
+    /// if they're tunnel addresses (IPv4 or IPv6).
+    src: Option<Ipv4Addr>,
+    dst: Option<Ipv4Addr>,
+    /// TCP, UDP or ICMP (ICMPv6 is mapped onto the ICMP constants).
     proto: u8,
-    /// Not the first fragment: no transport header.
+    /// No transport header to look at: a later IPv4 fragment, or an IPv6
+    /// packet with extension headers.
     later_fragment: bool,
     sport: u16,
     dport: u16,
@@ -59,16 +63,26 @@ struct L4 {
     icmp_id: u16,
 }
 
+const PROTO_ICMPV6: u8 = 58;
+
 fn parse(p: &[u8]) -> Option<L4> {
-    let (src, dst) = crate::packet::ipv4_addrs(p)?;
-    let ihl = ((p[0] & 0x0f) as usize) * 4;
-    let proto = p[9];
-    let frag = u16::from_be_bytes([p[6], p[7]]) & 0x1fff;
+    let (src, dst) = crate::packet::ip_addrs(p)?;
+    let v6 = p[0] >> 4 == 6;
+    let (proto, hdr, frag) = if v6 {
+        let nh = p[6];
+        // Extension headers (hop-by-hop, routing, fragment, options) aren't
+        // followed: such packets count as having no transport header.
+        let plain = matches!(nh, PROTO_TCP | PROTO_UDP | PROTO_ICMPV6);
+        (if nh == PROTO_ICMPV6 { PROTO_ICMP } else { nh }, 40, !plain)
+    } else {
+        let frag = u16::from_be_bytes([p[6], p[7]]) & 0x1fff;
+        (p[9], ((p[0] & 0x0f) as usize) * 4, frag != 0)
+    };
     let mut l = L4 {
-        src,
-        dst,
+        src: crate::machine_of(src),
+        dst: crate::machine_of(dst),
         proto,
-        later_fragment: frag != 0,
+        later_fragment: frag,
         sport: 0,
         dport: 0,
         tcp_flags: 0,
@@ -78,7 +92,7 @@ fn parse(p: &[u8]) -> Option<L4> {
     if l.later_fragment {
         return Some(l);
     }
-    let t = p.get(ihl..)?;
+    let t = p.get(hdr..)?;
     match proto {
         PROTO_TCP | PROTO_UDP => {
             l.sport = u16::from_be_bytes([*t.first()?, *t.get(1)?]);
@@ -88,7 +102,19 @@ fn parse(p: &[u8]) -> Option<L4> {
             }
         }
         PROTO_ICMP => {
-            l.icmp_type = *t.first()?;
+            let ty = *t.first()?;
+            l.icmp_type = if v6 {
+                match ty {
+                    128 => ICMP_ECHO_REQUEST,
+                    129 => ICMP_ECHO_REPLY,
+                    1 | 2 => ICMP_UNREACHABLE, // unreachable, packet too big
+                    3 => ICMP_TIME_EXCEEDED,
+                    4 => ICMP_PARAM_PROBLEM,
+                    _ => 255,
+                }
+            } else {
+                ty
+            };
             if matches!(l.icmp_type, ICMP_ECHO_REQUEST | ICMP_ECHO_REPLY) {
                 l.icmp_id = u16::from_be_bytes([*t.get(4)?, *t.get(5)?]);
             }
@@ -125,7 +151,8 @@ impl Filter {
     /// restricted, so its replies pass.
     pub fn outbound(&mut self, pkt: &[u8], now: Instant) {
         let Some(l) = parse(pkt) else { return };
-        if self.peers.get(&l.dst).is_none_or(Access::is_all) || l.later_fragment {
+        let Some(dst) = l.dst else { return };
+        if self.peers.get(&dst).is_none_or(Access::is_all) || l.later_fragment {
             return;
         }
         let (key, ttl) = match l.proto {
@@ -137,7 +164,7 @@ impl Filter {
                 };
                 (
                     FlowKey {
-                        peer: l.dst,
+                        peer: dst,
                         proto: PROTO_TCP,
                         local: l.sport,
                         remote: l.dport,
@@ -147,7 +174,7 @@ impl Filter {
             }
             PROTO_UDP => (
                 FlowKey {
-                    peer: l.dst,
+                    peer: dst,
                     proto: PROTO_UDP,
                     local: l.sport,
                     remote: l.dport,
@@ -156,7 +183,7 @@ impl Filter {
             ),
             PROTO_ICMP if l.icmp_type == ICMP_ECHO_REQUEST => (
                 FlowKey {
-                    peer: l.dst,
+                    peer: dst,
                     proto: PROTO_ICMP,
                     local: l.icmp_id,
                     remote: 0,
@@ -186,7 +213,8 @@ impl Filter {
 
     fn check(&mut self, pkt: &[u8], now: Instant) -> bool {
         let Some(l) = parse(pkt) else { return false };
-        let Some(access) = self.peers.get(&l.src) else {
+        let Some(src) = l.src else { return false };
+        let Some(access) = self.peers.get(&src) else {
             return false;
         };
         if access.is_all() {
@@ -198,7 +226,7 @@ impl Filter {
         match l.proto {
             PROTO_TCP | PROTO_UDP => {
                 let key = FlowKey {
-                    peer: l.src,
+                    peer: src,
                     proto: l.proto,
                     local: l.dport,
                     remote: l.sport,
@@ -216,7 +244,7 @@ impl Filter {
             PROTO_ICMP => match l.icmp_type {
                 ICMP_ECHO_REPLY => {
                     let key = FlowKey {
-                        peer: l.src,
+                        peer: src,
                         proto: PROTO_ICMP,
                         local: l.icmp_id,
                         remote: 0,
@@ -328,6 +356,50 @@ mod tests {
         assert!(!f.inbound(&tcp(PEER, ME, 1, 2, 0x02), now));
         f.set_peers([(PEER, Access::All)]);
         assert!(f.inbound(&tcp(PEER, ME, 1, 2, 0x02), now));
+    }
+
+    fn ip6(src: Ipv4Addr, dst: Ipv4Addr, next: u8, l4: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&(l4.len() as u16).to_be_bytes());
+        p[6] = next;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&crate::ip6_of(src).octets());
+        p[24..40].copy_from_slice(&crate::ip6_of(dst).octets());
+        p.extend_from_slice(l4);
+        p
+    }
+
+    #[test]
+    fn ipv6_is_filtered_like_ipv4() {
+        let now = Instant::now();
+        let mut f = filter("tcp:22,icmp");
+        let mut syn = vec![0u8; 20];
+        syn[0..2].copy_from_slice(&5000u16.to_be_bytes());
+        syn[2..4].copy_from_slice(&22u16.to_be_bytes());
+        syn[13] = 0x02;
+        assert!(
+            f.inbound(&ip6(PEER, ME, PROTO_TCP, &syn), now),
+            "allowed port over IPv6"
+        );
+        syn[2..4].copy_from_slice(&23u16.to_be_bytes());
+        assert!(!f.inbound(&ip6(PEER, ME, PROTO_TCP, &syn), now));
+        let echo = [128u8, 0, 0, 0, 0, 7, 0, 1];
+        assert!(f.inbound(&ip6(PEER, ME, 58, &echo), now), "ICMPv6 echo counts as icmp");
+        // Replies to our own IPv6 flows pass for a restricted peer.
+        let mut f = filter("");
+        let mut out = vec![0u8; 20];
+        out[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        out[2..4].copy_from_slice(&443u16.to_be_bytes());
+        out[13] = 0x02;
+        f.outbound(&ip6(ME, PEER, PROTO_TCP, &out), now);
+        let mut back = vec![0u8; 20];
+        back[0..2].copy_from_slice(&443u16.to_be_bytes());
+        back[2..4].copy_from_slice(&40000u16.to_be_bytes());
+        back[13] = 0x12;
+        assert!(f.inbound(&ip6(PEER, ME, PROTO_TCP, &back), now));
+        // Extension headers: not followed, so not let through for restricted peers.
+        assert!(!f.inbound(&ip6(PEER, ME, 0, &[6, 0, 0, 0, 0, 0, 0, 0]), now));
     }
 
     #[test]

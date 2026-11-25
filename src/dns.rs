@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
 const TYPE_PTR: u16 = 12;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_REFUSED: u8 = 5;
@@ -110,6 +111,22 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
     out.push(0);
 }
 
+/// Is the query for MagicDNS (a tailnet name, or a reverse lookup of a
+/// tunnel address)? Other names go to the exit node, when one is in use.
+pub fn is_local(zone: &Zone, q: &[u8]) -> bool {
+    let Some((name, _)) = read_name(q, 12) else { return true };
+    let n = name.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(rev) = n.strip_suffix(".in-addr.arpa") {
+        let o: Vec<u8> = rev.split('.').rev().filter_map(|x| x.parse().ok()).collect();
+        return o.len() == 4 && crate::in_tailnet(Ipv4Addr::new(o[0], o[1], o[2], o[3]));
+    }
+    if n.ends_with(".ip6.arpa") {
+        // fd74:6373:7368::/48, as nibbles reversed: 8.6.3.7.3.7.3.6.4.7.d.f.ip6.arpa
+        return n.ends_with("8.6.3.7.3.7.3.6.4.7.d.f.ip6.arpa");
+    }
+    !matches!(zone.lookup(&n), Lookup::NotOurs)
+}
+
 /// Answer one DNS query message. Returns `None` for things that aren't queries.
 pub fn answer(zone: &Zone, q: &[u8]) -> Option<Vec<u8>> {
     if q.len() < 12 || q[2] & 0x80 != 0 {
@@ -137,13 +154,14 @@ pub fn answer(zone: &Zone, q: &[u8]) -> Option<Vec<u8>> {
     let question = &q[12..pos + 4];
 
     let mut answers = Vec::new();
+    let mut an: u16 = 0;
     let rcode;
     if qtype == TYPE_PTR {
         match zone.reverse(&name) {
             Some(target) => {
                 let mut rdata = Vec::new();
                 encode_name(&target, &mut rdata);
-                push_rr(&mut answers, TYPE_PTR, &rdata);
+                push_rr(&mut answers, &mut an, TYPE_PTR, &rdata);
                 rcode = 0;
             }
             None => {
@@ -158,7 +176,10 @@ pub fn answer(zone: &Zone, q: &[u8]) -> Option<Vec<u8>> {
         rcode = match zone.lookup(&name) {
             Lookup::Found(ip) => {
                 if qtype == TYPE_A || qtype == 255 {
-                    push_rr(&mut answers, TYPE_A, &ip.octets());
+                    push_rr(&mut answers, &mut an, TYPE_A, &ip.octets());
+                }
+                if qtype == TYPE_AAAA || qtype == 255 {
+                    push_rr(&mut answers, &mut an, TYPE_AAAA, &crate::ip6_of(ip).octets());
                 }
                 0
             }
@@ -167,13 +188,14 @@ pub fn answer(zone: &Zone, q: &[u8]) -> Option<Vec<u8>> {
             Lookup::NotOurs => RCODE_REFUSED,
         };
     }
-    header(rcode, if answers.is_empty() { 0 } else { 1 }, &mut resp);
+    header(rcode, an, &mut resp);
     resp.extend_from_slice(question);
     resp.extend_from_slice(&answers);
     Some(resp)
 }
 
-fn push_rr(out: &mut Vec<u8>, ty: u16, rdata: &[u8]) {
+fn push_rr(out: &mut Vec<u8>, count: &mut u16, ty: u16, rdata: &[u8]) {
+    *count += 1;
     out.extend_from_slice(&[0xc0, 12]); // pointer to the question name
     out.extend_from_slice(&ty.to_be_bytes());
     out.extend_from_slice(&[0, 1]); // IN
@@ -221,6 +243,18 @@ mod tests {
     }
 
     #[test]
+    fn aaaa_answers_carry_the_derived_ipv6_address() {
+        let r = answer(&zone(), &query("laptop", TYPE_AAAA)).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1);
+        assert_eq!(
+            &r[r.len() - 16..],
+            &crate::ip6_of(Ipv4Addr::new(100, 64, 0, 2)).octets()
+        );
+        let r = answer(&zone(), &query("laptop", 255)).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 2, "ANY: A and AAAA");
+    }
+
+    #[test]
     fn other_accounts_need_the_account() {
         for n in ["nas.alice.tc.internal", "nas.alice"] {
             let r = answer(&zone(), &query(n, TYPE_A)).unwrap();
@@ -240,6 +274,19 @@ mod tests {
         assert_eq!(r[3] & 0x0f, RCODE_NXDOMAIN);
         let r = answer(&zone(), &query("example.com", TYPE_A)).unwrap();
         assert_eq!(r[3] & 0x0f, RCODE_REFUSED);
+    }
+
+    #[test]
+    fn which_names_stay_local() {
+        let z = zone();
+        assert!(is_local(&z, &query("laptop", TYPE_A)));
+        assert!(
+            is_local(&z, &query("nope.richard.tc.internal", TYPE_A)),
+            "ours, even if it doesn't exist"
+        );
+        assert!(!is_local(&z, &query("example.com", TYPE_A)));
+        assert!(is_local(&z, &query("2.0.64.100.in-addr.arpa", TYPE_PTR)));
+        assert!(!is_local(&z, &query("1.1.168.192.in-addr.arpa", TYPE_PTR)));
     }
 
     #[test]

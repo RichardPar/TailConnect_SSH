@@ -41,6 +41,12 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
     let policy: KeyPolicy = Arc::new(move |k| dw.upgrade().is_some_and(|d| d.peer_ip_by_key(&key_id(k)).is_some()));
     loop {
         let (tcp, addr) = listener.accept().await?;
+        // Replies on accepted sessions must use the real network too, not an
+        // exit node's routes.
+        {
+            use std::os::fd::AsRawFd;
+            crate::transport::set_mark(tcp.as_raw_fd(), super::exit::MARK);
+        }
         let (d, tls, ssh, policy) = (d.clone(), tls.clone(), ssh.clone(), policy.clone());
         tokio::spawn(async move {
             match transport::accept(tcp, tls, ssh, policy).await {

@@ -143,6 +143,9 @@ pub struct Opened {
 pub struct E2e {
     local_private: [u8; 32],
     peers: Mutex<HashMap<Ipv4Addr, Peer>>,
+    /// The exit node this machine uses: its packets may come from any
+    /// address outside the tunnel (internet replies).
+    exit: Mutex<Option<Ipv4Addr>>,
 }
 
 fn now_nanos() -> u64 {
@@ -180,6 +183,7 @@ impl E2e {
         E2e {
             local_private,
             peers: Mutex::new(HashMap::new()),
+            exit: Mutex::new(None),
         }
     }
 
@@ -195,6 +199,11 @@ impl E2e {
             };
             map.insert(*ip, p);
         }
+    }
+
+    /// The exit node this machine uses, if any.
+    pub fn set_exit(&self, ip: Option<Ipv4Addr>) {
+        *self.exit.lock().unwrap() = ip;
     }
 
     /// Whether a session with the peer at `ip` is established.
@@ -269,7 +278,7 @@ impl E2e {
         let r = match msg.first() {
             Some(&MSG_INIT) => self.on_init(src, p, msg, &mut out),
             Some(&MSG_RESP) => on_resp(src, p, msg, now, &mut out),
-            Some(&MSG_DATA) => on_data(src, p, msg, now, &mut out),
+            Some(&MSG_DATA) => on_data(src, p, msg, now, &mut out, *self.exit.lock().unwrap() == Some(src)),
             _ => Err(anyhow!("unknown message type")),
         };
         if let Err(e) = r {
@@ -364,7 +373,7 @@ fn on_resp(src: Ipv4Addr, p: &mut Peer, msg: &[u8], now: Instant, out: &mut Open
     Ok(())
 }
 
-fn on_data(src: Ipv4Addr, p: &mut Peer, msg: &[u8], now: Instant, out: &mut Opened) -> Result<()> {
+fn on_data(src: Ipv4Addr, p: &mut Peer, msg: &[u8], now: Instant, out: &mut Opened, exit: bool) -> Result<()> {
     let receiver = u32_at(msg, 1).ok_or_else(|| anyhow!("short data"))?;
     let counter = u64_at(msg, 5).ok_or_else(|| anyhow!("short data"))?;
     let (s, unconfirmed) = p.find(receiver).ok_or_else(|| anyhow!("data for unknown session"))?;
@@ -391,9 +400,11 @@ fn on_data(src: Ipv4Addr, p: &mut Peer, msg: &[u8], now: Instant, out: &mut Open
     if pt.is_empty() {
         return Ok(()); // keepalive
     }
-    // The sealed packet must really be from that peer.
-    match crate::packet::ipv4_addrs(&pt) {
-        Some((inner_src, _)) if inner_src == src => out.packet = Some(pt),
+    // The sealed packet must really be from that peer (its IPv4 or IPv6
+    // address); from our exit node, also from outside the tunnel.
+    match crate::packet::ip_addrs(&pt).map(|(s, _)| (s, crate::machine_of(s))) {
+        Some((_, Some(m))) if m == src => out.packet = Some(pt),
+        Some((_, None)) if exit => out.packet = Some(pt),
         _ => return Err(anyhow!("inner source doesn't match sender {src}")),
     }
     Ok(())
@@ -610,6 +621,36 @@ mod tests {
         let init = d.e2e.seal(b.ip, packet(d.ip, b.ip, b"x")).pop().unwrap();
         assert!(b.e2e.open(a.ip, &init[4..]).replies.is_empty());
         assert!(!b.e2e.established(a.ip));
+    }
+
+    #[test]
+    fn exit_node_may_send_internet_sources_only_when_chosen() {
+        let (a, b) = pair();
+        relay(&a, &b, a.e2e.seal(b.ip, packet(a.ip, b.ip, b"x")), vec![]);
+        let web = Ipv4Addr::new(93, 184, 216, 34);
+        // From a's IPv6 address: fine.
+        let v6 = {
+            let mut p = vec![0u8; 40];
+            p[0] = 0x60;
+            p[8..24].copy_from_slice(&crate::ip6_of(a.ip).octets());
+            p[24..40].copy_from_slice(&crate::ip6_of(b.ip).octets());
+            p
+        };
+        let m = a.e2e.seal(b.ip, v6).pop().unwrap();
+        assert!(b.e2e.open(a.ip, &m[4..]).packet.is_some());
+        // An internet source: only if b uses a as its exit node.
+        let m = a.e2e.seal(b.ip, packet(web, b.ip, b"reply")).pop().unwrap();
+        assert!(b.e2e.open(a.ip, &m[4..]).packet.is_none());
+        b.e2e.set_exit(Some(a.ip));
+        let m = a.e2e.seal(b.ip, packet(web, b.ip, b"reply")).pop().unwrap();
+        assert!(b.e2e.open(a.ip, &m[4..]).packet.is_some());
+        // Even then, never another machine's tunnel address.
+        let m = a
+            .e2e
+            .seal(b.ip, packet(Ipv4Addr::new(100, 64, 0, 9), b.ip, b"spoof"))
+            .pop()
+            .unwrap();
+        assert!(b.e2e.open(a.ip, &m[4..]).packet.is_none());
     }
 
     #[test]

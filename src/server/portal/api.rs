@@ -109,6 +109,7 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/machines/{id}/tags", post(tag_machine))
         .route("/machines/{id}/rename", post(rename_machine))
         .route("/machines/{id}/traffic", get(machine_traffic))
+        .route("/machines/{id}/exit-node", post(exit_node))
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}/revoke", post(revoke_key))
         .route("/rules", get(rules).post(add_rule))
@@ -339,6 +340,7 @@ async fn machines(State(p): P, me: Me) -> ApiResult {
                 "fqdn": format!("{}.{}.{}", n.name, n.account, p.cfg.domain),
                 "ip": n.ip.to_string(),
                 "tags": n.tags,
+                "exit_node": n.exit_node,
                 "hostname": n.hostname,
                 "online": online.contains(&n.ip),
                 "traffic": traffic.get(&n.ip).map(|r| {
@@ -428,6 +430,18 @@ async fn tag_machine(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Tag
 #[derive(Deserialize)]
 struct Name {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct Enabled {
+    enabled: bool,
+}
+
+/// Let a machine route internet traffic for its account's machines, or stop.
+async fn exit_node(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Enabled>) -> ApiResult {
+    own_node(&p, &me, id)?;
+    p.db.lock().unwrap().set_exit_node(id, b.enabled)?;
+    ok(json!({ "exit_node": b.enabled }))
 }
 
 async fn rename_machine(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Name>) -> ApiResult {

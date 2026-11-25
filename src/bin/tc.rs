@@ -28,6 +28,10 @@ enum Cmd {
         /// SHA-256 fingerprint of the hub's self-signed TLS certificate.
         #[arg(long)]
         tls_fingerprint: Option<String>,
+        /// Send internet traffic through this exit node (name, name.account
+        /// or address); "" to stop. Remembered across restarts.
+        #[arg(long)]
+        exit_node: Option<String>,
     },
     /// Disconnect, keeping this machine's registration.
     Down,
@@ -96,6 +100,14 @@ fn print_status(s: &Status) {
     if let Some(n) = &s.notice {
         println!("notice: {n}");
     }
+    if s.exit_serving {
+        println!("exit node: this machine forwards internet traffic for its account");
+    }
+    match (&s.exit_in_use, &s.exit_problem) {
+        (Some(e), _) => println!("exit node: internet traffic and DNS go through {e}"),
+        (None, Some(p)) => println!("exit node: {p}; internet traffic goes direct"),
+        _ => {}
+    }
     if let Some(e) = &s.last_error {
         println!("last error: {e}");
     }
@@ -105,6 +117,12 @@ fn print_status(s: &Status) {
             (false, _, _) => "offline",
             (_, "hub", true) => "hub, e2e",
             (_, path, _) => path,
+        };
+        let in_use = s.exit_in_use.as_deref() == Some(format!("{}.{}", p.name, p.account).as_str());
+        let path = match (p.exit_node, in_use) {
+            (_, true) => format!("{path}; exit node (in use)"),
+            (true, false) => format!("{path}; exit node"),
+            _ => path.to_string(),
         };
         let name = format!("{}.{}", p.name, p.account);
         let counts = if p.rx > 0 || p.tx > 0 {
@@ -130,10 +148,12 @@ async fn main() -> Result<()> {
             server,
             authkey,
             tls_fingerprint,
+            exit_node,
         } => Request::Up {
             server: server.clone(),
             auth_key: authkey.clone(),
             tls_fingerprint: tls_fingerprint.clone(),
+            exit_node: exit_node.clone(),
         },
         Cmd::Down => Request::Down,
         Cmd::Logout => Request::Logout,

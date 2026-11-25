@@ -24,6 +24,9 @@ pub enum Request {
         auth_key: Option<String>,
         #[serde(default)]
         tls_fingerprint: Option<String>,
+        /// Send internet traffic through this exit node ("" for none).
+        #[serde(default)]
+        exit_node: Option<String>,
     },
     /// Disconnect, keeping the registration.
     Down,
@@ -57,6 +60,18 @@ pub struct Status {
     /// Packets the filter dropped since tcd started.
     #[serde(default)]
     pub filter_dropped: u64,
+    /// The chosen exit node, as given.
+    #[serde(default)]
+    pub exit_node: Option<String>,
+    /// The exit node internet traffic goes through now (name.account).
+    #[serde(default)]
+    pub exit_in_use: Option<String>,
+    /// Why the chosen exit node isn't in use.
+    #[serde(default)]
+    pub exit_problem: Option<String>,
+    /// This machine forwards internet traffic for its account.
+    #[serde(default)]
+    pub exit_serving: bool,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -75,6 +90,9 @@ pub struct PeerStatus {
     /// `direct`, `hub` or `-` (offline).
     pub path: String,
     pub endpoints: Vec<SocketAddr>,
+    /// The peer offers to be this machine's exit node.
+    #[serde(default)]
+    pub exit_node: bool,
     /// An end-to-end session for relayed traffic is established.
     #[serde(default)]
     pub e2e: bool,

@@ -30,6 +30,7 @@ pub struct SNode {
     pub ip: Ipv4Addr,
     pub key: String,
     pub tags: Vec<String>,
+    pub exit_node: bool,
 }
 
 /// An account's compiled rules. `None`: no rules, everything allowed.
@@ -51,6 +52,8 @@ pub struct Peer<'a> {
     pub node: &'a SNode,
     /// What this peer may open on the machine.
     pub inbound: Access,
+    /// The peer offers to be the machine's exit node.
+    pub exit_node: bool,
 }
 
 impl Snapshot {
@@ -68,6 +71,7 @@ impl Snapshot {
                 ip: n.ip,
                 key: n.key,
                 tags: n.tags,
+                exit_node: n.exit_node,
             })
             .collect();
         let mut policies: HashMap<i64, Policy> = HashMap::new();
@@ -149,6 +153,13 @@ impl Snapshot {
         self.shares.get(&(to.id, from.account_id)).cloned().unwrap_or_default()
     }
 
+    /// May `user` send its internet traffic through `exit`? Only within one
+    /// account, and only if `user` may open everything on `exit` (access
+    /// rules that limit it rule it out).
+    pub fn exit_for(&self, exit: &SNode, user: &SNode) -> bool {
+        exit.exit_node && exit.account_id == user.account_id && self.access(user, exit).is_all()
+    }
+
     /// The network map of `me`, or `None` if its account is suspended.
     pub fn peers_of(&self, me: &SNode) -> Option<Vec<Peer<'_>>> {
         if !me.active {
@@ -163,7 +174,11 @@ impl Snapshot {
             if inbound.is_none() && self.access(me, p).is_none() {
                 continue;
             }
-            out.push(Peer { node: p, inbound });
+            out.push(Peer {
+                node: p,
+                inbound,
+                exit_node: self.exit_for(p, me),
+            });
         }
         Some(out)
     }
@@ -255,6 +270,44 @@ mod tests {
         w.db.accept_share(s2).unwrap();
         assert_eq!(w.map(x), vec!["y.alice=*"]);
         assert_eq!(w.map(y), vec!["x.richard=tcp:22"]);
+    }
+
+    #[test]
+    fn exit_nodes_serve_their_own_account_when_rules_allow() {
+        let mut w = World::new(&["richard", "alice"]);
+        let gw = w.add("richard", "gw");
+        let laptop = w.add("richard", "laptop");
+        let tablet = w.add("richard", "tablet");
+        let nas = w.add("alice", "nas");
+        w.db.set_exit_node(gw, true).unwrap();
+        let s = w.db.create_share(gw, "alice", "*").unwrap();
+        w.db.accept_share(s).unwrap();
+        let exits = |me: i64| {
+            let s = Snapshot::load(&w.db).unwrap();
+            let me = s.nodes.iter().find(|n| n.id == me).unwrap();
+            let mut v: Vec<String> = s
+                .peers_of(me)
+                .unwrap()
+                .iter()
+                .filter(|p| p.exit_node)
+                .map(|p| p.node.name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(exits(laptop), vec!["gw"]);
+        assert!(
+            exits(nas).is_empty(),
+            "a share never makes it an exit node for another account"
+        );
+        // Rules that limit what the tablet may open on gw rule it out.
+        w.db.set_tags(laptop, &["staff".into()]).unwrap();
+        w.db.add_rule("richard", "tag:staff", "*", "*").unwrap();
+        w.db.add_rule("richard", "tablet", "gw", "tcp:443").unwrap();
+        assert_eq!(exits(laptop), vec!["gw"]);
+        assert!(exits(tablet).is_empty());
+        w.db.set_exit_node(gw, false).unwrap();
+        assert!(exits(laptop).is_empty());
     }
 
     #[test]

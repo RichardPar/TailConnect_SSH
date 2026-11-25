@@ -14,6 +14,19 @@ pub fn ipv4_addrs(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     Some((src, dst))
 }
 
+/// Source and destination of an IPv4 or IPv6 packet.
+pub fn ip_addrs(p: &[u8]) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
+    match p.first()? >> 4 {
+        4 => ipv4_addrs(p).map(|(s, d)| (s.into(), d.into())),
+        6 if p.len() >= 40 => {
+            let s: [u8; 16] = p[8..24].try_into().ok()?;
+            let d: [u8; 16] = p[24..40].try_into().ok()?;
+            Some((std::net::Ipv6Addr::from(s).into(), std::net::Ipv6Addr::from(d).into()))
+        }
+        _ => None,
+    }
+}
+
 /// A UDP datagram inside an IPv4 packet.
 pub struct Udp<'a> {
     pub src: Ipv4Addr,

@@ -238,6 +238,13 @@ enum NodesCmd {
         node: String,
         tags: String,
     },
+    /// Let a (Linux) machine route internet traffic for the machines of its
+    /// account, or stop it. Off for every machine until turned on.
+    ExitNode {
+        node: String,
+        /// on or off
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -461,8 +468,8 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Nodes(c) => match c {
             NodesCmd::List { account } => {
                 println!(
-                    "{:<4} {:<28} {:<15} {:<16} {:<10} KEY",
-                    "ID", "NAME", "IP", "TAGS", "LAST SEEN"
+                    "{:<4} {:<28} {:<15} {:<16} {:<5} {:<10} KEY",
+                    "ID", "NAME", "IP", "TAGS", "EXIT", "LAST SEEN"
                 );
                 for n in db.nodes()? {
                     if account.as_ref().is_some_and(|a| *a != n.account) {
@@ -475,11 +482,12 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                         n.tags.join(",")
                     };
                     println!(
-                        "{:<4} {:<28} {:<15} {:<16} {:<10} {key}…",
+                        "{:<4} {:<28} {:<15} {:<16} {:<5} {:<10} {key}…",
                         n.id,
                         format!("{}.{}", n.name, n.account),
                         n.ip,
                         tags,
+                        if n.exit_node { "yes" } else { "-" },
                         fmt_time(n.last_seen)
                     );
                 }
@@ -493,6 +501,25 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
                 let n = db.find_node(&node)?;
                 let new = db.rename_node(n.id, &new_name)?;
                 println!("renamed {}.{} to {new}.{}", n.name, n.account, n.account);
+            }
+            NodesCmd::ExitNode { node, state } => {
+                let n = db.find_node(&node)?;
+                let on = match state.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => bail!("say on or off"),
+                };
+                db.set_exit_node(n.id, on)?;
+                println!(
+                    "{}.{}: exit node {}",
+                    n.name,
+                    n.account,
+                    if on {
+                        "on (machines of its account can use it with `tcs up --exit-node`)"
+                    } else {
+                        "off"
+                    }
+                );
             }
             NodesCmd::Tag { node, tags } => {
                 let n = db.find_node(&node)?;

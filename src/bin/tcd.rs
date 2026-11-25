@@ -33,6 +33,10 @@ struct Cli {
     /// Name to register with (default: the system hostname).
     #[arg(long)]
     hostname: Option<String>,
+    /// As an exit node: resolvers to answer the DNS lookups of the machines
+    /// using it (comma-separated addresses; default: this host's own).
+    #[arg(long, value_delimiter = ',')]
+    exit_dns: Vec<std::net::IpAddr>,
 }
 
 #[tokio::main]
@@ -56,6 +60,11 @@ async fn main() -> Result<()> {
         direct_port: cli.direct_port,
         dns: !cli.no_dns,
         hostname,
+        exit_dns: cli
+            .exit_dns
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, 53))
+            .collect(),
     })?;
     d.run().await
 }

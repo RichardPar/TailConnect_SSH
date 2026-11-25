@@ -163,7 +163,7 @@ impl Hub {
         let snap = self.snapshot();
         let me = snap.by_key(key)?;
         let sessions = self.sessions.read().unwrap();
-        let node = |n: &policy::SNode, inbound: Vec<String>| {
+        let node = |n: &policy::SNode, inbound: Vec<String>, exit_node: bool| {
             let s = sessions.get(&n.ip);
             Node {
                 name: n.name.clone(),
@@ -174,13 +174,19 @@ impl Hub {
                 online: s.is_some(),
                 endpoints: s.map(|s| s.endpoints.clone()).unwrap_or_default(),
                 inbound,
+                exit_node,
             }
         };
         let (peers, notice) = match snap.peers_of(me) {
-            Some(ps) => (ps.iter().map(|p| node(p.node, p.inbound.to_wire())).collect(), None),
+            Some(ps) => (
+                ps.iter()
+                    .map(|p| node(p.node, p.inbound.to_wire(), p.exit_node))
+                    .collect(),
+                None,
+            ),
             None => (vec![], Some(format!("account {} is suspended", me.account))),
         };
-        let mut me = node(me, vec![]);
+        let mut me = node(me, vec![], me.exit_node && me.active);
         me.endpoints.clear();
         Some(MapView { me, peers, notice })
     }

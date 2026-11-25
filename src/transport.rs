@@ -86,6 +86,43 @@ pub fn server_ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
     })
 }
 
+/// Mark outgoing sockets with this firewall mark (0: don't). tcd sets it so
+/// that, while an exit node is in use, its own connections still go out
+/// through the real network.
+pub static SOCKET_MARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let sock = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    let mark = SOCKET_MARK.load(std::sync::atomic::Ordering::Relaxed);
+    if mark != 0 {
+        use std::os::fd::AsRawFd;
+        set_mark(sock.as_raw_fd(), mark);
+    }
+    sock.connect(addr).await
+}
+
+/// Set a socket's firewall mark (needs CAP_NET_ADMIN; ignored without).
+pub fn set_mark(fd: std::os::fd::RawFd, mark: u32) {
+    let m: libc::c_uint = mark;
+    // SAFETY: setsockopt on a valid fd with a pointer to a c_uint of the given size.
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &m as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        tracing::debug!("SO_MARK: {}", std::io::Error::last_os_error());
+    }
+}
+
 /// Dial `addr` and bring up SSH-in-TLS.
 ///
 /// `sni` is the TLS server name (a host name, or an IP literal).
@@ -98,7 +135,7 @@ pub async fn dial(
     host_key: HostKey,
     connect_timeout: Duration,
 ) -> Result<ClientConn> {
-    let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+    let tcp = tokio::time::timeout(connect_timeout, connect(addr))
         .await
         .map_err(|_| anyhow!("connect to {addr} timed out"))?
         .with_context(|| format!("connect to {addr}"))?;

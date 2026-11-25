@@ -7,6 +7,7 @@
 //!   0 database is migrated into an account named `default`.
 //! * 2: the web portal: account passwords and roles, the `pending` status,
 //!   invites, share links, settings (the admin token's hash).
+//! * 3: exit nodes (`nodes.exit_node`).
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -148,6 +149,8 @@ pub struct NodeRow {
     pub key: String,
     pub hostname: String,
     pub tags: Vec<String>,
+    /// May route internet traffic for its account's machines.
+    pub exit_node: bool,
     pub created: i64,
     pub last_seen: Option<i64>,
 }
@@ -269,7 +272,7 @@ CREATE TABLE settings(
 );
 ";
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Name of the account that machines from a version 0 database move into.
 pub const DEFAULT_ACCOUNT: &str = "default";
@@ -318,8 +321,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V1)?;
         }
     }
-    // Version 1 to 2.
-    tx.execute_batch(SCHEMA_V2_UPGRADE)?;
+    if version < 2 {
+        tx.execute_batch(SCHEMA_V2_UPGRADE)?;
+    }
+    if version < 3 {
+        tx.execute_batch("ALTER TABLE nodes ADD COLUMN exit_node INTEGER NOT NULL DEFAULT 0;")?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -353,7 +360,7 @@ fn split_tags(s: &str) -> Vec<String> {
 }
 
 const NODE_SELECT: &str =
-    "SELECT n.id, n.account_id, a.name, n.name, n.ip, n.key, n.hostname, n.tags, n.created, n.last_seen
+    "SELECT n.id, n.account_id, a.name, n.name, n.ip, n.key, n.hostname, n.tags, n.created, n.last_seen, n.exit_node
      FROM nodes n JOIN accounts a ON a.id = n.account_id";
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -370,6 +377,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         tags: split_tags(&tags),
         created: r.get(8)?,
         last_seen: r.get(9)?,
+        exit_node: r.get(10)?,
     })
 }
 
@@ -668,6 +676,18 @@ impl Db {
     }
 
     /// Replace a machine's tags.
+    /// Turn a machine's exit node role on or off.
+    pub fn set_exit_node(&self, id: i64, on: bool) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE nodes SET exit_node = ?1 WHERE id = ?2", params![on, id])?
+            == 0
+        {
+            bail!("no machine with id {id}");
+        }
+        Ok(())
+    }
+
     pub fn set_tags(&self, id: i64, tags: &[String]) -> Result<Vec<String>> {
         let mut clean = Vec::new();
         for t in tags {

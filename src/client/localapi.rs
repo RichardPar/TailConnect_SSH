@@ -85,7 +85,19 @@ async fn dispatch(d: &Arc<Daemon>, req: Request) -> Result<()> {
             server,
             auth_key,
             tls_fingerprint,
+            exit_node,
         } => {
+            // Only choosing an exit node, while connected: no reconnect.
+            let running = *d.phase.read().unwrap() == Phase::Running;
+            if exit_node.is_some() && server.is_none() && auth_key.is_none() && tls_fingerprint.is_none() && running {
+                d.state.lock().unwrap().exit_node = exit_node.filter(|e| !e.trim().is_empty());
+                d.save_state();
+                d.reconcile_exit();
+                return match d.exit_problem.read().unwrap().clone() {
+                    Some(p) => Err(anyhow!("{p}")),
+                    None => Ok(()),
+                };
+            }
             let fp = tls_fingerprint
                 .map(|f| crate::tls::normalise_fingerprint(&f))
                 .transpose()?;
@@ -102,6 +114,9 @@ async fn dispatch(d: &Arc<Daemon>, req: Request) -> Result<()> {
                 }
                 if fp.is_some() {
                     st.tls_fingerprint = fp;
+                }
+                if let Some(e) = exit_node {
+                    st.exit_node = Some(e).filter(|e| !e.trim().is_empty());
                 }
                 if st.server.is_none() {
                     return Err(anyhow!("no server configured: pass --server"));

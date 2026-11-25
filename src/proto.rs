@@ -32,6 +32,11 @@ pub struct Node {
     /// receiver's packet filter fails closed.
     #[serde(default)]
     pub inbound: Vec<String>,
+    /// In a machine's own entry: it should route internet traffic for its
+    /// account. In a peer's entry: the peer offers to be this machine's
+    /// exit node.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_node: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

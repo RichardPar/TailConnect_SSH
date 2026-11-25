@@ -3,11 +3,14 @@
 //! It keeps one SSH-in-TLS session to the hub, which carries control
 //! messages and relayed packets. Alongside, it accepts and opens direct
 //! SSH-in-TLS sessions with peers it can reach; packets to such a peer skip
-//! the hub. A TUN device carries the machine's own traffic, and an in-tunnel
-//! resolver at 100.100.100.100 answers MagicDNS queries.
+//! the hub. A TUN device carries the machine's own traffic (IPv4 and IPv6),
+//! and an in-tunnel resolver at 100.100.100.100 answers MagicDNS queries.
+//! A machine can be an exit node for its account, or send its internet
+//! traffic through one (see [`exit`]).
 
 pub mod api;
 mod direct;
+mod exit;
 mod localapi;
 
 use std::collections::HashMap;
@@ -41,6 +44,8 @@ pub struct Options {
     /// Configure systemd-resolved for MagicDNS.
     pub dns: bool,
     pub hostname: String,
+    /// Resolvers an exit node uses for its clients (default: the host's).
+    pub exit_dns: Vec<SocketAddr>,
 }
 
 /// What survives a restart.
@@ -50,6 +55,9 @@ struct State {
     tls_fingerprint: Option<String>,
     server_host_key: Option<String>,
     want_up: bool,
+    /// The exit node to send internet traffic through (name or address).
+    #[serde(default)]
+    exit_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +124,8 @@ impl Net {
 
 struct Tun {
     ip: Ipv4Addr,
+    /// The IPv6 address is set too.
+    v6: bool,
     cancel: CancellationToken,
 }
 
@@ -140,6 +150,16 @@ pub struct Daemon {
     filter: Mutex<crate::filter::Filter>,
     /// Bytes (received, sent) per peer since the tunnel started.
     traffic: Mutex<HashMap<Ipv4Addr, (u64, u64)>>,
+    /// This machine's exit node role, while on.
+    serving: Mutex<Option<exit::Serving>>,
+    /// The exit node this machine's internet traffic goes through now.
+    exit_in_use: RwLock<Option<Ipv4Addr>>,
+    /// Why the chosen exit node isn't in use.
+    exit_problem: RwLock<Option<String>>,
+    /// DNS queries forwarded to the exit node, awaiting answers.
+    dns_pending: Mutex<exit::Pending>,
+    /// The hub's addresses from the last successful lookup.
+    hub_addrs: Mutex<Vec<SocketAddr>>,
     next_link: AtomicU64,
 }
 
@@ -172,11 +192,21 @@ impl Daemon {
             e2e,
             filter: Mutex::new(Default::default()),
             traffic: Mutex::new(HashMap::new()),
+            serving: Mutex::new(None),
+            exit_in_use: RwLock::new(None),
+            exit_problem: RwLock::new(None),
+            dns_pending: Mutex::new(Default::default()),
+            hub_addrs: Mutex::new(Vec::new()),
         }))
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("machine key: {}", self.my_key);
+        // Leftovers of a previous run (after a crash): routes, NAT.
+        exit::cleanup();
+        // tcd's own connections keep using the real network when an exit
+        // node is in use.
+        transport::SOCKET_MARK.store(exit::MARK, std::sync::atomic::Ordering::Relaxed);
         let api = tokio::spawn(localapi::serve(self.clone()));
         if self.opts.direct_port != 0 {
             let d = self.clone();
@@ -228,6 +258,10 @@ impl Daemon {
     fn stop(&self, phase: Phase) {
         if let Some(c) = self.run.lock().unwrap().take() {
             c.cancel();
+        }
+        self.stop_using_exit(None);
+        if let Some(s) = self.serving.lock().unwrap().take() {
+            exit::unserve(s);
         }
         if let Some(t) = self.tun.lock().unwrap().take() {
             t.cancel.cancel();
@@ -313,11 +347,23 @@ impl Daemon {
             Some(k) => HostKey::Pinned(k.clone()),
             None => HostKey::Tofu,
         };
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .with_context(|| format!("resolving {host}"))
-            .map_err(HubError::Retry)?
-            .collect();
+        // Remember the hub's addresses: with an exit node in use, DNS goes
+        // through the tunnel, which is down while reconnecting.
+        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(a) => {
+                let a: Vec<SocketAddr> = a.collect();
+                *self.hub_addrs.lock().unwrap() = a.clone();
+                a
+            }
+            Err(e) => {
+                let cached = self.hub_addrs.lock().unwrap().clone();
+                if cached.is_empty() {
+                    return Err(HubError::Retry(anyhow!(e).context(format!("resolving {host}"))));
+                }
+                debug!("resolving {host}: {e}; using {cached:?}");
+                cached
+            }
+        };
         let mut last = anyhow!("{host} has no addresses");
         let mut conn = None;
         for a in addrs {
@@ -481,6 +527,8 @@ impl Daemon {
                     if let Err(e) = self.ensure_tun(node.ip, prefix_len, &domain, &node.account) {
                         break Err(HubError::Fatal(format!("creating TUN device: {e:#}")));
                     }
+                    self.set_role(node.exit_node);
+                    self.reconcile_exit();
                     if !running {
                         running = true;
                         *self.hub_tx.write().unwrap() = Some(tx.clone());
@@ -555,7 +603,123 @@ impl Daemon {
             .collect();
         drop(net);
         self.e2e.sync(&keys);
+        self.reconcile_exit();
         self.map_changed.notify_one();
+    }
+
+    /// Turn this machine's exit node role on or off, as its map entry says.
+    fn set_role(self: &Arc<Self>, on: bool) {
+        let mut serving = self.serving.lock().unwrap();
+        match (on, serving.is_some()) {
+            (true, false) => match exit::serve(&self.opts.tun_name) {
+                Ok(s) => {
+                    let me = self.net.read().unwrap().me.as_ref().map(|m| m.ip);
+                    if let Some(ip) = me {
+                        let ups = if self.opts.exit_dns.is_empty() {
+                            exit::system_resolvers()
+                        } else {
+                            self.opts.exit_dns.clone()
+                        };
+                        let d = Arc::downgrade(self);
+                        let allowed: Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync> =
+                            Arc::new(move |ip| d.upgrade().is_some_and(|d| d.may_use_me_as_exit(ip)));
+                        tokio::spawn(exit::dns_forwarder(ip, ups, allowed, s.dns.clone()));
+                    }
+                    *serving = Some(s);
+                }
+                Err(e) => warn!("exit node: {e:#}"),
+            },
+            (false, true) => exit::unserve(serving.take().expect("serving")),
+            _ => {}
+        }
+    }
+
+    /// May the peer at `ip` send its internet traffic through this machine?
+    /// Only while the role is on, for machines of this machine's own account
+    /// that may open everything here (as the hub decided when it offered us).
+    fn may_use_me_as_exit(&self, ip: Ipv4Addr) -> bool {
+        if self.serving.lock().unwrap().is_none() {
+            return false;
+        }
+        let net = self.net.read().unwrap();
+        let Some(me) = &net.me else { return false };
+        net.peers
+            .get(&ip)
+            .is_some_and(|p| p.node.account == me.account && crate::acl::Access::from_wire(&p.node.inbound).is_all())
+    }
+
+    /// Use the chosen exit node if it's offered and online; otherwise go
+    /// direct, and say why.
+    fn reconcile_exit(&self) {
+        let want = self
+            .state
+            .lock()
+            .unwrap()
+            .exit_node
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let Some(want) = want else {
+            self.stop_using_exit(None);
+            return;
+        };
+        let found = {
+            let net = self.net.read().unwrap();
+            find_peer(&net, &want).map(|p| (p.node.ip, p.node.exit_node, p.node.online, p.node.name.clone()))
+        };
+        let problem = match found {
+            None => Some(format!("exit node {want} isn't in the network map")),
+            Some((_, false, _, n)) => Some(format!("{n} doesn't offer to be this machine's exit node")),
+            Some((_, _, false, n)) => Some(format!("{n} is offline")),
+            Some((ip, true, true, n)) => {
+                if *self.exit_in_use.read().unwrap() == Some(ip) {
+                    return;
+                }
+                let v6 = self.tun.lock().unwrap().as_ref().is_some_and(|t| t.v6);
+                match exit::route_via(&self.opts.tun_name, v6) {
+                    Ok(()) => {
+                        *self.exit_in_use.write().unwrap() = Some(ip);
+                        *self.exit_problem.write().unwrap() = None;
+                        self.e2e.set_exit(Some(ip));
+                        info!("exit node: internet traffic goes through {n}");
+                        if self.opts.dns {
+                            let (d, a) = self.dns_names();
+                            exit_dns_routing(&self.opts.tun_name, true, &d, &a);
+                        }
+                        return;
+                    }
+                    Err(e) => Some(format!("routing through {n}: {e:#}")),
+                }
+            }
+        };
+        self.stop_using_exit(problem);
+    }
+
+    /// The MagicDNS domain and this machine's account.
+    fn dns_names(&self) -> (String, String) {
+        let net = self.net.read().unwrap();
+        (
+            net.domain.clone(),
+            net.me.as_ref().map(|m| m.account.clone()).unwrap_or_default(),
+        )
+    }
+
+    /// Stop sending internet traffic through an exit node.
+    fn stop_using_exit(&self, problem: Option<String>) {
+        if let Some(p) = &problem
+            && self.exit_problem.read().unwrap().as_ref() != Some(p)
+        {
+            warn!("{p}; internet traffic goes direct");
+        }
+        *self.exit_problem.write().unwrap() = problem;
+        if self.exit_in_use.write().unwrap().take().is_some() {
+            exit::unroute();
+            self.e2e.set_exit(None);
+            if self.opts.dns {
+                let (d, a) = self.dns_names();
+                exit_dns_routing(&self.opts.tun_name, false, &d, &a);
+            }
+            info!("exit node: no longer in use");
+        }
     }
 
     /// Create the TUN device, or recreate it if our address changed.
@@ -614,8 +778,33 @@ impl Daemon {
                 }
             }
         });
-        info!("{} up with {ip}/{prefix_len}", self.opts.tun_name);
-        *tun = Some(Tun { ip, cancel });
+        // IPv6: the address derived from the IPv4 one, routing the /48.
+        let ip6 = crate::ip6_of(ip);
+        let v6 = match exit_cmd(&[
+            "ip",
+            "-6",
+            "addr",
+            "replace",
+            &format!("{ip6}/{}", crate::TAILNET6_PREFIX),
+            "dev",
+            &self.opts.tun_name,
+        ]) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("no IPv6 in the tunnel: {e:#}");
+                false
+            }
+        };
+        info!(
+            "{} up with {ip}/{prefix_len}{}",
+            self.opts.tun_name,
+            if v6 {
+                format!(" and {ip6}/{}", crate::TAILNET6_PREFIX)
+            } else {
+                String::new()
+            }
+        );
+        *tun = Some(Tun { ip, v6, cancel });
         drop(tun);
         if self.opts.dns {
             configure_dns(&self.opts.tun_name, domain, account);
@@ -623,27 +812,44 @@ impl Daemon {
         Ok(())
     }
 
-    /// A packet from the TUN device, leaving this machine.
+    /// A packet from the TUN device, leaving this machine: to a peer by its
+    /// tunnel address (IPv4 or IPv6), or to the internet through the exit node.
     fn outbound(&self, pkt: Vec<u8>) {
-        let Some((_, dst)) = crate::packet::ipv4_addrs(&pkt) else {
+        let Some((_, dst)) = crate::packet::ip_addrs(&pkt) else {
             return;
         };
-        if dst == crate::MAGIC_DNS_IP {
+        if dst == IpAddr::V4(crate::MAGIC_DNS_IP) {
             self.answer_dns(&pkt);
             return;
         }
-        let (direct, known) = {
-            let net = self.net.read().unwrap();
-            match net.peers.get(&dst) {
-                Some(p) => (p.direct.as_ref().map(|l| l.tx.clone()), true),
-                None => (None, false),
+        let peer = match crate::machine_of(dst) {
+            Some(m) => {
+                if !self.net.read().unwrap().peers.contains_key(&m) {
+                    return;
+                }
+                self.filter.lock().unwrap().outbound(&pkt, Instant::now());
+                m
             }
+            // Not a tunnel address: the internet, if an exit node is in use.
+            None => match *self.exit_in_use.read().unwrap() {
+                Some(e) => e,
+                None => return,
+            },
         };
-        if !known {
-            return;
-        }
-        self.filter.lock().unwrap().outbound(&pkt, Instant::now());
-        self.traffic.lock().unwrap().entry(dst).or_default().1 += pkt.len() as u64;
+        self.send_to_peer(peer, pkt);
+    }
+
+    /// Send a packet to a peer: over the direct link if there is one, else
+    /// sealed end to end through the hub.
+    fn send_to_peer(&self, peer: Ipv4Addr, pkt: Vec<u8>) {
+        let direct = self
+            .net
+            .read()
+            .unwrap()
+            .peers
+            .get(&peer)
+            .and_then(|p| p.direct.as_ref().map(|l| l.tx.clone()));
+        self.traffic.lock().unwrap().entry(peer).or_default().1 += pkt.len() as u64;
         let pkt = match direct {
             Some(tx) => match tx.try_send(Frame::packet(pkt)) {
                 Ok(()) => return,
@@ -652,10 +858,9 @@ impl Daemon {
             },
             None => pkt,
         };
-        // Through the hub, sealed end to end.
         let hub = self.hub_tx.read().unwrap().clone();
         if let Some(tx) = hub {
-            for m in self.e2e.seal(dst, pkt) {
+            for m in self.e2e.seal(peer, pkt) {
                 let _ = tx.try_send(Frame {
                     kind: frame::SEALED,
                     payload: m,
@@ -682,23 +887,51 @@ impl Daemon {
         }
     }
 
-    /// A packet arriving for this machine from the peer at `via`, over a
-    /// direct link or decrypted from the hub.
-    fn inbound(&self, pkt: Vec<u8>, via: Ipv4Addr) {
-        let Some((src, dst)) = crate::packet::ipv4_addrs(&pkt) else {
+    /// A packet from the peer at `via`, over a direct link or decrypted from
+    /// the hub. It reaches the TUN device if it's for this machine and the
+    /// filter allows it, if it's an internet reply from our exit node, or if
+    /// this machine is an exit node the peer may use and it's for the internet.
+    fn inbound(&self, mut pkt: Vec<u8>, via: Ipv4Addr) {
+        let Some((src, dst)) = crate::packet::ip_addrs(&pkt) else {
             return;
         };
-        {
+        let (me, known) = {
             let net = self.net.read().unwrap();
-            if net.me.as_ref().map(|m| m.ip) != Some(dst) {
-                return;
-            }
-            if src != via || !net.peers.contains_key(&src) {
-                debug!("dropping packet from {src} (via {via:?})");
-                return;
-            }
+            (net.me.as_ref().map(|m| m.ip), net.peers.contains_key(&via))
+        };
+        let Some(me) = me else { return };
+        if !known {
+            return;
         }
-        if !self.filter.lock().unwrap().inbound(&pkt, Instant::now()) {
+        let from_tunnel = crate::machine_of(src);
+        let ok = if crate::machine_of(dst) == Some(me) {
+            match from_tunnel {
+                Some(m) if m == via => {
+                    if !self.filter.lock().unwrap().inbound(&pkt, Instant::now()) {
+                        return;
+                    }
+                    // An answer from our exit node's DNS forwarder: make it
+                    // look like MagicDNS's.
+                    if *self.exit_in_use.read().unwrap() == Some(via) {
+                        self.unforward_dns(&mut pkt, via);
+                    }
+                    true
+                }
+                // An internet reply, from the exit node in use.
+                None => *self.exit_in_use.read().unwrap() == Some(via),
+                _ => false,
+            }
+        } else {
+            // For somewhere else: forward it only as an exit node, only for
+            // the internet, and only for machines allowed to use it.
+            from_tunnel == Some(via)
+                && crate::machine_of(dst).is_none()
+                && dst != IpAddr::V4(crate::MAGIC_DNS_IP)
+                && !matches!(dst, IpAddr::V6(v6) if crate::in_tailnet6(v6))
+                && self.may_use_me_as_exit(via)
+        };
+        if !ok {
+            debug!("dropping packet {src} -> {dst} (via {via})");
             return;
         }
         self.traffic.lock().unwrap().entry(via).or_default().0 += pkt.len() as u64;
@@ -715,16 +948,49 @@ impl Daemon {
         if u.dport != 53 {
             return;
         }
-        let resp = {
+        let exit = *self.exit_in_use.read().unwrap();
+        let (resp, local) = {
             let net = self.net.read().unwrap();
-            crate::dns::answer(&net.zone, u.payload)
+            (
+                crate::dns::answer(&net.zone, u.payload),
+                crate::dns::is_local(&net.zone, u.payload),
+            )
         };
+        // With an exit node in use, other names are resolved there, so the
+        // local network's resolver sees none of this machine's lookups.
+        if let (Some(e), false) = (exit, local)
+            && u.payload.len() >= 2
+        {
+            let me = match u.src {
+                s if crate::in_tailnet(s) => s,
+                _ => return,
+            };
+            let id = u16::from_be_bytes([u.payload[0], u.payload[1]]);
+            self.dns_pending.lock().unwrap().add(u.sport, id);
+            let fwd = crate::packet::build_udp(me, e, u.sport, exit::DNS_PORT, u.payload);
+            self.filter.lock().unwrap().outbound(&fwd, Instant::now());
+            self.send_to_peer(e, fwd);
+            return;
+        }
         if let Some(resp) = resp {
             let out = crate::packet::build_udp(crate::MAGIC_DNS_IP, u.src, 53, u.sport, &resp);
             let tun = self.tun_tx.read().unwrap().clone();
             if let Some(tx) = tun {
                 let _ = tx.try_send(out);
             }
+        }
+    }
+
+    /// Readdress an answer from the exit node's DNS forwarder to come from
+    /// MagicDNS, if it answers a query we forwarded.
+    fn unforward_dns(&self, pkt: &mut Vec<u8>, exit_ip: Ipv4Addr) {
+        let Some(u) = crate::packet::parse_udp(pkt) else { return };
+        if u.src != exit_ip || u.sport != exit::DNS_PORT || u.payload.len() < 2 {
+            return;
+        }
+        let id = u16::from_be_bytes([u.payload[0], u.payload[1]]);
+        if self.dns_pending.lock().unwrap().take(u.dport, id) {
+            *pkt = crate::packet::build_udp(crate::MAGIC_DNS_IP, u.dst, 53, u.dport, u.payload);
         }
     }
 
@@ -761,6 +1027,7 @@ impl Daemon {
                 },
                 endpoints: p.node.endpoints.clone(),
                 e2e: self.e2e.established(p.node.ip),
+                exit_node: p.node.exit_node,
                 rx: traffic.get(&p.node.ip).map_or(0, |t| t.0),
                 tx: traffic.get(&p.node.ip).map_or(0, |t| t.1),
             })
@@ -776,6 +1043,15 @@ impl Daemon {
             last_error: self.last_error.read().unwrap().clone(),
             notice: net.notice.clone(),
             filter_dropped: self.filter.lock().unwrap().dropped(),
+            exit_node: st.exit_node.clone(),
+            exit_in_use: self
+                .exit_in_use
+                .read()
+                .unwrap()
+                .and_then(|ip| net.peers.get(&ip))
+                .map(|p| format!("{}.{}", p.node.name, p.node.account)),
+            exit_problem: self.exit_problem.read().unwrap().clone(),
+            exit_serving: self.serving.lock().unwrap().is_some(),
             peers,
         }
     }
@@ -859,6 +1135,47 @@ fn configure_dns(tun: &str, domain: &str, account: &str) {
             Err(e) => warn!("MagicDNS not configured (resolvectl: {e}); names still resolve with `dig @{dns}`"),
         }
     });
+}
+
+/// While an exit node is in use, send every name to MagicDNS (which passes
+/// names outside it to the exit node); otherwise only MagicDNS names.
+fn exit_dns_routing(tun: &str, all: bool, domain: &str, account: &str) {
+    let tun = tun.to_string();
+    let search = format!("{account}.{domain}");
+    let route = format!("~{domain}");
+    tokio::task::spawn_blocking(move || {
+        let run = |args: &[&str]| std::process::Command::new("resolvectl").args(args).output();
+        let mut domains = vec!["domain", tun.as_str(), search.as_str(), route.as_str()];
+        if all {
+            domains.push("~.");
+        }
+        let _ = run(&domains);
+        let _ = run(&["default-route", &tun, if all { "yes" } else { "no" }]);
+    });
+}
+
+/// Run a system command (iproute2 and the like).
+fn exit_cmd(args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new(args[0]).args(&args[1..]).output()?;
+    if !out.status.success() {
+        bail!("{}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// A peer by short name, `name.account`, full MagicDNS name or address.
+fn find_peer<'a>(net: &'a Net, s: &str) -> Option<&'a PeerState> {
+    let s = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        let m = crate::machine_of(ip)?;
+        return net.peers.get(&m);
+    }
+    let rel = s.strip_suffix(&format!(".{}", net.domain)).unwrap_or(&s);
+    let my_account = net.me.as_ref().map(|m| m.account.as_str()).unwrap_or("");
+    let (name, account) = rel.split_once('.').unwrap_or((rel, my_account));
+    net.peers
+        .values()
+        .find(|p| p.node.name == name && p.node.account == account)
 }
 
 async fn shutdown_signal() {

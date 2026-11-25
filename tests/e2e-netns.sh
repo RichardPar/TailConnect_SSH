@@ -5,6 +5,9 @@
 #   ns B: machine "bravo" (richard), reaching the hub over veth 10.99.0.0/24
 #   ns C: machine "charlie" (alice), reaching the hub over veth 10.98.0.0/24
 #
+#   ns I: "the internet", linked only to ns A: a web address (203.0.113.10,
+#         2001:db8:1::10) and a DNS server. alpha can be the exit node to it.
+#
 # Each machine needs its own namespace: two TUN devices in one namespace
 # would both route 100.64.0.0/10, and traffic would leave through either.
 #
@@ -78,6 +81,34 @@ inC ip link set lo up
 inC ip addr add 10.98.0.2/24 dev vC
 inC ip link set vC up
 
+unshare -n --fork --kill-child sleep infinity &
+IPID=$!
+PIDS+=("$IPID")
+sleep 0.3
+inI() { nsenter -n -t "$IPID" "$@"; }
+ip link add vA3 type veth peer name vI netns "$IPID"
+ip addr add 203.0.113.1/24 dev vA3
+ip -6 addr add 2001:db8:1::1/64 dev vA3 nodad
+ip link set vA3 up
+inI ip link set lo up
+inI ip addr add 203.0.113.10/24 dev vI
+inI ip -6 addr add 2001:db8:1::10/64 dev vI nodad
+inI ip link set vI up
+inI ip route add default via 203.0.113.1
+inI ip -6 route add default via 2001:db8:1::1
+# The web: a TCP server answering with the address it sees the client at.
+for a in 203.0.113.10 2001:db8:1::10; do
+    nsenter -n -t "$IPID" python3 -c "
+import socket,sys; fam = socket.AF_INET6 if ':' in '$a' else socket.AF_INET
+s=socket.socket(fam); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('$a', 8080)); s.listen(8)
+while True:
+    c,peer=s.accept(); c.sendall(peer[0].encode()); c.close()
+# $W" &
+    PIDS+=("$!")
+done
+nsenter -n -t "$IPID" python3 "$ROOT/tests/tiny_dns.py" 203.0.113.10 web.example=203.0.113.10 &
+PIDS+=("$!")
+
 # Hub, with two accounts.
 ctl() { TC_STATE_DIR="$W/hub" "$BIN/tc-control" "$@"; }
 TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test >"$W/hub.log" 2>&1 &
@@ -130,7 +161,7 @@ start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"
     # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
     local cmd=(env TC_TRAFFIC_INTERVAL=2 "$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
-        --hostname "$name" --direct-port "$port" --no-dns)
+        --hostname "$name" --direct-port "$port" --no-dns --exit-dns 203.0.113.10)
     # Not through a shell function: $! must be the process itself (nsenter
     # execs into tcd), or cleanup would leave it running.
     local pre
@@ -150,6 +181,7 @@ ns_prefix() { # A|B|C -> command prefix entering that namespace
     case $1 in
         B) echo "nsenter -n -t $BPID" ;;
         C) echo "nsenter -n -t $CPID" ;;
+        I) echo "nsenter -n -t $IPID" ;;
         *) echo "" ;;
     esac
 }
@@ -298,6 +330,52 @@ wait_status_not bravo "rules:" "deleting the last rule didn't restore everything
 can_ping bravo "$A" || fail "ping bravo -> alpha after deleting the rule"
 pass "rules: tag:staff -> tag:server on tcp:9000 only; deleting the rule restores everything"
 
+# ---- IPv6 inside the tunnel ----
+A6=$(python3 -c "import ipaddress; print(ipaddress.IPv6Address(int(ipaddress.IPv6Address('fd74:6373:7368::')) + int(ipaddress.IPv4Address('$A'))))")
+B6=$(python3 -c "import ipaddress; print(ipaddress.IPv6Address(int(ipaddress.IPv6Address('fd74:6373:7368::')) + int(ipaddress.IPv4Address('$B'))))")
+on bravo ip -6 addr show dev tc-bravo | grep -q "$B6" || fail "bravo has no tunnel IPv6 address $B6"
+wait_for 10 can_ping alpha "$B6" || fail "ping6 alpha -> bravo ($B6)"
+can_ping bravo "$A6" || fail "ping6 bravo -> alpha ($A6)"
+ANS=$(dig +short +time=2 +tries=2 @100.100.100.100 bravo AAAA)
+[[ "$ANS" == "$B6" ]] || fail "MagicDNS AAAA bravo -> '$ANS'"
+pass "IPv6 inside the tunnel: addresses derived from IPv4, ping6 both ways, MagicDNS AAAA"
+
+# ---- Exit nodes ----
+web() { # machine address: what the web server sees us as
+    local ns_var="NS_$1" pre; pre=$(ns_prefix "${!ns_var}")
+    $pre python3 -c "
+import socket,sys; s=socket.create_connection(('$2', 8080), timeout=3); print(s.recv(100).decode())" 2>/dev/null
+}
+[[ -z "$(web bravo 203.0.113.10)" ]] || fail "bravo reaches the internet without an exit node"
+ctl nodes exit-node alpha.richard on >/dev/null
+wait_status alpha "exit node: this machine forwards" "alpha didn't become an exit node"
+wait_status bravo "alpha.richard.*exit node" "bravo isn't offered alpha as exit node"
+tc_ bravo up --exit-node alpha >/dev/null || fail "bravo up --exit-node alpha"
+wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo not using alpha"
+SEEN=$(web bravo 203.0.113.10)
+[[ "$SEEN" == 203.0.113.1 ]] || fail "IPv4 through the exit node: web sees '$SEEN'"
+SEEN6=$(web bravo 2001:db8:1::10)
+[[ "$SEEN6" == 2001:db8:1::1 ]] || fail "IPv6 through the exit node: web sees '$SEEN6'"
+ANS=$(on bravo dig +short +time=2 +tries=2 @100.100.100.100 web.example A)
+[[ "$ANS" == 203.0.113.10 ]] || fail "DNS through the exit node: web.example -> '$ANS'"
+ANS=$(on bravo dig +short +time=2 +tries=2 @100.100.100.100 alpha A)
+[[ "$ANS" == "$A" ]] || fail "MagicDNS names still answered locally while using an exit node"
+on bravo ip rule | grep -q "lookup 7443" || fail "no policy routing rule on bravo"
+pass "exit node: bravo's IPv4 and IPv6 internet traffic leaves through alpha (NAT), DNS resolved there"
+
+if tc_ charlie up --exit-node alpha.richard 2>"$W/err"; then fail "charlie (alice) may use richard's exit node"; fi
+grep -q "doesn't offer\|isn't in the network map" "$W/err" || fail "unexpected: $(cat "$W/err")"
+pass "an exit node serves only its own account"
+
+ctl nodes exit-node alpha.richard off >/dev/null
+wait_status bravo "goes direct" "bravo didn't fall back when alpha stopped being an exit node"
+[[ -z "$(web bravo 203.0.113.10)" ]] || fail "bravo still reaches the internet after the role was turned off"
+on bravo ip rule | grep -q "lookup 7443" && fail "policy routing left behind on bravo"
+wait_status_not alpha "this machine forwards" "alpha still forwarding"
+ctl nodes exit-node alpha.richard on >/dev/null
+wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo didn't return to alpha"
+pass "turning the role off: bravo falls back to direct, and returns when it's back on"
+
 # ---- Direct paths (filter still applies) ----
 for n in alpha bravo charlie; do stop_tcd "$n"; done
 start_tcd alpha 7443
@@ -313,6 +391,9 @@ can_tcp charlie "$A" 9001 || fail "charlie -> alpha:9001 over direct path"
 can_tcp charlie "$A" 9000 && fail "charlie reached unshared alpha:9000 over direct path"
 cant_ping alpha "$C" || fail "alpha opened a connection to charlie over direct path"
 pass "direct SSH paths; share limits still enforced on them"
+wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo's exit node choice not kept across a restart"
+[[ "$(web bravo 203.0.113.10)" == 203.0.113.1 ]] || fail "exit node over the direct path"
+pass "exit node choice kept across restarts; works over the direct path too"
 
 # ---- Removal ----
 ctl nodes remove bravo.richard >/dev/null

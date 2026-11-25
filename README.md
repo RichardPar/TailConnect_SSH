@@ -24,6 +24,43 @@ This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It is a
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
 
+### IPv6 and exit nodes
+
+**IPv6 inside the tunnel.**
+- **Addresses.** Every machine also has an IPv6 address: its IPv4 address in the last 32 bits of `fd74:6373:7368::/48`, a private (ULA) range. For example, `100.96.0.2` goes with `fd74:6373:7368::6460:2`.
+- **What works over it.** Ping, TCP and UDP work to that address too, and MagicDNS answers AAAA queries with it. Access rules, shares and the packet filter apply to IPv6 exactly as to IPv4.
+- **Side by side.** The range differs from the WireGuard TailConnect's, so both can run on one machine.
+
+**Exit nodes** (Linux). An exit node is a machine that other machines of its account can send all their internet traffic through, for example to browse from a café as if from home.
+
+1. **Turn it on:** `sudo tcs-control nodes exit-node gw.richard on`, or **Exit node: off** on the portal's Machines tab. Every machine's role is off until then. Within a second, the machine turns on IP forwarding and NAT for traffic from the tunnel, and its `tcs status` says `exit node: this machine forwards internet traffic for its account`.
+2. **Use it:** `sudo tcs up --exit-node gw` (a short name, `name.account`, full name or address). `tcs status` then says `exit node: internet traffic and DNS go through gw.richard`. The choice is kept across restarts.
+3. **Stop using it:** `sudo tcs up --exit-node ""`.
+
+| Traffic | Path while using an exit node |
+|---|---|
+| Internet, IPv4 and IPv6 | Through the tunnel to the exit node, then out from there (NAT to its address) |
+| The local network, and anything else the machine has a more specific route for | Direct, as before |
+| Other machines in the network | Through the tunnel, as before |
+| tcd's own connections to the hub and to peers | Direct: they carry the tunnel |
+| DNS | Names outside MagicDNS are resolved by the exit node, so the local network's resolver sees none of the lookups. MagicDNS names are answered on the machine itself. |
+
+How it works and what to know:
+- **Using one.** The machine uses policy routing, as `wg-quick` does, leaving the main routing table alone:
+  - `tcd`'s own sockets carry firewall mark `0x7443` and use the main table;
+  - every other route of the main table except its default still applies;
+  - table 7443 holds the default routes into the tunnel.
+- **DNS.** systemd-resolved sends every name to MagicDNS while the exit node is in use. MagicDNS passes names outside it to the exit node's forwarder, on its tunnel address at port 41653, through the tunnel, and readdresses the answers. Only UDP lookups go through; the rare lookup over TCP fails rather than going anywhere else.
+- **Serving.** The exit node:
+  - turns on forwarding, moving interfaces that take router advertisements to `accept_ra=2` first, so the host keeps its own IPv6 setup;
+  - adds an nftables table `tailconnect-ssh-exit` that masquerades traffic from the tunnel;
+  - where a firewall's forward policy is DROP (ufw), adds iptables rules tagged `tailconnect-ssh-exit`.
+  - Its DNS forwarder uses the host's resolvers, or the ones given with `tcd --exit-dns 1.1.1.1,9.9.9.9`.
+- **Cleanup.** Everything is undone when the role is turned off or `tcd` stops, and leftovers of a crash are removed when `tcd` starts.
+- **Who may use an exit node.** Only machines of its own account, and only those that may open everything on it: access rules that limit a machine rule it out, and a share never makes a machine an exit node for another account. The exit node enforces this itself: it forwards only for machines allowed to use it, and only to addresses outside the tunnel.
+- **Falling back.** If the exit node goes away (turned off, removed or offline), the machine falls back to its own internet connection and `tcs status` says why. It returns to the exit node by itself when it's back.
+- **IPv6 to the internet** works if the exit node has a global IPv6 address. Otherwise programs fall back to IPv4.
+
 ### Accounts, sharing and access rules
 
 | | |
@@ -198,11 +235,11 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control invites create [--days N]` / `list` / `revoke ID` | Invites for sign-up |
 | `tc-control admin-token` | New admin token for the portal (replaces the old one) |
 | `tc-control authkey create [--account NAME] [--reusable] [--expires-hours N]` / `list` / `revoke ID` | Pre-auth keys; machines join the key's account |
-| `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` | Machines; `NODE` is an ID or `name.account` |
+| `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` / `exit-node NODE on\|off` | Machines; `NODE` is an ID or `name.account` |
 | `tc-control rules list [--account NAME]` / `add --account NAME FROM TO [PORTS]` / `delete ID` | Access rules |
 | `tc-control shares list` / `create NODE ACCOUNT [PORTS]` / `accept ID` / `ports ID PORTS` / `revoke ID` | Shares |
-| `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
-| `tc up [--server HOST[:PORT]] [--authkey KEY] [--tls-fingerprint FP]` | Join or reconnect |
+| `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
+| `tc up [--server HOST[:PORT]] [--authkey KEY] [--tls-fingerprint FP] [--exit-node NAME]` | Join or reconnect; `--exit-node` alone switches the exit node without reconnecting (`""` for none) |
 | `tc down` / `tc logout` | Disconnect / disconnect and forget the server |
 | `tc status [--json]`, `tc ip [NAME]` | Show this machine, its peers, the path to each (`direct` or `hub`), and what they may do (`shared with you`, `has access to this machine on tcp:80`, `rules: can open tcp:22 here`) |
 
@@ -229,6 +266,12 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 - joining, and refusal of a used single-use key or a wrong TLS fingerprint;
 - ping, TCP and MagicDNS through the hub, with end-to-end sessions up both ways;
 - traffic counts in `tc status`, and in the portal with a per-peer breakdown;
+- IPv6 inside the tunnel (ping6 both ways, MagicDNS AAAA);
+- exit nodes, using an extra namespace as "the internet":
+  - IPv4 and IPv6 leaving through the exit node with NAT, and DNS resolved there;
+  - an exit node serving only its own account;
+  - falling back when the role is turned off, and returning when it's back;
+  - the choice kept across restarts, and working over a direct path;
 - the admin HTTP API with a bearer token;
 - isolation between accounts (maps, DNS, traffic);
 - a share that's one-way and limited to some ports, including changing the ports live;
@@ -247,6 +290,7 @@ Done (Linux MVP):
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
+- IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node;
 - an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
 - the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
@@ -254,6 +298,6 @@ Done (Linux MVP):
 
 Roadmap toward parity with the Go TailConnect:
 
-1. IPv6 inside the tunnel, exit nodes
-2. Key expiry, machine approval, ephemeral machines; per-account DNS domains
+1. Key expiry, machine approval, ephemeral machines; per-account DNS domains
+2. Sending exit traffic through another interface (a commercial VPN) with a kill switch
 3. Windows (Wintun) and Android (VpnService) clients
