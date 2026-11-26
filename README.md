@@ -39,7 +39,8 @@ flowchart LR
 
 - **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (ALPN `tc-ssh/1`) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
 - **End-to-end encryption of relayed traffic.** Before relaying anything, two machines run a Noise IK handshake (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) through the hub. Every relayed packet is then sealed with ChaCha20-Poly1305. The hub sees only the 4-byte destination address, and tells the receiver which machine sent each message. It never relays plaintext. The receiver checks, by cryptography, that the message came from that machine's key, and that the inner packet's source address is that machine's. Details are in [src/e2e.rs](src/e2e.rs).
-- **Direct paths.** Each `tcd` also listens on port 7443 (TLS + SSH again) and reports its addresses to the hub, which adds the public address it sees. Peers dial each other's endpoints. Each side checks the other's SSH key against the network map, so only machines on the network get in. If the two dial each other at the same moment, both keep the link dialled by the smaller key. When a direct link drops, traffic goes back through the hub straight away, and the daemon dials again.
+- **Direct paths.** Each `tcd` also listens on port 7443 (TLS + SSH again) and reports its addresses to the hub, which adds the public address it sees. Peers dial each other's endpoints. Each side checks the other's SSH key against the network map, so only machines on the network get in. If the two dial each other at the same moment, both keep the link dialled by the smaller key. When a direct link drops, traffic goes back through the hub straight away, and the daemon dials again. A peer that starts sending through the hub while we still hold a direct link to it has lost that link, so we drop ours too.
+- **Noticing dead connections.** SSH keepalives run every 5 seconds (10 on Android), and on Linux and Android `TCP_USER_TIMEOUT` gives up after two of them unanswered, so a silently dead connection, to the hub or a peer, is noticed in about 15 seconds. Desktops check their outgoing address every 2 seconds and the Android app checks the network every second. On another network, `tcd` drops its direct links and reconnects to the hub at once (retries start at 250 ms); if only the addresses changed, it re-reports its endpoints.
 - **Machine identity** is an Ed25519 SSH key (`/var/lib/tailconnect-ssh/machine_key`). The hub knows machines by their public key. Clients trust the hub's SSH host key on first use and pin it.
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
@@ -97,7 +98,7 @@ stateDiagram-v2
     Relay --> Dialling: peer has endpoints
     Dialling --> Direct: TLS + SSH up, peer key matches netmap
     Dialling --> Relay: dial fails (retry later)
-    Direct --> Relay: link drops (falls back at once)
+    Direct --> Relay: link drops · keepalives missed · new network · peer sends via hub
     Relay --> Direct: peer dials us on 7443
     Direct --> [*]: peer leaves netmap
     Relay --> [*]: peer leaves netmap
@@ -179,7 +180,7 @@ flowchart TD
     EX --> F{"sender allowed?<br/>(own account or exit share,<br/>may open every port)"}
     F -- no --> DROP["dropped"]
     F -- yes --> X{"--exit-interface set?"}
-    X -- no --> NAT["nftables masquerade<br/>→ exit node's uplink"]
+    X -- no --> NAT["masquerade (nftables, or iptables)<br/>→ exit node's uplink"]
     X -- yes --> UP{"interface up?"}
     UP -- yes --> T7444["rules 5260/5261 → table 7444<br/>→ tun0 / second uplink"]
     UP -- no --> KS["unreachable (metric 4000)<br/>kill switch: blocked"]
@@ -193,7 +194,7 @@ How it works and what to know:
 - **DNS.** systemd-resolved sends every name to MagicDNS while the exit node is in use. MagicDNS passes names outside it to the exit node's forwarder, on its tunnel address at port 41653, through the tunnel, and readdresses the answers. Only UDP lookups go through; the rare lookup over TCP fails rather than going anywhere else.
 - **Serving.** The exit node:
   - turns on forwarding, moving interfaces that take router advertisements to `accept_ra=2` first, so the host keeps its own IPv6 setup;
-  - adds an nftables table `tailconnect-ssh-exit` that masquerades traffic from the tunnel;
+  - adds an nftables table `tailconnect-ssh-exit` that masquerades traffic from the tunnel, or, where `nft` isn't installed (Debian 11 and older), the same NAT with `iptables`/`ip6tables` rules tagged `tailconnect-ssh-exit`;
   - where a firewall's forward policy is DROP (ufw), adds iptables rules tagged `tailconnect-ssh-exit`.
   - Its DNS forwarder uses the host's resolvers, or the ones given with `tcd --exit-dns 1.1.1.1,9.9.9.9`.
 - **Cleanup.** Everything is undone when the role is turned off or `tcd` stops, and leftovers of a crash are removed when `tcd` starts.
@@ -413,6 +414,8 @@ Build it on Linux. It needs Rust, Python 3, a JDK 17+ and the Android SDK (build
 ### Security notes
 
 - **All traffic between machines is end-to-end encrypted.** Direct paths are SSH sessions between the two machines. Relayed traffic is sealed with per-pair Noise sessions that the hub can't read or forge. The hub still sees metadata: which machines talk to each other, when, and how much.
+- **SSH algorithms** are limited to what TailConnect needs, on both ends: Ed25519 keys only; AEAD ciphers only (ChaCha20-Poly1305, AES-256-GCM); no compression; key exchange ML-KEM-768 + X25519 (post-quantum hybrid) first, then X25519, never SHA-1.
+- **DuckDNS token.** The hub sends DuckDNS requests, which carry the token in the URL, only over HTTPS (plain HTTP only to this machine, for the tests).
 - **E2E keys.** Each machine's X25519 key is derived from its Ed25519 SSH machine key (the libsodium `ed25519_sk_to_curve25519` conversion). Peers' keys come from the network map, so no second key needs distributing.
 - **Sessions:**
   - they're rekeyed every 2 minutes and refused after 3, so a stolen session key exposes at most a few minutes of traffic (forward secrecy comes from the ephemeral Noise keys);
@@ -534,6 +537,8 @@ flowchart TB
         direct["direct.rs<br/>peer links"]
         exit["exit.rs · exitdns.rs<br/>exit nodes"]
         lapi["localapi.rs<br/>socket / named pipe"]
+        net["netchange.rs<br/>network changes"]
+        plat["android.rs · win.rs<br/>platform glue"]
     end
     subgraph shared["shared"]
         transport["transport.rs · tls.rs"]
