@@ -58,6 +58,16 @@ and how to build it.
     (`drop_stale_link`, for links older than 10 s). Before this, dell3591's
     replies to the phone went into the dead link until it timed out.
   - `tests/android-bridge.sh` checks the reconnect (7 checks now).
+- Faster failover, on every platform:
+  - SSH keepalive every 5 s (10 s on Android), plus `TCP_USER_TIMEOUT` of
+    two keepalives on Linux and Android. A silently dead connection (to the
+    hub or a peer) is noticed in 13–15 s, down from 46 s (measured on
+    dell3591 by black-holing its hub connection).
+  - Desktops watch their outgoing address every 2 s and reconnect when it
+    moves (Wi-Fi to Ethernet, a second uplink).
+  - The app checks the network every second.
+  - Hub retries start at 250 ms.
+  - On the phone, Wi-Fi ↔ mobile data now recovers in 0.1–2 s.
 
 ## Left to do
 

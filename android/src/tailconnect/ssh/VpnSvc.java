@@ -328,11 +328,12 @@ public class VpnSvc extends VpnService {
         cm.registerDefaultNetworkCallback(netCallback);
         underlying = cm.getActiveNetwork();
         // Android can hold callbacks back (newer versions batch them for
-        // some apps), so also look every 2 seconds: the active network, for
-        // this app (outside its own VPN), is the real one.
+        // some apps), so also look: the active network, for
+        // this app (outside its own VPN), is the real one. Every second:
+        // the check is cheap, and it's how quickly a move is noticed.
         new Thread(() -> {
             while (running) {
-                sleep(2000);
+                sleep(1000);
                 Network n = cm.getActiveNetwork();
                 if (n == null) continue;
                 if (!n.equals(underlying)) {

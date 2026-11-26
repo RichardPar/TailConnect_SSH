@@ -20,7 +20,16 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::keys::key_id;
 
-const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Seconds between SSH keepalives on an idle connection. A connection that
+/// misses three is dead: with 5 s that's noticed in 15–20 s, so a failed
+/// link (the Wi-Fi gone, a dead uplink) moves to another path quickly. The
+/// Android app sets 10 s (fewer wake-ups of a phone's radio; Android tells
+/// it about network changes anyway).
+pub static KEEPALIVE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5);
+
+fn keepalive() -> Duration {
+    Duration::from_secs(KEEPALIVE_SECS.load(std::sync::atomic::Ordering::Relaxed).max(1))
+}
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How the client checks the SSH host key.
@@ -80,8 +89,8 @@ fn preferred() -> russh::Preferred {
 fn client_ssh_config() -> Arc<client::Config> {
     Arc::new(client::Config {
         preferred: preferred(),
-        inactivity_timeout: Some(KEEPALIVE * 4),
-        keepalive_interval: Some(KEEPALIVE),
+        inactivity_timeout: Some(keepalive() * 4),
+        keepalive_interval: Some(keepalive()),
         keepalive_max: 3,
         nodelay: true,
         window_size: 8 << 20,
@@ -92,8 +101,8 @@ fn client_ssh_config() -> Arc<client::Config> {
 pub fn server_ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
     Arc::new(server::Config {
         preferred: preferred(),
-        inactivity_timeout: Some(KEEPALIVE * 4),
-        keepalive_interval: Some(KEEPALIVE),
+        inactivity_timeout: Some(keepalive() * 4),
+        keepalive_interval: Some(keepalive()),
         keepalive_max: 3,
         nodelay: true,
         window_size: 8 << 20,
@@ -119,8 +128,34 @@ async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
     if mark != 0 {
         set_mark(&sock, mark);
     }
+    fail_fast(&sock);
     sock.connect(addr).await
 }
+
+/// Give up on a connection whose sent data (keepalives included) goes
+/// unacknowledged for two keepalive intervals, instead of the kernel's
+/// minutes of retransmitting: a dead path is noticed in about that long.
+/// Linux and Android (TCP_USER_TIMEOUT); elsewhere the SSH keepalives do it.
+#[cfg(target_os = "linux")]
+pub fn fail_fast(sock: &impl std::os::fd::AsRawFd) {
+    let ms: libc::c_uint = (keepalive().as_millis() * 2) as libc::c_uint;
+    // SAFETY: setsockopt on a valid fd with a pointer to a c_uint of the given size.
+    let r = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &ms as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        tracing::debug!("TCP_USER_TIMEOUT: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fail_fast<S>(_sock: &S) {}
 
 /// Set a socket's firewall mark (needs CAP_NET_ADMIN; ignored without).
 #[cfg(unix)]

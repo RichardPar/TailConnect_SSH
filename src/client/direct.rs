@@ -44,6 +44,7 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
         // Replies on accepted sessions must use the real network too, not an
         // exit node's routes.
         crate::transport::set_mark(&tcp, super::exit::MARK);
+        crate::transport::fail_fast(&tcp);
         let (d, tls, ssh, policy) = (d.clone(), tls.clone(), ssh.clone(), policy.clone());
         tokio::spawn(async move {
             match transport::accept(tcp, tls, ssh, policy).await {

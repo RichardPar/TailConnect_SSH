@@ -16,6 +16,7 @@ mod direct;
 mod exit;
 mod exitdns;
 mod localapi;
+mod netchange;
 pub mod view;
 #[cfg(windows)]
 pub mod win;
@@ -206,6 +207,10 @@ impl Daemon {
             Some(a) => Some(android::Bridge::listen(a)?),
             None => None,
         };
+        #[cfg(unix)]
+        if bridge.is_some() {
+            transport::KEEPALIVE_SECS.store(10, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Arc::new(Daemon {
             opts,
             key: Arc::new(key),
@@ -257,6 +262,28 @@ impl Daemon {
                     rt.spawn(async move { d.network_changed(change) });
                 }
             }));
+        }
+        if !self.is_android() {
+            // Elsewhere, look at this machine's addresses every 2 seconds:
+            // a laptop moving from Wi-Fi to Ethernet, a second uplink taking
+            // over.
+            let d = self.clone();
+            tokio::spawn(async move {
+                let (mut last, mut last_out) = (local_network(), outgoing_address());
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let (now, out) = (local_network(), outgoing_address());
+                    let change = desktop_change(last_out, out, &last, &now);
+                    if out.is_some() {
+                        last_out = out;
+                    } else if last_out.is_some() && now.addrs.is_empty() {
+                        // Offline: coming back counts as a new network.
+                        last_out = None;
+                    }
+                    last = now;
+                    d.network_changed(change);
+                }
+            });
         }
         if self.is_android() {
             // New routes mean a new VPN interface from the app.
@@ -358,7 +385,10 @@ impl Daemon {
         mut auth_key: Option<String>,
         mut first: Option<oneshot::Sender<Result<()>>>,
     ) {
-        let mut backoff = Duration::from_secs(1);
+        // Retry quickly at first (a network that's just come up may need a
+        // moment), then back off to every 30 s.
+        const FIRST_RETRY: Duration = Duration::from_millis(250);
+        let mut backoff = FIRST_RETRY;
         loop {
             self.set_phase(Phase::Connecting);
             let started = Instant::now();
@@ -394,7 +424,7 @@ impl Daemon {
                 return;
             }
             if started.elapsed() > Duration::from_secs(30) {
-                backoff = Duration::from_secs(1);
+                backoff = FIRST_RETRY;
             }
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
@@ -1023,21 +1053,20 @@ impl Daemon {
         }
     }
 
-    /// Android: the device's network changed. On another network the hub
+    /// The device's network changed. On another network the hub
     /// connection and direct links are dead (their addresses are gone):
     /// drop the links and reconnect now, rather than after the keepalive
     /// timeout. Otherwise, report the new endpoints.
-    #[cfg(unix)]
-    fn network_changed(self: &Arc<Self>, change: android::Change) {
+    fn network_changed(self: &Arc<Self>, change: netchange::Change) {
         match change {
-            android::Change::None => {}
-            android::Change::Addresses => self.endpoints_changed.notify_one(),
-            android::Change::Network => {
+            netchange::Change::None => {}
+            netchange::Change::Addresses => self.endpoints_changed.notify_one(),
+            netchange::Change::Network => {
                 let connected = self.run.lock().unwrap().is_some();
                 if !connected {
                     return;
                 }
-                info!("android: the device moved to another network; reconnecting");
+                info!("this device moved to another network; reconnecting");
                 {
                     let mut net = self.net.write().unwrap();
                     for p in net.peers.values_mut() {
@@ -1491,6 +1520,52 @@ pub async fn resolve_via(host: &str, port: u16, servers: &[SocketAddr]) -> std::
     }
 }
 
+/// The address this machine reaches the internet from (the default route's
+/// source), or None offline. A UDP "connect" sends nothing. A tunnel
+/// address (an exit node in use) says nothing about the real network.
+fn outgoing_address() -> Option<IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("1.1.1.1:53").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    usable_endpoint(ip).then_some(ip)
+}
+
+/// Desktops: another network when the outgoing address changes (Wi-Fi to
+/// Ethernet, a second uplink taking over) or comes back after being gone;
+/// otherwise new endpoints if the addresses changed. (Addresses that stay,
+/// such as Docker's or a VM bridge's, don't hide a move.)
+fn desktop_change(
+    last_out: Option<IpAddr>,
+    out: Option<IpAddr>,
+    last: &netchange::Network,
+    now: &netchange::Network,
+) -> netchange::Change {
+    match (last_out, out) {
+        (Some(a), Some(b)) if a != b => netchange::Change::Network,
+        (None, Some(_)) => netchange::Change::Network,
+        _ if last.addrs != now.addrs => netchange::Change::Addresses,
+        _ => netchange::Change::None,
+    }
+}
+
+/// This machine's network, from its interfaces' usable addresses.
+fn local_network() -> netchange::Network {
+    let mut addrs: Vec<(IpAddr, u8)> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i.ip())
+        .filter(|ip| usable_endpoint(*ip))
+        .map(|ip| (ip, 0))
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    netchange::Network {
+        id: 0,
+        dns: vec![],
+        addrs,
+    }
+}
+
 fn local_endpoints(port: u16) -> Vec<SocketAddr> {
     if port == 0 {
         return vec![];
@@ -1617,6 +1692,35 @@ fn scopeguard<F: FnOnce()>(f: F) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::parse_server;
+
+    #[test]
+    fn desktop_network_changes() {
+        use super::{
+            desktop_change,
+            netchange::{Change, Network},
+        };
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let net = |a: &[&str]| Network {
+            id: 0,
+            dns: vec![],
+            addrs: a.iter().map(|s| (ip(s), 0)).collect(),
+        };
+        let (wifi, both) = (
+            net(&["172.17.0.1", "192.168.10.50"]),
+            net(&["10.0.0.9", "172.17.0.1", "192.168.10.50"]),
+        );
+        let eth = net(&["10.0.0.9", "172.17.0.1"]);
+        let (w, e) = (Some(ip("192.168.10.50")), Some(ip("10.0.0.9")));
+        assert_eq!(desktop_change(w, w, &wifi, &wifi), Change::None);
+        // Ethernet plugged in, Wi-Fi still the way out: new endpoints only.
+        assert_eq!(desktop_change(w, w, &wifi, &both), Change::Addresses);
+        // The way out moves to Ethernet (Docker's address stays): a new network.
+        assert_eq!(desktop_change(w, e, &both, &eth), Change::Network);
+        // Back online after being offline.
+        assert_eq!(desktop_change(None, w, &net(&[]), &wifi), Change::Network);
+        // Offline: nothing to reconnect to yet.
+        assert_eq!(desktop_change(w, None, &wifi, &net(&[])), Change::Addresses);
+    }
 
     #[test]
     fn server_addresses() {
