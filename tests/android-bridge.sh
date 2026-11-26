@@ -9,7 +9,9 @@
 # "underlying network", whose DNS server is tests/tiny_dns.py. It checks:
 # joining a hub, the interface handed over with the right addresses, routes
 # and DNS, MagicDNS answers from tcd, other names forwarded to the
-# underlying network's server, and the interface closed on `tc down`.
+# underlying network's server, an immediate reconnect when the device moves
+# to another network (keeping the interface), and the interface closed on
+# `tc down`.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${BIN:-$ROOT/target/debug}
@@ -41,7 +43,7 @@ mkdir -p "$N"
 RUST_LOG=info "$BIN/tcd" --state-dir "$N" --socket "$N/tcd.sock" --bridge "$N/bridge.sock" \
     --hostname phone --android-dns 127.0.0.53 --direct-port 7443 >"$T/tcd.log" 2>&1 &
 PIDS="$PIDS $!"
-python3 "$ROOT/tests/fake_android_app.py" "$N/bridge.sock" 127.0.0.53 >"$T/app.log" 2>&1 &
+python3 "$ROOT/tests/fake_android_app.py" "$N/bridge.sock" 127.0.0.53 "$T/move" >"$T/app.log" 2>&1 &
 PIDS="$PIDS $!"
 
 timeout 10 sh -c "until grep -q connected '$T/app.log'; do sleep 0.1; done" || fail "the app didn't connect to the bridge"
@@ -66,6 +68,14 @@ pass "MagicDNS names are answered by tcd, through the interface"
 A=$(timeout 8 dig +short +tries=1 +time=5 @100.100.100.100 web.example) || true
 [ "$A" = 203.0.113.10 ] || fail "forwarding: web.example = '$A'"
 pass "other names are forwarded to the underlying network's DNS server"
+
+touch "$T/move"
+timeout 10 sh -c "until grep -q 'moved to another network; reconnecting' '$T/tcd.log'; do sleep 0.1; done" || fail "no reconnect on a new network"
+timeout 15 sh -c "until [ \$(grep -c 'joined as phone.test' '$T/tcd.log') -ge 2 ]; do sleep 0.1; done" || fail "didn't join again after moving"
+[ "$(grep -c '^tun ' "$T/app.log")" = 1 ] || fail "the VPN interface was replaced on a network change"
+A=$(timeout 5 dig +short +tries=1 +time=3 @100.100.100.100 phone.test.tc.internal) || true
+[ "$A" = 100.64.0.1 ] || fail "MagicDNS after moving: '$A'"
+pass "moving to another network reconnects at once, keeping the VPN interface"
 
 $TC down >/dev/null
 timeout 10 sh -c "until grep -q '^close' '$T/app.log'; do sleep 0.1; done" || fail "no close on down"

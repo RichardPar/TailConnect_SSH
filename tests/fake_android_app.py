@@ -1,17 +1,20 @@
 """Stand-in for the Android app's VpnService, for tests (tests/android-bridge.sh).
 
-    python3 fake_android_app.py BRIDGE_SOCKET DNS_SERVER
+    python3 fake_android_app.py BRIDGE_SOCKET DNS_SERVER [MOVE_FILE]
 
 Connects to tcd's bridge socket (`tcd --bridge`), reports the "underlying
 network", and answers each "tun" request the way the app does: it creates a
 real TUN interface (inside the test's network namespace), gives it the
 requested addresses and routes, and passes its file descriptor to tcd
 (SCM_RIGHTS). Like Android, a new interface replaces the previous one.
+When MOVE_FILE appears, it reports another network (a new handle and new
+addresses), as Android does when the device moves from Wi-Fi to mobile data.
 Prints one line per event.
 """
 import fcntl
 import json
 import os
+import select
 import socket
 import struct
 import subprocess
@@ -23,6 +26,8 @@ IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000
 
 bridge, dns = sys.argv[1], sys.argv[2]
+move_file = sys.argv[3] if len(sys.argv) > 3 else None
+moved = False
 
 
 def ip(*args):
@@ -49,11 +54,18 @@ def send(msg, fd=None):
         socket.send_fds(s, [line], [fd])
 
 
-send({"Type": "network", "DNS": [dns], "Addresses": ["192.0.2.5/24"]})
+send({"Type": "network", "ID": 1, "DNS": [dns], "Addresses": ["192.0.2.5/24"]})
 
 n = 0
 buf = b""
 while True:
+    ready, _, _ = select.select([s], [], [], 0.2)
+    if move_file and not moved and os.path.exists(move_file):
+        moved = True
+        send({"Type": "network", "ID": 2, "DNS": [dns], "Addresses": ["198.51.100.7/24"]})
+        print("moved", flush=True)
+    if not ready:
+        continue
     data = s.recv(65536)
     if not data:
         print("bridge closed", flush=True)

@@ -39,25 +39,34 @@ and how to build it.
   - exit node khadas (the public IP became the VPN's 146.70.175.94), and
     back to None;
   - the Connect switch off and on;
-  - an in-place update that kept the login.
+  - an in-place update that kept the login;
+  - the old Go app (`tailconnect.android`) is gone from the phone;
+  - changing networks (Wi-Fi → mobile data → Wi-Fi, with
+    `adb shell cmd wifi set-wifi-enabled …`): after each switch both
+    directions worked and internet names resolved within 1–2 s, and the
+    direct path to dell3591 was back straight away on Wi-Fi.
+- Changing networks:
+  - The app reports the network with Android's handle for it (`ID`). It
+    follows the default network callback and also checks every 2 s,
+    because Android 16 held the callbacks back in testing.
+  - `tcd` (`Network::change`): on another network it drops its direct
+    links and reconnects to the hub at once. If only the addresses change,
+    it re-reports the endpoints. A DNS forward that fails while the device
+    moves is retried with the new network's servers.
+  - Every client: a peer that starts sending through the hub while we hold
+    a direct link to it has lost that link, so we drop ours too
+    (`drop_stale_link`, for links older than 10 s). Before this, dell3591's
+    replies to the phone went into the dead link until it timed out.
+  - `tests/android-bridge.sh` checks the reconnect (7 checks now).
 
 ## Left to do
 
 - [ ] **QR scanning with the camera** hasn't been tried. Make a key in the
       portal, tap "Scan QR code" in the app, and check the sheet fills in
       (camera permission prompt included).
-- [ ] **Changing networks** (Wi-Fi to mobile data and back) hasn't been
-      tried. The app reports network changes to `tcd`, but `tcd` doesn't
-      react to them beyond the 30-second endpoint re-report and the hub
-      connection's keepalive timeout. Consider calling
-      `Bridge::set_on_network` with a function that re-reports endpoints at
-      once and reconnects to the hub when the network changes.
 - [ ] **Always-on VPN and starting after a reboot** haven't been tried.
       The manifest declares `SUPPORTS_ALWAYS_ON`. Without always-on, the
       app reconnects when it's opened (`want_up` is kept by `tcd`).
-- [ ] **The old Go app** (`tailconnect.android`) is still on the phone, and
-      useless, because its hub is gone. **Ask the user before uninstalling
-      it** (`adb uninstall tailconnect.android`).
 - [ ] Maybe: show the daemon's log more nicely, a Quick Settings tile, and
       a dark-mode check (the palette follows the system theme, but only
       light mode has been looked at).

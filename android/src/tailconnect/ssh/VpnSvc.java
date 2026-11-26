@@ -61,6 +61,9 @@ public class VpnSvc extends VpnService {
     private ParcelFileDescriptor vpn;
     private ConnectivityManager.NetworkCallback netCallback;
     private Network underlying;
+    /** The last network report sent, and on which bridge connection. */
+    private String lastReport;
+    private LocalSocket reportedTo;
     private boolean foreground;
 
     static String socket(Context c) {
@@ -86,10 +89,30 @@ public class VpnSvc extends VpnService {
         return s.isEmpty() ? "android" : (s.length() > 40 ? s.substring(0, 40) : s);
     }
 
+    /** The log, also kept in a file for support (readable over adb). */
+    private static volatile File logFile;
+
     static void addLog(String line) {
         synchronized (log) {
             log.addLast(line);
             while (log.size() > LOG_LINES) log.removeFirst();
+            File f = logFile;
+            if (f != null) {
+                try (java.io.FileWriter w = new java.io.FileWriter(f, true)) {
+                    w.write(line + "\n");
+                } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        File dir = getExternalFilesDir(null);
+        if (dir != null) {
+            File f = new File(dir, "tcd.log");
+            if (f.length() > 2_000_000) f.delete();
+            logFile = f;
         }
     }
 
@@ -192,14 +215,17 @@ public class VpnSvc extends VpnService {
         }
     }
 
-    private synchronized void send(JSONObject m, FileDescriptor fd) {
-        if (bridge == null) return;
+    private synchronized boolean send(JSONObject m, FileDescriptor fd) {
+        if (bridge == null) return false;
         try {
             if (fd != null) bridge.setFileDescriptorsForSend(new FileDescriptor[]{fd});
             bridgeOut.write((m.toString() + "\n").getBytes(StandardCharsets.UTF_8));
             bridgeOut.flush();
+            return true;
         } catch (IOException e) {
             Log.w(TAG, "bridge: " + e);
+            addLog("— bridge: " + e);
+            return false;
         } finally {
             if (fd != null) bridge.setFileDescriptorsForSend(null);
         }
@@ -276,19 +302,56 @@ public class VpnSvc extends VpnService {
 
     // ---- the underlying network ----
 
+    /**
+     * Follow the device's default network, as seen by this app. The app is
+     * outside its own VPN, so that's the real network (Wi-Fi, mobile data),
+     * never the VPN. Each change goes to tcd with the network's handle: a
+     * new handle means another network, and tcd reconnects at once.
+     */
     private void watchNetwork() {
         ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        NetworkRequest req = new NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build();
         netCallback = new ConnectivityManager.NetworkCallback() {
-            @Override public void onAvailable(Network n) { underlying = n; sendNetwork(); }
-            @Override public void onLinkPropertiesChanged(Network n, LinkProperties lp) { if (n.equals(underlying)) sendNetwork(); }
-            @Override public void onLost(Network n) { if (n.equals(underlying)) { underlying = cm.getActiveNetwork(); sendNetwork(); } }
+            @Override public void onAvailable(Network n) {
+                underlying = n;
+                addLog("— network: " + describe(cm, n));
+                setUnderlyingNetworks(new Network[]{n});
+                sendNetwork();
+            }
+            @Override public void onLinkPropertiesChanged(Network n, LinkProperties lp) {
+                if (n.equals(underlying)) sendNetwork();
+            }
+            @Override public void onLost(Network n) {
+                addLog("— network lost: " + describe(cm, n));
+                if (n.equals(underlying)) underlying = null;
+            }
         };
-        cm.registerNetworkCallback(req, netCallback);
+        cm.registerDefaultNetworkCallback(netCallback);
         underlying = cm.getActiveNetwork();
+        // Android can hold callbacks back (newer versions batch them for
+        // some apps), so also look every 2 seconds: the active network, for
+        // this app (outside its own VPN), is the real one.
+        new Thread(() -> {
+            while (running) {
+                sleep(2000);
+                Network n = cm.getActiveNetwork();
+                if (n == null) continue;
+                if (!n.equals(underlying)) {
+                    underlying = n;
+                    addLog("— network: " + describe(cm, n));
+                    setUnderlyingNetworks(new Network[]{n});
+                }
+                sendNetwork();
+            }
+        }, "network").start();
+    }
+
+    private static String describe(ConnectivityManager cm, Network n) {
+        NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+        if (nc == null) return "network " + n.getNetworkHandle();
+        if (nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "Wi-Fi";
+        if (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "mobile data";
+        if (nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "Ethernet";
+        return "network " + n.getNetworkHandle();
     }
 
     /** [DNS servers, addresses] of the underlying network, comma-separated. */
@@ -317,7 +380,18 @@ public class VpnSvc extends VpnService {
             JSONArray dns = new JSONArray(), addrs = new JSONArray();
             for (InetAddress a : lp.getDnsServers()) dns.put(a.getHostAddress());
             for (LinkAddress a : lp.getLinkAddresses()) addrs.put(a.getAddress().getHostAddress() + "/" + a.getPrefixLength());
-            send(new JSONObject().put("Type", "network").put("DNS", dns).put("Addresses", addrs), null);
+            Network n = underlying;
+            JSONObject m = new JSONObject().put("Type", "network").put("DNS", dns).put("Addresses", addrs);
+            if (n != null) m.put("ID", n.getNetworkHandle());
+            String key = m.toString();
+            synchronized (this) {
+                // The same report again (the 2-second check): nothing to say.
+                if (key.equals(lastReport) && bridge == reportedTo) return;
+            }
+            if (send(m, null)) {
+                synchronized (this) { lastReport = key; reportedTo = bridge; }
+                addLog("— network report " + (n == null ? "?" : n.getNetworkHandle()) + ": DNS " + dns);
+            }
         } catch (JSONException ignored) {}
     }
 

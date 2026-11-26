@@ -20,7 +20,15 @@
 //! tcd → app  {"Type":"tun","ID":n,"Addresses":[…],"Routes":[…],"DNS":[…],"Search":[…],"MTU":1400}
 //! app → tcd  {"Type":"tun-reply","ID":n,"OK":true}        with the fd attached
 //! tcd → app  {"Type":"close"}                              no tunnel now: close the interface
-//! app → tcd  {"Type":"network","DNS":[…],"Addresses":["192.168.1.20/24",…]}
+//! app → tcd  {"Type":"network","ID":h,"DNS":[…],"Addresses":["192.168.1.20/24",…]}
+//! ```
+//!
+//! A network message's ID is Android's handle for the underlying network
+//! (`Network.getNetworkHandle()`): a new one means the device moved to
+//! another network (Wi-Fi to mobile data, say), and tcd reconnects at once
+//! rather than waiting for the old connections to time out.
+//!
+//! ```text
 //! ```
 //!
 //! On Android every app's DNS goes to the VPN's server (100.100.100.100):
@@ -57,10 +65,45 @@ pub struct AndroidOpts {
 }
 
 /// What the app last reported about the underlying network.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Network {
+    /// Android's handle for it (0: not reported yet).
+    pub id: u64,
     pub dns: Vec<IpAddr>,
     pub addrs: Vec<(IpAddr, u8)>,
+}
+
+/// What a network report means for tcd.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Change {
+    None,
+    /// The same network, other addresses: re-report the endpoints.
+    Addresses,
+    /// Another network: reconnect (the old connections are dead).
+    Network,
+}
+
+impl Network {
+    /// How `new` differs from `self`, the network reported before.
+    pub fn change(&self, new: &Network) -> Change {
+        let v4 = |n: &Network| -> Vec<IpAddr> {
+            let mut v: Vec<IpAddr> = n.addrs.iter().map(|(a, _)| *a).filter(|a| a.is_ipv4()).collect();
+            v.sort();
+            v
+        };
+        let (old4, new4) = (v4(self), v4(new));
+        let moved = (self.id != 0 && new.id != self.id)
+            // The same network handle (or none yet) with entirely new IPv4
+            // addresses: as good as a new network.
+            || (!old4.is_empty() && !new4.is_empty() && !old4.iter().any(|a| new4.contains(a)));
+        if moved {
+            Change::Network
+        } else if self.addrs != new.addrs {
+            Change::Addresses
+        } else {
+            Change::None
+        }
+    }
 }
 
 /// A VPN interface to ask the app for.
@@ -108,14 +151,17 @@ fn is_false(v: &bool) -> bool {
 
 type Reply = Result<OwnedFd, String>;
 
+/// Called with the network before and after each report from the app.
+pub type OnNetwork = Box<dyn Fn(&Network, &Network) + Send>;
+
 pub struct Bridge {
     /// The app's connection, for sending (the reader thread has a clone).
     conn: Mutex<Option<UnixStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     pub network: RwLock<Network>,
-    /// Called after the app reports a network change.
-    on_network: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called after the app reports the network: (before, now).
+    on_network: Mutex<Option<OnNetwork>>,
 }
 
 impl Bridge {
@@ -132,6 +178,7 @@ impl Bridge {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             network: RwLock::new(Network {
+                id: 0,
                 dns: o.dns.clone(),
                 addrs: o.addrs.clone(),
             }),
@@ -161,7 +208,7 @@ impl Bridge {
         Ok(b)
     }
 
-    pub fn set_on_network(&self, f: Box<dyn Fn() + Send>) {
+    pub fn set_on_network(&self, f: OnNetwork) {
         *self.on_network.lock().unwrap() = Some(f);
     }
 
@@ -266,10 +313,11 @@ impl Bridge {
                     "network" => {
                         let dns: Vec<IpAddr> = m.dns.iter().filter_map(|d| d.parse().ok()).collect();
                         let addrs: Vec<(IpAddr, u8)> = m.addresses.iter().filter_map(|a| parse_prefix(a)).collect();
-                        debug!("android: network: dns {dns:?}, addresses {addrs:?}");
-                        *self.network.write().unwrap() = Network { dns, addrs };
+                        info!("android: network {}: DNS {dns:?}, addresses {addrs:?}", m.id);
+                        let new = Network { id: m.id, dns, addrs };
+                        let old = std::mem::replace(&mut *self.network.write().unwrap(), new.clone());
                         if let Some(f) = self.on_network.lock().unwrap().as_ref() {
-                            f();
+                            f(&old, &new);
                         }
                     }
                     other => debug!("android bridge: unknown message {other}"),
@@ -556,6 +604,35 @@ mod tests {
             Some(("192.168.1.20".parse().unwrap(), 24))
         );
         assert_eq!(parse_prefix("fe80::1"), Some(("fe80::1".parse().unwrap(), 128)));
+    }
+
+    #[test]
+    fn network_changes() {
+        let a = |s: &str| (s.parse::<IpAddr>().unwrap(), 24u8);
+        let wifi = Network {
+            id: 101,
+            dns: vec![],
+            addrs: vec![a("192.168.10.50"), a("fe80::1")],
+        };
+        let mut renewed = wifi.clone();
+        renewed.addrs.push(a("2a00::5"));
+        assert_eq!(wifi.change(&wifi), Change::None);
+        assert_eq!(wifi.change(&renewed), Change::Addresses);
+        let mobile = Network {
+            id: 102,
+            dns: vec![],
+            addrs: vec![a("10.20.30.40")],
+        };
+        assert_eq!(wifi.change(&mobile), Change::Network);
+        // No handle yet (from the command line), then the same network…
+        let start = Network {
+            id: 0,
+            dns: vec![],
+            addrs: vec![a("192.168.10.50")],
+        };
+        assert_eq!(start.change(&wifi), Change::Addresses);
+        // …or a different one.
+        assert_eq!(start.change(&mobile), Change::Network);
     }
 
     #[test]

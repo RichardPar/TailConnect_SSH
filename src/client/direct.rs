@@ -150,6 +150,7 @@ where
         p.direct = Some(Link {
             id,
             tx: tx.clone(),
+            since: std::time::Instant::now(),
             dialer: dialer.clone(),
         });
         p.node.name.clone()

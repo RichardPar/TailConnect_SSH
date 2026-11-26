@@ -97,6 +97,8 @@ impl Phase {
 struct Link {
     id: u64,
     tx: mpsc::Sender<Frame>,
+    /// When it came up.
+    since: Instant,
     /// Key of the side that dialled; used to pick one link when both sides
     /// dial each other at once.
     dialer: String,
@@ -182,6 +184,8 @@ pub struct Daemon {
     /// Android: the VPN interface needs new routes (an exit node in use, or
     /// not); a task asks the app for a new one.
     retun: Notify,
+    /// This machine's addresses changed: report the direct endpoints now.
+    endpoints_changed: Notify,
 }
 
 impl Daemon {
@@ -229,6 +233,7 @@ impl Daemon {
             #[cfg(unix)]
             bridge,
             retun: Notify::new(),
+            endpoints_changed: Notify::new(),
         }))
     }
 
@@ -242,6 +247,17 @@ impl Daemon {
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("machine key: {}", self.my_key);
+        #[cfg(unix)]
+        if let Some(b) = &self.bridge {
+            // The app reports the network: on a new one, reconnect at once.
+            let (d, rt) = (Arc::downgrade(&self), tokio::runtime::Handle::current());
+            b.set_on_network(Box::new(move |old, new| {
+                let change = old.change(new);
+                if let Some(d) = d.upgrade() {
+                    rt.spawn(async move { d.network_changed(change) });
+                }
+            }));
+        }
         if self.is_android() {
             // New routes mean a new VPN interface from the app.
             let d = self.clone();
@@ -489,7 +505,10 @@ impl Daemon {
         let d_ep = self.clone();
         let ep_task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = d_ep.endpoints_changed.notified() => {}
+                }
                 let now = d_ep.endpoints(port);
                 if now != endpoints {
                     endpoints = now.clone();
@@ -1004,6 +1023,35 @@ impl Daemon {
         }
     }
 
+    /// Android: the device's network changed. On another network the hub
+    /// connection and direct links are dead (their addresses are gone):
+    /// drop the links and reconnect now, rather than after the keepalive
+    /// timeout. Otherwise, report the new endpoints.
+    #[cfg(unix)]
+    fn network_changed(self: &Arc<Self>, change: android::Change) {
+        match change {
+            android::Change::None => {}
+            android::Change::Addresses => self.endpoints_changed.notify_one(),
+            android::Change::Network => {
+                let connected = self.run.lock().unwrap().is_some();
+                if !connected {
+                    return;
+                }
+                info!("android: the device moved to another network; reconnecting");
+                {
+                    let mut net = self.net.write().unwrap();
+                    for p in net.peers.values_mut() {
+                        // Dropping a link's sender ends it; dial again soon.
+                        p.direct = None;
+                        p.last_attempt = None;
+                    }
+                }
+                self.start(None, None);
+                self.map_changed.notify_one();
+            }
+        }
+    }
+
     /// Android: a new VPN interface with the current routes.
     fn android_retun(self: &Arc<Self>) {
         let old = self.tun.lock().unwrap().take();
@@ -1106,6 +1154,33 @@ impl Daemon {
         }
     }
 
+    /// A peer sends through the hub while we have a direct link to it: the
+    /// peer no longer has that link (it moved to another network, say), so
+    /// ours is dead too, and replies sent over it would be lost until it
+    /// timed out. Drop it. (Not a link just made: packets sent before it
+    /// was up can still be arriving through the hub.)
+    fn drop_stale_link(&self, src: Ipv4Addr) {
+        const SETTLE: Duration = Duration::from_secs(10);
+        let stale = self
+            .net
+            .read()
+            .unwrap()
+            .peers
+            .get(&src)
+            .and_then(|p| p.direct.as_ref())
+            .is_some_and(|l| l.since.elapsed() > SETTLE);
+        if !stale {
+            return;
+        }
+        let mut net = self.net.write().unwrap();
+        if let Some(p) = net.peers.get_mut(&src) {
+            // Dropping its sender ends the link; it's dialled again later.
+            p.direct = None;
+            p.last_attempt = None;
+            info!("{} sends through the hub: its direct path is gone", p.node.name);
+        }
+    }
+
     /// A sealed message from the hub: `[sender address][e2e message]`.
     fn open_sealed(&self, msg: &[u8], hub: &mpsc::Sender<Frame>) {
         if msg.len() < 5 {
@@ -1120,6 +1195,7 @@ impl Daemon {
             });
         }
         if let Some(pkt) = opened.packet {
+            self.drop_stale_link(src);
             self.inbound(pkt, src);
         }
     }
@@ -1214,11 +1290,39 @@ impl Daemon {
         if let (false, Some(servers)) = (local, self.resolver()) {
             let tun = self.tun_tx.read().unwrap().clone();
             let (q, src, sport) = (u.payload.to_vec(), u.src, u.sport);
+            #[cfg(unix)]
+            let bridge = self.bridge.clone();
             tokio::spawn(async move {
                 #[cfg(unix)]
-                if let (Some(a), Some(tx)) = (android::exchange(&servers, &q).await, tun) {
-                    let out = crate::packet::build_udp(crate::MAGIC_DNS_IP, src, 53, sport, &a);
-                    let _ = tx.try_send(out);
+                let mut servers = servers;
+                #[cfg(unix)]
+                let mut answer = android::exchange(&servers, &q).await;
+                // The device moved to another network while asking: ask its
+                // servers instead.
+                #[cfg(unix)]
+                if answer.is_none()
+                    && let Some(now) = bridge.map(|b| b.resolvers())
+                    && now != servers
+                {
+                    servers = now;
+                    answer = android::exchange(&servers, &q).await;
+                }
+                #[cfg(unix)]
+                match (answer, tun) {
+                    (Some(a), Some(tx)) => {
+                        let out = crate::packet::build_udp(crate::MAGIC_DNS_IP, src, 53, sport, &a);
+                        let _ = tx.try_send(out);
+                    }
+                    (None, _) => {
+                        // Once a minute at most.
+                        static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+                        let mut last = LAST.lock().unwrap();
+                        if last.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+                            *last = Some(Instant::now());
+                            warn!("DNS: no answer from {servers:?}");
+                        }
+                    }
+                    _ => {}
                 }
                 #[cfg(not(unix))]
                 let _ = (servers, q, src, sport, tun);
