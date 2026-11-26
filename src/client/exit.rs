@@ -63,6 +63,12 @@ const TAG: &str = "tailconnect-ssh-exit";
 
 pub use super::exitdns::{DNS_PORT, Pending, dns_forwarder, system_resolvers};
 
+/// Did running a command fail because it isn't installed?
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn run(args: &[&str]) -> Result<String> {
     let out = Command::new(args[0]).args(&args[1..]).output()?;
     if !out.status.success() {
@@ -99,12 +105,88 @@ fn write_sysctl(path: &str, v: &str) -> Result<()> {
 /// What enabling the exit node role changed, to restore it afterwards.
 pub struct Serving {
     sysctls: Vec<(String, String)>,
-    iptables: Vec<(&'static str, Vec<String>)>,
+    /// iptables rules added: (command, table, chain, rule).
+    iptables: Vec<IptRule>,
     pub dns: CancellationToken,
     /// The exit interface, when one is set.
     pub iface: Option<String>,
     /// Why forwarded traffic is blocked right now (the kill switch).
     pub iface_problem: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+type IptRule = (&'static str, &'static str, &'static str, Vec<String>);
+
+/// Insert an iptables rule (tagged), recording it for removal.
+fn ipt_add(
+    added: &mut Vec<IptRule>,
+    cmd: &'static str,
+    table: &'static str,
+    chain: &'static str,
+    rule: &[&str],
+) -> Result<()> {
+    let mut r: Vec<String> = rule.iter().map(|s| s.to_string()).collect();
+    r.extend(["-m", "comment", "--comment", TAG].map(String::from));
+    let mut a = vec![cmd, "-w", "-t", table, "-I", chain, "1"];
+    a.extend(r.iter().map(String::as_str));
+    run(&a)?;
+    added.push((cmd, table, chain, r));
+    Ok(())
+}
+
+/// The forward rules for the tunnel: its traffic out, and the replies.
+fn forward_rules(tun: &str) -> [Vec<&str>; 2] {
+    [
+        vec!["-i", tun, "-j", "ACCEPT"],
+        vec![
+            "-o",
+            tun,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+    ]
+}
+
+/// NAT with iptables, where nftables isn't installed: masquerade what the
+/// tunnel's addresses send out by any other interface, and let it through
+/// the filter. (iptables' nat POSTROUTING can't match the incoming
+/// interface, so this matches the tailnet's source addresses.)
+fn iptables_nat(tun: &str, added: &mut Vec<IptRule>) -> Result<()> {
+    let v4 = format!("{}/{}", crate::TAILNET_NET, crate::TAILNET_PREFIX);
+    let v6 = format!("{}/{}", crate::TAILNET6, crate::TAILNET6_PREFIX);
+    for (cmd, src) in [("iptables", v4.as_str()), ("ip6tables", v6.as_str())] {
+        let r = ipt_add(
+            added,
+            cmd,
+            "nat",
+            "POSTROUTING",
+            &["-s", src, "!", "-o", tun, "-j", "MASQUERADE"],
+        )
+        .and_then(|_| {
+            for rule in forward_rules(tun) {
+                ipt_add(added, cmd, "filter", "FORWARD", &rule)?;
+            }
+            Ok(())
+        });
+        match (cmd, r) {
+            (_, Ok(())) => {}
+            // IPv4 is what matters; IPv6 NAT may not be available.
+            ("ip6tables", Err(e)) => warn!("exit node: no IPv6 forwarding (ip6tables NAT: {e:#})"),
+            (_, Err(e)) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn remove_iptables(rules: &[IptRule]) {
+    for (cmd, table, chain, r) in rules.iter().rev() {
+        let mut a = vec![*cmd, "-w", "-t", table, "-D", chain];
+        a.extend(r.iter().map(String::as_str));
+        let _ = run(&a);
+    }
 }
 
 const FORWARD_V4: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -154,45 +236,36 @@ pub fn serve(tun: &str, iface: Option<&str>) -> Result<Serving> {
             }}
         }}"
     );
-    if let Err(e) = run_input(&["nft", "-f", "-"], &script) {
-        restore(&sysctls);
-        bail!("exit node: setting up NAT (nft): {e}");
-    }
-    // A firewall whose forward policy is DROP (ufw) would still drop it.
     let mut iptables = Vec::new();
-    for cmd in ["iptables", "ip6tables"] {
-        let drops = run(&[cmd, "-w", "-S", "FORWARD"]).is_ok_and(|s| s.lines().any(|l| l == "-P FORWARD DROP"));
-        if !drops {
-            continue;
-        }
-        let rules: [Vec<String>; 2] = [
-            ["-i", tun, "-j", "ACCEPT", "-m", "comment", "--comment", TAG]
-                .map(String::from)
-                .to_vec(),
-            [
-                "-o",
-                tun,
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
-                "-m",
-                "comment",
-                "--comment",
-                TAG,
-            ]
-            .map(String::from)
-            .to_vec(),
-        ];
-        for r in rules {
-            let mut a = vec![cmd, "-w", "-I", "FORWARD", "1"];
-            a.extend(r.iter().map(String::as_str));
-            match run(&a) {
-                Ok(_) => iptables.push((cmd, r)),
-                Err(e) => warn!("exit node: {e}"),
+    match run_input(&["nft", "-f", "-"], &script) {
+        Ok(()) => {
+            // A firewall whose forward policy is DROP (ufw, Docker) would
+            // still drop it.
+            for cmd in ["iptables", "ip6tables"] {
+                let drops = run(&[cmd, "-w", "-S", "FORWARD"]).is_ok_and(|s| s.lines().any(|l| l == "-P FORWARD DROP"));
+                if !drops {
+                    continue;
+                }
+                for rule in forward_rules(tun) {
+                    if let Err(e) = ipt_add(&mut iptables, cmd, "filter", "FORWARD", &rule) {
+                        warn!("exit node: {e}");
+                    }
+                }
             }
+        }
+        // No nftables here (Debian 11 and older): iptables, as its
+        // forward chain would otherwise drop, and its NAT.
+        Err(e) if is_not_found(&e) => {
+            info!("exit node: nft isn't installed; using iptables for NAT");
+            if let Err(e) = iptables_nat(tun, &mut iptables) {
+                remove_iptables(&iptables);
+                restore(&sysctls);
+                bail!("exit node: setting up NAT (iptables): {e:#}");
+            }
+        }
+        Err(e) => {
+            restore(&sysctls);
+            bail!("exit node: setting up NAT (nft): {e}");
         }
     }
     let dns = CancellationToken::new();
@@ -381,11 +454,7 @@ pub fn unserve(s: Serving) {
         let _ = run(&["ip", f, "route", "flush", "table", &table]);
     }
     let _ = run(&["nft", "delete", "table", "inet", NFT_TABLE]);
-    for (cmd, r) in &s.iptables {
-        let mut a = vec![*cmd, "-w", "-D", "FORWARD"];
-        a.extend(r.iter().map(String::as_str));
-        let _ = run(&a);
-    }
+    remove_iptables(&s.iptables);
     restore(&s.sysctls);
     info!("exit node: stopped forwarding");
 }
@@ -446,15 +515,17 @@ pub fn cleanup() {
         info!("exit node: removed a leftover NAT table");
     }
     for cmd in ["iptables", "ip6tables"] {
-        let Ok(rules) = run(&[cmd, "-w", "-S", "FORWARD"]) else {
-            continue;
-        };
-        for l in rules.lines().filter(|l| l.contains(TAG)) {
-            // "-A FORWARD ..." → "-D FORWARD ..."
-            let spec: Vec<String> = shell_words(l.trim_start_matches("-A FORWARD"));
-            let mut a = vec![cmd, "-w", "-D", "FORWARD"];
-            a.extend(spec.iter().map(String::as_str));
-            let _ = run(&a);
+        for (table, chain) in [("filter", "FORWARD"), ("nat", "POSTROUTING")] {
+            let Ok(rules) = run(&[cmd, "-w", "-t", table, "-S", chain]) else {
+                continue;
+            };
+            for l in rules.lines().filter(|l| l.contains(TAG)) {
+                // "-A CHAIN ..." → "-D CHAIN ..."
+                let spec: Vec<String> = shell_words(l.trim_start_matches(&format!("-A {chain}")));
+                let mut a = vec![cmd, "-w", "-t", table, "-D", chain];
+                a.extend(spec.iter().map(String::as_str));
+                let _ = run(&a);
+            }
         }
     }
 }

@@ -398,7 +398,12 @@ It downloads Wintun once from wintun.net, checks it against a pinned SHA-256, an
 ```sh
 cargo build --release                  # target/release/{tc-control,tcd,tc,tc-tray}
 cargo build --release --features gui   # also the window, tc-gui (needs libgtk-4-dev)
+
+packaging/linux/build.sh               # dist/tailconnect-ssh-VERSION-linux-{amd64,arm64}.tar.gz
+packaging/windows/build.sh             # dist/tailconnect-ssh-VERSION-windows-amd64-setup.exe and .zip
 ```
+
+`packaging/linux/build.sh` makes install packages for 64-bit Intel/AMD and ARM (Raspberry Pi, Rock 5B, ...). It needs only Rust and Python 3: on first use it sets up its cross toolchain, [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) with Zig at pinned versions, in `target/tools`, inside the project. The programs are linked for glibc 2.31, so they run on Debian 11+, Ubuntu 20.04+ and Raspberry Pi OS. The amd64 package also gets the window (`tc-gui`) when GTK 4's development files are installed; the window needs GTK 4.14+ (Ubuntu 24.04, Debian 13). To install a package on a machine, unpack it and run `sudo ./packaging/linux/install.sh client` (or `hub ARGS`).
 
 ## Quick start
 

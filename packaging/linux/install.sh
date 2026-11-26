@@ -23,14 +23,22 @@
 # tailconnect-ssh, whose members may connect, disconnect and choose the exit
 # node without sudo; the installing user ($SUDO_USER) is added to it.
 #
-# Binaries are taken from target/release, or from the directory in $BIN.
+# Binaries are taken from $BIN, a package's bin/ (packaging/linux/build.sh
+# makes packages), or target/release.
 set -eu
 
 PREFIX=/opt/tailconnect-ssh
 UNITS=/etc/systemd/system
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-BIN=${BIN:-$ROOT/target/release}
+# The programs: $BIN, else a package's bin/ (from build.sh), else target/release.
+if [ -z "${BIN:-}" ]; then
+    if [ -x "$ROOT/bin/tcd" ] || [ -x "$ROOT/bin/tc-control" ]; then
+        BIN=$ROOT/bin
+    else
+        BIN=$ROOT/target/release
+    fi
+fi
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
@@ -78,18 +86,21 @@ client)
         usermod -aG tailconnect-ssh "$SUDO_USER"
         echo "added $SUDO_USER to the tailconnect-ssh group: it may connect, disconnect and pick the exit node without sudo"
     fi
-    if [ -x "$BIN/tc-gui" ]; then
-        copy_bins tc-gui
-        ln -sf "$PREFIX/bin/tc-gui" /usr/local/bin/tcs-gui
-        install -m 0644 "$HERE/tailconnect-ssh.desktop" /usr/share/applications/tailconnect-ssh.desktop
-    else
-        echo "note: no window (tc-gui): build it with cargo build --release --features gui (needs libgtk-4-dev)"
-        rm -f /usr/share/applications/tailconnect-ssh.desktop
-    fi
-    rm -f /etc/xdg/autostart/tailconnect-ssh.desktop # (its old name)
-    install -m 0644 "$HERE/tailconnect-ssh-tray.desktop" /etc/xdg/autostart/tailconnect-ssh-tray.desktop
-    if [ -f /etc/xdg/autostart/tailconnect.desktop ]; then
-        echo "note: the WireGuard TailConnect's tray also starts at login (/etc/xdg/autostart/tailconnect.desktop)"
+    # The window and the panel icon's sign-in entry, where there's a desktop.
+    if [ -d /usr/share/xsessions ] || [ -d /usr/share/wayland-sessions ]; then
+        if [ -x "$BIN/tc-gui" ]; then
+            copy_bins tc-gui
+            ln -sf "$PREFIX/bin/tc-gui" /usr/local/bin/tcs-gui
+            install -D -m 0644 "$HERE/tailconnect-ssh.desktop" /usr/share/applications/tailconnect-ssh.desktop
+        else
+            echo "note: no window (tc-gui): build it with cargo build --release --features gui (needs libgtk-4-dev)"
+            rm -f /usr/share/applications/tailconnect-ssh.desktop
+        fi
+        rm -f /etc/xdg/autostart/tailconnect-ssh.desktop # (its old name)
+        install -D -m 0644 "$HERE/tailconnect-ssh-tray.desktop" /etc/xdg/autostart/tailconnect-ssh-tray.desktop
+        if [ -f /etc/xdg/autostart/tailconnect.desktop ]; then
+            echo "note: the WireGuard TailConnect's tray also starts at login (/etc/xdg/autostart/tailconnect.desktop)"
+        fi
     fi
     install -m 0644 "$HERE/tailconnect-ssh.service" "$UNITS/"
     if [ ! -f /etc/default/tailconnect-ssh ]; then
