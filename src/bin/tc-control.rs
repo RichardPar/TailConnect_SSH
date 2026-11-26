@@ -320,6 +320,10 @@ enum SharesCmd {
         /// `*` (default) or a port list such as `tcp:80,tcp:443`.
         #[arg(default_value = "*")]
         ports: String,
+        /// Also let the account use the machine as its exit node (it must
+        /// be one, and the share must cover every port).
+        #[arg(long)]
+        exit: bool,
     },
     /// Accept a share on the recipient account's behalf.
     Accept {
@@ -329,6 +333,12 @@ enum SharesCmd {
     Ports {
         id: i64,
         ports: String,
+    },
+    /// Let the share's account use the machine as its exit node, or not.
+    Exit {
+        id: i64,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
     /// End a share.
     Revoke {
@@ -670,24 +680,33 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Shares(c) => match c {
             SharesCmd::List => {
                 println!(
-                    "{:<4} {:<28} {:<14} {:<9} {:<20} CREATED",
-                    "ID", "MACHINE", "SHARED WITH", "STATUS", "PORTS"
+                    "{:<4} {:<28} {:<14} {:<9} {:<20} {:<5} CREATED",
+                    "ID", "MACHINE", "SHARED WITH", "STATUS", "PORTS", "EXIT"
                 );
                 for s in db.shares()? {
                     println!(
-                        "{:<4} {:<28} {:<14} {:<9} {:<20} {}",
+                        "{:<4} {:<28} {:<14} {:<9} {:<20} {:<5} {}",
                         s.id,
                         format!("{}.{}", s.node, s.owner),
                         s.account,
                         if s.accepted { "active" } else { "pending" },
                         s.ports,
+                        if s.exit { "yes" } else { "-" },
                         fmt_time(Some(s.created))
                     );
                 }
             }
-            SharesCmd::Create { node, account, ports } => {
+            SharesCmd::Create {
+                node,
+                account,
+                ports,
+                exit,
+            } => {
                 let n = db.find_node(&node)?;
                 let id = db.create_share(n.id, &account, &ports)?;
+                if exit {
+                    db.set_share_exit(id, true)?;
+                }
                 println!(
                     "shared {}.{} with {account} (share {id}, pending until accepted)",
                     n.name, n.account
@@ -701,6 +720,38 @@ fn admin(dir: &Path, cmd: Cmd) -> Result<()> {
             SharesCmd::Ports { id, ports } => {
                 let p = db.set_share_ports(id, &ports)?;
                 println!("share {id}: ports {p}");
+            }
+            SharesCmd::Exit { id, state } => {
+                let on = state == "on";
+                db.set_share_exit(id, on)?;
+                let s = db.share(id)?;
+                if !on {
+                    println!(
+                        "share {id}: {} no longer offers {}.{} as an exit node",
+                        s.account, s.node, s.owner
+                    );
+                } else {
+                    println!(
+                        "share {id}: {} may use {}.{} as its exit node",
+                        s.account, s.node, s.owner
+                    );
+                    let n = db.node(s.node_id)?;
+                    if !n.exit_node {
+                        println!(
+                            "note: {}.{} isn't an exit node: tc-control nodes exit-node {}.{} on",
+                            s.node, s.owner, s.node, s.owner
+                        );
+                    }
+                    if s.ports != "*" {
+                        println!(
+                            "note: the share covers only {}; an exit node needs every port (tc-control shares ports {id} '*')",
+                            s.ports
+                        );
+                    }
+                    if !s.accepted {
+                        println!("note: the share is still pending (tc-control shares accept {id})");
+                    }
+                }
             }
             SharesCmd::Revoke { id } => {
                 db.revoke_share(id)?;

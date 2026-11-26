@@ -378,6 +378,8 @@ async fn sharing_by_name_and_by_link() {
     let (web, nas) = t.db(|db| {
         db.create_account_with("bob", Status::Active, Role::Tenant, Some(&hash_password(PW).unwrap()))
             .unwrap();
+        db.create_account_with("op", Status::Active, Role::Operator, Some(&hash_password(PW).unwrap()))
+            .unwrap();
         let kr = db.create_authkey("richard", true, None).unwrap();
         let ka = db.create_authkey("alice", true, None).unwrap();
         (
@@ -393,6 +395,20 @@ async fn sharing_by_name_and_by_link() {
         .post("/api/shares", json!({"node_id": web, "account": "bob"}), &ca)
         .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // Nor can an operator share another account's machine onwards.
+    let cop = t.login("op").await;
+    let r = t
+        .post("/api/shares", json!({"node_id": web, "account": "bob"}), &cop)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    let r = t
+        .post(
+            "/api/share-links",
+            json!({"node_id": web, "ports": "", "days": 7}),
+            &cop,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
     // richard shares web with alice; alice accepts.
     let r = t
         .post(
@@ -422,6 +438,18 @@ async fn sharing_by_name_and_by_link() {
         .post(&format!("/api/shares/{sid}/ports"), json!({"ports": "tcp:443"}), &ca)
         .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // Sharing it as an exit node: off by default, the owner only.
+    assert_eq!(t.get("/api/shares", &ca).await.body["with_me"][0]["exit"], false);
+    let r = t
+        .post(&format!("/api/shares/{sid}/exit"), json!({"on": true}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = t
+        .post(&format!("/api/shares/{sid}/exit"), json!({"on": true}), &cr)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(t.get("/api/shares", &ca).await.body["with_me"][0]["exit"], true);
+    assert_eq!(t.get("/api/shares", &cr).await.body["by_me"][0]["exit"], true);
     // alice shares nas with bob by link.
     let r = t
         .post("/api/share-links", json!({"node_id": nas, "ports": "", "days": 7}), &ca)

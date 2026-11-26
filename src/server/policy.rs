@@ -53,6 +53,8 @@ pub struct Snapshot {
     policies: HashMap<i64, Policy>,
     /// Accepted shares between active accounts: (node, recipient account) → ports.
     shares: HashMap<(i64, i64), Access>,
+    /// Of those, the ones that also share the machine as an exit node.
+    share_exits: std::collections::HashSet<(i64, i64)>,
     /// The next moment a machine's key expires: the snapshot must be rebuilt
     /// then, although nothing in the database changes.
     pub next_expiry: Option<i64>,
@@ -65,6 +67,8 @@ pub struct Peer<'a> {
     pub inbound: Access,
     /// The peer offers to be the machine's exit node.
     pub exit_node: bool,
+    /// The machine (an exit node) may carry this peer's internet traffic.
+    pub exit_client: bool,
 }
 
 impl Snapshot {
@@ -142,6 +146,7 @@ impl Snapshot {
         }
         let active_node: HashMap<i64, bool> = nodes.iter().map(|n| (n.id, n.active)).collect();
         let mut shares = HashMap::new();
+        let mut share_exits = std::collections::HashSet::new();
         for s in db.shares()? {
             let both_active =
                 active_node.get(&s.node_id) == Some(&true) && accounts.get(&s.account_id) == Some(&Status::Active);
@@ -154,6 +159,9 @@ impl Snapshot {
                 .entry((s.node_id, s.account_id))
                 .or_insert_with(Access::none)
                 .union(&ports);
+            if s.exit {
+                share_exits.insert((s.node_id, s.account_id));
+            }
         }
         let by_ip = nodes.iter().enumerate().map(|(i, n)| (n.ip, i)).collect();
         let by_key = nodes.iter().enumerate().map(|(i, n)| (n.key.clone(), i)).collect();
@@ -163,6 +171,7 @@ impl Snapshot {
             by_key,
             policies,
             shares,
+            share_exits,
             next_expiry,
         })
     }
@@ -203,11 +212,13 @@ impl Snapshot {
         self.shares.get(&(to.id, from.account_id)).cloned().unwrap_or_default()
     }
 
-    /// May `user` send its internet traffic through `exit`? Only within one
-    /// account, and only if `user` may open everything on `exit` (access
-    /// rules that limit it rule it out).
+    /// May `user` send its internet traffic through `exit`? Within one
+    /// account, or across a share that says so; and only if `user` may open
+    /// everything on `exit` (access rules or share ports that limit it rule
+    /// it out).
     pub fn exit_for(&self, exit: &SNode, user: &SNode) -> bool {
-        exit.exit_node && exit.account_id == user.account_id && self.access(user, exit).is_all()
+        let allowed = exit.account_id == user.account_id || self.share_exits.contains(&(exit.id, user.account_id));
+        exit.exit_node && allowed && self.access(user, exit).is_all()
     }
 
     /// The network map of `me`, or `None` if its account is suspended.
@@ -228,6 +239,7 @@ impl Snapshot {
                 node: p,
                 inbound,
                 exit_node: self.exit_for(p, me),
+                exit_client: self.exit_for(me, p),
             });
         }
         Some(out)
@@ -346,10 +358,30 @@ mod tests {
             v
         };
         assert_eq!(exits(laptop), vec!["gw"]);
-        assert!(
-            exits(nas).is_empty(),
-            "a share never makes it an exit node for another account"
-        );
+        assert!(exits(nas).is_empty(), "a share alone doesn't share the exit node");
+        // …unless it says so; and the exit node is told who may use it.
+        w.db.set_share_exit(s, true).unwrap();
+        assert_eq!(exits(nas), vec!["gw"]);
+        let clients = {
+            let s = Snapshot::load(&w.db).unwrap();
+            let me = s.nodes.iter().find(|n| n.id == gw).unwrap();
+            let mut v: Vec<String> = s
+                .peers_of(me)
+                .unwrap()
+                .iter()
+                .filter(|p| p.exit_client)
+                .map(|p| p.node.name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(clients, vec!["laptop", "nas", "tablet"]);
+        // A share limited to some ports doesn't carry internet traffic.
+        w.db.set_share_ports(s, "tcp:443").unwrap();
+        assert!(exits(nas).is_empty());
+        w.db.set_share_ports(s, "*").unwrap();
+        w.db.set_share_exit(s, false).unwrap();
+        assert!(exits(nas).is_empty());
         // Rules that limit what the tablet may open on gw rule it out.
         w.db.set_tags(laptop, &["staff".into()]).unwrap();
         w.db.add_rule("richard", "tag:staff", "*", "*").unwrap();

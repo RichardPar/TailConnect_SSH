@@ -37,6 +37,11 @@ pub struct Node {
     /// exit node.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_node: bool,
+    /// In a peer's entry, in an exit node's map: the peer may send its
+    /// internet traffic through this machine (its own account's machines,
+    /// and those of accounts it's shared with as an exit node).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_client: bool,
     /// In a machine's own entry: when its key expires (Unix time; absent:
     /// never).
     #[serde(default, skip_serializing_if = "Option::is_none")]

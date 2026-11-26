@@ -758,17 +758,22 @@ impl Daemon {
     }
 
     /// May the peer at `ip` send its internet traffic through this machine?
-    /// Only while the role is on, for machines of this machine's own account
-    /// that may open everything here (as the hub decided when it offered us).
+    /// Only while the role is on, and only for machines the hub offered us
+    /// to: this account's, and those of accounts this machine is shared with
+    /// as an exit node, if they may open everything here.
     fn may_use_me_as_exit(&self, ip: Ipv4Addr) -> bool {
         if self.serving.lock().unwrap().is_none() {
             return false;
         }
         let net = self.net.read().unwrap();
         let Some(me) = &net.me else { return false };
-        net.peers
-            .get(&ip)
-            .is_some_and(|p| p.node.account == me.account && crate::acl::Access::from_wire(&p.node.inbound).is_all())
+        // The hub says who may (`exit_client`: this account's machines, and
+        // accounts it's shared with as an exit node). Older hubs don't say:
+        // then this account's machines that may open everything here.
+        net.peers.get(&ip).is_some_and(|p| {
+            p.node.exit_client
+                || (p.node.account == me.account && crate::acl::Access::from_wire(&p.node.inbound).is_all())
+        })
     }
 
     /// Use the chosen exit node if it's offered and online; otherwise go
@@ -1433,6 +1438,7 @@ impl Daemon {
                 endpoints: p.node.endpoints.clone(),
                 e2e: self.e2e.established(p.node.ip),
                 exit_node: p.node.exit_node,
+                exit_client: p.node.exit_client && serving.0,
                 rx: traffic.get(&p.node.ip).map_or(0, |t| t.0),
                 tx: traffic.get(&p.node.ip).map_or(0, |t| t.1),
             })

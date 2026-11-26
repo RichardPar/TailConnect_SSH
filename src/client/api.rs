@@ -104,6 +104,9 @@ pub struct PeerStatus {
     /// The peer offers to be this machine's exit node.
     #[serde(default)]
     pub exit_node: bool,
+    /// This machine (an exit node) may carry the peer's internet traffic.
+    #[serde(default)]
+    pub exit_client: bool,
     /// An end-to-end session for relayed traffic is established.
     #[serde(default)]
     pub e2e: bool,

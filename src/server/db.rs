@@ -13,6 +13,8 @@
 //!   `authkeys.ephemeral`, `authkeys.preapproved`). Existing machines never
 //!   expire.
 //! * 5: per-account MagicDNS domains (`accounts.dns_domain`).
+//! * 6: shared exit nodes (`shares.exit`): a share may also let the other
+//!   account use the machine as its exit node. Existing shares don't.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -216,6 +218,9 @@ pub struct ShareRow {
     pub ports: String,
     pub accepted: bool,
     pub created: i64,
+    /// The other account may also use the machine as its exit node (if it
+    /// is one, and the share covers every port).
+    pub exit: bool,
 }
 
 const SCHEMA_V1: &str = "
@@ -297,7 +302,7 @@ CREATE TABLE settings(
 );
 ";
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// How long a machine's authorisation lasts by default: 180 days.
 pub const DEFAULT_KEY_EXPIRY: i64 = 180 * 86400;
@@ -370,6 +375,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "ALTER TABLE accounts ADD COLUMN dns_domain TEXT;
              CREATE UNIQUE INDEX accounts_dns_domain ON accounts(dns_domain) WHERE dns_domain IS NOT NULL;",
         )?;
+    }
+    if version < 6 {
+        tx.execute_batch("ALTER TABLE shares ADD COLUMN exit INTEGER NOT NULL DEFAULT 0;")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -449,7 +457,8 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
     })
 }
 
-const SHARE_SELECT: &str = "SELECT s.id, s.node_id, n.name, o.id, o.name, a.id, a.name, s.ports, s.accepted, s.created
+const SHARE_SELECT: &str =
+    "SELECT s.id, s.node_id, n.name, o.id, o.name, a.id, a.name, s.ports, s.accepted, s.created, s.exit
      FROM shares s JOIN nodes n ON n.id = s.node_id JOIN accounts o ON o.id = n.account_id
      JOIN accounts a ON a.id = s.account_id";
 
@@ -465,6 +474,7 @@ fn row_to_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
         ports: r.get(7)?,
         accepted: r.get(8)?,
         created: r.get(9)?,
+        exit: r.get(10)?,
     })
 }
 
@@ -1035,6 +1045,18 @@ impl Db {
             bail!("no share with id {id}");
         }
         Ok(ports)
+    }
+
+    /// Let the share's account use the machine as its exit node, or not.
+    pub fn set_share_exit(&self, id: i64, on: bool) -> Result<()> {
+        if self
+            .conn
+            .execute("UPDATE shares SET exit = ?1 WHERE id = ?2", params![on, id])?
+            == 0
+        {
+            bail!("no share with id {id}");
+        }
+        Ok(())
     }
 
     pub fn revoke_share(&self, id: i64) -> Result<()> {

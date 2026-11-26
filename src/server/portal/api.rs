@@ -123,6 +123,7 @@ pub fn routes() -> Router<Arc<Portal>> {
         .route("/shares/{id}", delete(end_share))
         .route("/shares/{id}/accept", post(accept_share))
         .route("/shares/{id}/ports", post(share_ports))
+        .route("/shares/{id}/exit", post(share_exit))
         .route("/share-links", post(create_link))
         .route("/share-links/{id}", delete(revoke_link))
         .route("/share-links/redeem", post(redeem_link))
@@ -433,6 +434,21 @@ fn own_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, 
         return Err(ApiError::not_found());
     }
     Ok(n)
+}
+
+/// A machine `me` may share: one of its own account's. Not another
+/// account's, operators included (sharing what was shared with you, or a
+/// tenant's machine, would hand out access its owner didn't give); only the
+/// admin token, which has no account, may share any machine.
+fn shareable_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, ApiError> {
+    let n = own_node(p, me, id)?;
+    match me.account_id() {
+        Some(a) if a != n.account_id => Err(ApiError::bad(format!(
+            "{}.{} belongs to account {}: only its own account can share it",
+            n.name, n.account, n.account
+        ))),
+        _ => Ok(n),
+    }
 }
 
 /// Whom one of `me`'s machines exchanges data with. Peers are named if
@@ -763,7 +779,7 @@ async fn shares(State(p): P, me: Me) -> ApiResult {
     let row = |s: &crate::server::db::ShareRow| {
         json!({
             "id": s.id, "node_id": s.node_id, "machine": format!("{}.{}", s.node, s.owner),
-            "owner": s.owner, "account": s.account, "ports": s.ports,
+            "owner": s.owner, "account": s.account, "ports": s.ports, "exit": s.exit,
             "status": if s.accepted { "active" } else { "pending" }, "created": s.created,
         })
     };
@@ -797,6 +813,9 @@ struct NewShare {
     account: String,
     #[serde(default)]
     ports: String,
+    /// Also share it as an exit node.
+    #[serde(default)]
+    exit: bool,
 }
 
 fn ports_or_all(s: &str) -> &str {
@@ -804,11 +823,14 @@ fn ports_or_all(s: &str) -> &str {
 }
 
 async fn create_share(State(p): P, me: Me, Json(b): Json<NewShare>) -> ApiResult {
-    own_node(&p, &me, b.node_id)?;
+    shareable_node(&p, &me, b.node_id)?;
     let db = p.db.lock().unwrap();
     // Don't reveal whether an account exists beyond what the share needs:
     // sharing with a name that doesn't exist fails the same way as a typo.
     let id = db.create_share(b.node_id, b.account.trim(), ports_or_all(&b.ports))?;
+    if b.exit {
+        db.set_share_exit(id, true)?;
+    }
     ok(json!({ "id": id }))
 }
 
@@ -837,6 +859,22 @@ async fn share_ports(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Por
     ok(json!({ "ports": ports }))
 }
 
+#[derive(Deserialize)]
+struct On {
+    on: bool,
+}
+
+/// The owner lets the share's account use the machine as its exit node, or not.
+async fn share_exit(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<On>) -> ApiResult {
+    let db = p.db.lock().unwrap();
+    let s = db.share(id).map_err(|_| ApiError::not_found())?;
+    if !me.may(s.owner_id) {
+        return Err(ApiError::not_found());
+    }
+    db.set_share_exit(id, b.on)?;
+    ok(json!({ "exit": b.on }))
+}
+
 /// The owner revokes, or the recipient removes or declines.
 async fn end_share(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
     let db = p.db.lock().unwrap();
@@ -860,7 +898,7 @@ async fn create_link(State(p): P, me: Me, Json(b): Json<NewLink>) -> ApiResult {
     if !(1..=90).contains(&b.days) {
         return Err(ApiError::bad("links are valid for 1 to 90 days"));
     }
-    own_node(&p, &me, b.node_id)?;
+    shareable_node(&p, &me, b.node_id)?;
     let exp = now_unix() + b.days as i64 * 86400;
     let code =
         p.db.lock()

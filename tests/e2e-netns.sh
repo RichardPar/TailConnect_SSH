@@ -427,6 +427,25 @@ if tc_ charlie up --exit-node alpha.richard 2>"$W/err"; then fail "charlie (alic
 grep -q "doesn't offer\|isn't in the network map" "$W/err" || fail "unexpected: $(cat "$W/err")"
 pass "an exit node serves only its own account"
 
+# A share can offer it to another account: only with the option on, and
+# only if the share covers every port.
+ctl shares exit "$SID" on >/dev/null
+sleep 2
+if tc_ charlie up --exit-node alpha.richard 2>"$W/err"; then fail "charlie offered alpha through a share limited to some ports"; fi
+ctl shares ports "$SID" '*' >/dev/null
+wait_status charlie "alpha.richard.*exit node" "charlie isn't offered alpha through the share"
+tc_ charlie up --exit-node alpha.richard >/dev/null || fail "charlie up --exit-node alpha.richard"
+wait_status charlie "internet traffic and DNS go through alpha.richard" "charlie not using alpha"
+SEEN=$(web charlie 203.0.113.10)
+[[ "$SEEN" == 203.0.113.1 ]] || fail "charlie's traffic through the shared exit node: web sees '$SEEN'"
+ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 web.example A)
+[[ "$ANS" == 203.0.113.10 ]] || fail "DNS through the shared exit node: web.example -> '$ANS'"
+tc_ charlie up --exit-node "" >/dev/null
+ctl shares exit "$SID" off >/dev/null
+ctl shares ports "$SID" tcp:9001 >/dev/null
+wait_status_not charlie "alpha.richard.*exit node" "charlie still offered alpha after the share's exit option was turned off"
+pass "a share can offer an exit node to another account (all ports and the option needed)"
+
 ctl nodes exit-node alpha.richard off >/dev/null
 wait_status bravo "goes direct" "bravo didn't fall back when alpha stopped being an exit node"
 [[ -z "$(web bravo 203.0.113.10)" ]] || fail "bravo still reaches the internet after the role was turned off"

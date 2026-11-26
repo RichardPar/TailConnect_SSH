@@ -75,17 +75,18 @@ curl -b jar https://hub.example.com/api/v1/machines
 | `GET /api/v1/machines/{id}/traffic` | | `{machine, reported, age, peers: [{peer, ip, rx, tx, rx_rate, tx_rate}]}`. For tenants, peers that aren't the account's own machines or linked by a share show as `another machine`, with no `ip`. |
 | `DELETE /api/v1/machines/{id}` | | Removes the machine and its shares. It's cut off within a second. |
 | `GET /api/v1/keys` | | `[{id, account, prefix, reusable, ephemeral, preapproved, expires, used, state, created}]`; `state` is `active`, `used`, `expired` or `revoked` |
-| `POST /api/v1/keys` | `{"expires_hours": 24, "reusable"?, "ephemeral"?, "preapproved"?, "account"?}` | `{key, account}`. The key is shown only here. It expires after 1 hour to 1 year. `account` defaults to your own; operators may name any account. |
+| `POST /api/v1/keys` | `{"expires_hours": 24, "reusable"?, "ephemeral"?, "preapproved"?, "account"?}` | `{key, account, join_url, qr_svg}`. The key is shown only here. `join_url` is a `tailconnect-ssh://join?server=…&key=…[&fp=…]` link (`fp` for a self-signed hub) that the apps open with their login filled in; `qr_svg` is that link as a QR code in SVG. It expires after 1 hour to 1 year. `account` defaults to your own; operators may name any account. |
 | `POST /api/v1/keys/{id}/revoke` | | Machines that joined with the key stay |
 | `GET /api/v1/rules?account=NAME` | | `{account, rules: [{id, account, from, to, ports}]}`. `account` defaults to your own; operators may name any account. |
 | `POST /api/v1/rules` | `{"from", "to", "ports", "account"?}` | `{id}`. `from` and `to` are `*`, `tag:NAME` or a machine name; `ports` defaults to `*`. An account's first rule switches it from "everything allowed" to "only what the rules allow". |
 | `DELETE /api/v1/rules/{id}` | | Deleting an account's last rule allows everything again |
-| `GET /api/v1/shares` | | `{by_me, with_me, links}`. Shares are `{id, node_id, machine, owner, account, ports, status, created}`, with `status` `pending` or `active`. Links are `{id, prefix, machine, ports, expires, used_by, state}`. |
-| `POST /api/v1/shares` | `{"node_id", "account", "ports"?}` | `{id}`. Offers your machine to `account` (pending until accepted); `ports` defaults to `*`. |
+| `GET /api/v1/shares` | | `{by_me, with_me, links}`. Shares are `{id, node_id, machine, owner, account, ports, exit, status, created}`, with `status` `pending` or `active`; `exit` says whether the share also offers the machine as an exit node. Links are `{id, prefix, machine, ports, expires, used_by, state}`. |
+| `POST /api/v1/shares` | `{"node_id", "account", "ports"?, "exit"?}` | `{id}`. Offers your machine to `account` (pending until accepted); `ports` defaults to `*`. Only a machine's own account can share it, operators included (400 otherwise); the admin token can share any machine. `exit: true` also lets `account` use it as its exit node. |
 | `POST /api/v1/shares/{id}/accept` | | The recipient accepts |
 | `POST /api/v1/shares/{id}/ports` | `{"ports"}` | `{ports}`. The owner changes what the recipient may open. |
+| `POST /api/v1/shares/{id}/exit` | `{"on": true}` | `{exit}`. The owner lets the recipient use the machine as its exit node, or stops. It takes effect only if the machine is an exit node and the share is accepted and covers every port. |
 | `DELETE /api/v1/shares/{id}` | | The owner revokes, or the recipient declines or removes |
-| `POST /api/v1/share-links` | `{"node_id", "days", "ports"?}` | `{code}`: a single-use `tc-share-…` link, valid for 1 to 90 days, shown only here |
+| `POST /api/v1/share-links` | `{"node_id", "days", "ports"?}` | Like shares, only for your own account's machines. `{code}`: a single-use `tc-share-…` link, valid for 1 to 90 days, shown only here |
 | `DELETE /api/v1/share-links/{id}` | | Revokes an unused link |
 | `POST /api/v1/share-links/redeem` | `{"code"}` | `{id}`: an active share for your account (not for the admin token) |
 

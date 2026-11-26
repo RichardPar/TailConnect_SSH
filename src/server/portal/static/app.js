@@ -536,7 +536,9 @@ async function rulesTab() {
 async function sharingTab() {
   const [sh, ms] = await Promise.all([api("GET", "/shares"), api("GET", "/machines")]);
   const me = state.me;
-  const mine = me.operator ? ms : ms.filter((m) => m.account === me.name);
+  // Only your own account's machines can be shared (not ones shared with
+  // you, nor other accounts'); the admin token, with no account, may share any.
+  const mine = me.admin_token ? ms : ms.filter((m) => m.account === me.name);
   const machineSelect = () => el("select", { name: "node_id", required: true },
     mine.map((m) => el("option", { value: m.id }, m.name + "." + m.account)));
   const shareForm = el("form", {
@@ -544,13 +546,15 @@ async function sharingTab() {
     onsubmit: (e) => {
       e.preventDefault();
       const f = fields(e.target);
-      act(() => api("POST", "/shares", { node_id: Number(f.node_id), account: f.account, ports: f.ports }), "Shared: it takes effect once they accept");
+      act(() => api("POST", "/shares", { node_id: Number(f.node_id), account: f.account, ports: f.ports, exit: f.exit }), "Shared: it takes effect once they accept");
     },
   },
   el("div", { class: "lead" }, "Share with an account"),
   el("label", {}, "Machine", machineSelect()),
   el("label", {}, "With account", el("input", { name: "account", required: true, placeholder: "account name" })),
   el("label", {}, "Ports", el("input", { name: "ports", placeholder: "* or tcp:80,tcp:443" })),
+  el("label", { class: "check", title: "If the machine is an exit node, they may send their internet traffic through it (the share must cover every port)" },
+    el("input", { type: "checkbox", name: "exit" }), "Also as exit node"),
   el("button", { class: "primary", type: "submit" }, "Share"));
   const linkForm = el("form", {
     class: "inline",
@@ -569,10 +573,19 @@ async function sharingTab() {
   el("label", {}, "Valid for", el("select", { name: "days" }, [[1, "1 day"], [7, "7 days"], [30, "30 days"]].map(([v, t]) => el("option", { value: v, selected: v === 7 }, t)))),
   el("button", { type: "submit" }, "Create link"));
 
+  const exitMachines = new Set(ms.filter((m) => m.exit_node).map((m) => m.id));
+  const exitCell = (s) => !s.exit ? "—"
+    : s.ports !== "*" ? badge("exit node: needs all ports", "warn")
+    : exitMachines.has(s.node_id) ? badge("exit node", "ok")
+    : badge("exit node (role off)", "warn");
   const byMe = sh.by_me.map((s) => el("tr", {},
     el("td", {}, s.machine), el("td", {}, s.account), el("td", { class: "mono" }, s.ports),
+    el("td", {}, exitCell(s)),
     el("td", {}, badge(s.status, s.status === "active" ? "ok" : "warn")),
     el("td", { class: "actions" },
+      el("button", { title: "Let them send their internet traffic through this machine, if it's an exit node",
+        onclick: () => act(() => api("POST", "/shares/" + s.id + "/exit", { on: !s.exit }), s.exit ? "No longer shared as an exit node" : "Shared as an exit node") },
+        s.exit ? "Stop exit" : "Share exit"),
       el("button", { onclick: async () => {
         const r = await ask("Ports for " + s.machine + " shared with " + s.account, [{ name: "ports", label: "* or a list such as tcp:80,tcp:443", value: s.ports }]);
         if (r) act(() => api("POST", "/shares/" + s.id + "/ports", { ports: r.ports }), "Ports saved");
@@ -586,6 +599,7 @@ async function sharingTab() {
       ? el("button", { class: "danger", onclick: () => act(() => api("DELETE", "/share-links/" + l.id), "Link revoked") }, "Revoke") : null)));
   const withMe = sh.with_me.map((s) => el("tr", {},
     el("td", {}, s.machine), el("td", {}, s.owner), el("td", { class: "mono" }, s.ports),
+    el("td", {}, s.exit ? badge("exit node", "ok") : "—"),
     el("td", {}, badge(s.status, s.status === "active" ? "ok" : "warn")),
     el("td", { class: "actions" },
       s.status === "pending" ? el("button", { class: "primary", onclick: () => act(() => api("POST", "/shares/" + s.id + "/accept"), "Accepted") }, "Accept") : null,
@@ -604,12 +618,12 @@ async function sharingTab() {
     el("h2", {}, "Shared by me"),
     el("p", { class: "hint" }, "Sharing lets another account's machines connect to one of yours. It's one-way: your machine can only reply."),
     el("div", { class: "panel" }, shareForm, linkForm, secretBox()),
-    table(["Machine", "Shared with", "Ports", "Status", ""], byMe, "Nothing shared."),
+    table(["Machine", "Shared with", "Ports", "Exit node", "Status", ""], byMe, "Nothing shared."),
     el("h2", {}, "Share links"),
     table(["Link", "Machine", "Ports", "Status", "Expires", ""], links, "No links."),
     me.admin_token ? null : el("h2", {}, "Shared with me"),
     me.admin_token ? null : el("div", { class: "panel" }, redeem),
-    me.admin_token ? null : table(["Machine", "Owner", "Ports", "Status", ""], withMe, "Nothing shared with you."),
+    me.admin_token ? null : table(["Machine", "Owner", "Ports", "Exit node", "Status", ""], withMe, "Nothing shared with you."),
   ];
 }
 

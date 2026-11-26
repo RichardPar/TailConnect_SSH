@@ -201,6 +201,7 @@ impl Hub {
                 endpoints: s.map(|s| s.endpoints.clone()).unwrap_or_default(),
                 inbound,
                 exit_node,
+                exit_client: false,
                 expires: None,
                 zone: n.zone.clone(),
             }
@@ -208,7 +209,11 @@ impl Hub {
         let (peers, notice) = match snap.peers_of(me) {
             Some(ps) => (
                 ps.iter()
-                    .map(|p| node(p.node, p.inbound.to_wire(), p.exit_node))
+                    .map(|p| {
+                        let mut n = node(p.node, p.inbound.to_wire(), p.exit_node);
+                        n.exit_client = p.exit_client;
+                        n
+                    })
                     .collect(),
                 None,
             ),

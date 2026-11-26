@@ -113,6 +113,12 @@ fn print_status(s: &Status) {
     for p in &s.peers {
         let path = path(s, p);
         let name = format!("{}.{}", p.name, p.account);
+        // On an exit node: which peers may send their internet traffic here.
+        let path = if p.exit_client && s.exit_serving {
+            format!("{path}; may use this exit node")
+        } else {
+            path
+        };
         let counts = if p.rx > 0 || p.tx > 0 {
             format!("; rx {} tx {}", bytes(p.rx), bytes(p.tx))
         } else {

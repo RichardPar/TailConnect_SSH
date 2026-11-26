@@ -154,7 +154,7 @@ stateDiagram-v2
 - **What works over it.** Ping, TCP and UDP work to that address too, and MagicDNS answers AAAA queries with it. Access rules, shares and the packet filter apply to IPv6 exactly as to IPv4.
 - **Side by side.** The range differs from the WireGuard TailConnect's, so both can run on one machine.
 
-**Exit nodes** (Linux). An exit node is a machine that other machines of its account can send all their internet traffic through, for example to browse from a café as if from home.
+**Exit nodes** (Linux). An exit node is a machine that other machines of its account, or of accounts it's shared with as an exit node, can send all their internet traffic through, for example to browse from a café as if from home.
 
 1. **Turn it on:** `sudo tcs-control nodes exit-node gw.richard on`, or **Exit node: off** on the portal's Machines tab. Every machine's role is off until then. Within a second, the machine turns on IP forwarding and NAT for traffic from the tunnel, and its `tcs status` says `exit node: this machine forwards internet traffic for its account`.
 2. **Use it:** `sudo tcs up --exit-node gw` (a short name, `name.account`, full name or address). `tcs status` then says `exit node: internet traffic and DNS go through gw.richard`. The choice is kept across restarts.
@@ -176,7 +176,7 @@ flowchart TD
     S -- "yes (LAN, tunnel peers)" --> MAIN2["main table, as before"]
     S -- no --> T7443["table 7443: default via tcs0"]
     T7443 --> EX["exit node"]
-    EX --> F{"sender allowed?<br/>(own account, unrestricted)"}
+    EX --> F{"sender allowed?<br/>(own account or exit share,<br/>may open every port)"}
     F -- no --> DROP["dropped"]
     F -- yes --> X{"--exit-interface set?"}
     X -- no --> NAT["nftables masquerade<br/>→ exit node's uplink"]
@@ -197,7 +197,9 @@ How it works and what to know:
   - where a firewall's forward policy is DROP (ufw), adds iptables rules tagged `tailconnect-ssh-exit`.
   - Its DNS forwarder uses the host's resolvers, or the ones given with `tcd --exit-dns 1.1.1.1,9.9.9.9`.
 - **Cleanup.** Everything is undone when the role is turned off or `tcd` stops, and leftovers of a crash are removed when `tcd` starts.
-- **Who may use an exit node.** Only machines of its own account, and only those that may open everything on it: access rules that limit a machine rule it out, and a share never makes a machine an exit node for another account. The exit node enforces this itself: it forwards only for machines allowed to use it, and only to addresses outside the tunnel.
+- **Who may use an exit node.** Machines of its own account, and machines of another account it's shared with **as an exit node**. Either way, only those that may open everything on it: access rules that limit a machine rule it out, and so does a share limited to some ports.
+  - **Sharing one with another account:** `sudo tcs-control shares create gw.richard alice --exit` (or `shares exit ID on` for an existing share), or **Also as exit node** / **Share exit** on the portal's Sharing tab. It's off by default, and needs the share to be accepted and to cover every port. The Sharing tab warns when the option is on but the role is off or the ports are limited.
+  - **Enforcement.** The hub marks, in the exit node's map, which peers may use it. The exit node forwards only for those, and only to addresses outside the tunnel. On the exit node, `tcs status` shows `may use this exit node` beside each of them.
 - **Falling back.** If the exit node goes away (turned off, removed or offline), the machine falls back to its own internet connection and `tcs status` says why. It returns to the exit node by itself when it's back.
 - **IPv6 to the internet** works if the exit node has a global IPv6 address. Otherwise programs fall back to IPv4.
 
@@ -216,7 +218,7 @@ How it works and what to know:
 | | |
 |---|---|
 | **Account** | A separate network on the hub. Its machines see and reach each other and nothing of other accounts, unless a machine is shared. Machine names are unique per account; addresses are unique across the hub. An account can be **suspended**: its machines stay connected but get an empty map with a notice, and its shares stop working, until it's activated again. |
-| **Share** | Lets every machine of another account connect to *one* machine, optionally only on some ports. It's **one-way**: the shared machine can only reply, never open connections back, and the account's other machines stay invisible. A share is **pending** until it's accepted. If two accounts share a machine with each other, the two machines can both open connections. |
+| **Share** | Lets every machine of another account connect to *one* machine, optionally only on some ports. It's **one-way**: the shared machine can only reply, never open connections back, and the account's other machines stay invisible. A share is **pending** until it's accepted. If two accounts share a machine with each other, the two machines can both open connections. A share can also offer the machine as an **exit node** to the other account. That's off by default; it needs the machine to be an exit node and the share to cover every port. Only a machine's own account can share it: you can't share onwards what's shared with you, or, as an operator, another account's machine (the admin token and `tc-control` can). |
 | **Tag** | A label on a machine (`server`, `staff`) that rules can select. |
 | **Access rule** | *from → to on ports* within one account. From and to are `*`, `tag:NAME` or a machine name. Ports are `*`, or a list like `tcp:22,tcp:443,udp:53,8000-8100,icmp`. An account with no rules lets every machine reach every other. Once it has rules, only what they allow can be opened. Rules are one-way, and replies always get back. Machines that no rule connects in either direction don't see each other at all. |
 
@@ -259,7 +261,7 @@ flowchart LR
 | Machines | everyone | Machines with online status, address, MagicDNS name, tags and **traffic** (current speeds and totals; click for the breakdown per peer); set tags, rename, remove. Operators see every account's. |
 | Auth keys | everyone | Create keys (1 hour to 90 days, single-use or reusable). A new key is shown once, with the full `tcs up` command (including `--tls-fingerprint` for a self-signed certificate) and a **QR code** of a `tailconnect-ssh://join?server=…&key=…&fp=…` link, for joining from a phone or another device. Revoke keys. |
 | Access rules | everyone | Add and delete rules (operators pick the account) |
-| Sharing | everyone | Share a machine with an account, or create a single-use **share link**; change ports; revoke. Accept, decline or remove shares offered to you, and redeem links. |
+| Sharing | everyone | Share one of your own account's machines with an account, optionally **also as exit node**, or create a single-use **share link**; change ports; turn the exit-node option on or off; revoke. Accept, decline or remove shares offered to you, and redeem links. |
 | Accounts | operators | Add accounts (with or without a portal password, tenant or operator); approve sign-ups; suspend and reactivate; change role; reset passwords; delete. Create and revoke **invites**. |
 | My account | everyone | Change your password (this signs you out everywhere else) |
 
@@ -498,7 +500,7 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control authkey create [--account NAME] [--reusable] [--expires-hours N] [--ephemeral] [--preapproved]` / `list` / `revoke ID` | Pre-auth keys; machines join the key's account |
 | `tc-control nodes list [--account NAME]` / `remove NODE` / `rename NODE NEW` / `tag NODE TAG,…` / `exit-node NODE on\|off` / `approve NODE` / `expiry NODE never\|default\|90d` | Machines; `NODE` is an ID or `name.account` |
 | `tc-control rules list [--account NAME]` / `add --account NAME FROM TO [PORTS]` / `delete ID` | Access rules |
-| `tc-control shares list` / `create NODE ACCOUNT [PORTS]` / `accept ID` / `ports ID PORTS` / `revoke ID` | Shares |
+| `tc-control shares list` / `create NODE ACCOUNT [PORTS] [--exit]` / `accept ID` / `ports ID PORTS` / `exit ID on\|off` / `revoke ID` | Shares; `exit` lets the account use the machine as its exit node |
 | `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…] [--exit-interface IFACE]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
 | `tc up [--server HOST[:PORT]] [--authkey KEY] [--tls-fingerprint FP] [--exit-node NAME]` | Join or reconnect; `--exit-node` alone switches the exit node without reconnecting (`""` for none) |
 | `tc-tray`, `tc-gui` | Panel icon and menu; the window (see "Desktop app") |
@@ -555,7 +557,10 @@ flowchart TB
 cargo test                    # unit tests: framing, DNS, packets, database, keys, e2e crypto, ACLs, filter, policy, portal API
 cargo build && tests/e2e-netns.sh   # end to end, no root needed
 PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebble, no root needed
+cargo build && tests/android-bridge.sh   # tcd's Android mode, with a fake app, no root needed
 ```
+
+`tests/android-bridge.sh` runs `tcd --bridge` in an unprivileged namespace with [tests/fake_android_app.py](tests/fake_android_app.py) in place of the app: the VPN interface handed over the bridge, DNS forwarded to the "phone's" network, using an exit node, refusing to be one, and reconnecting when the network changes.
 
 `tests/acme-pebble.sh` tests built-in Let's Encrypt against [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test ACME server. Get `pebble` and `pebble-challtestsrv` from Pebble's releases and check their SHA-256 digests. The script checks:
 - all three ways of proving the name;
@@ -575,7 +580,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 - a key that expires, cutting the machine off at once, and renewal with `tcs up --authkey`;
 - exit nodes, using an extra namespace as "the internet":
   - IPv4 and IPv6 leaving through the exit node with NAT, and DNS resolved there;
-  - an exit node serving only its own account;
+  - an exit node serving only its own account, unless a share offers it as an exit node and covers every port;
   - falling back when the role is turned off, and returning when it's back;
   - the choice kept across restarts, and working over a direct path;
   - an exit interface: forwarded traffic leaving through a "VPN" interface while the exit node's own traffic doesn't, and the kill switch blocking it while that interface is down;
@@ -595,7 +600,7 @@ Done:
 - the hub on 443 with SSH inside TLS, registration with auth keys, address allocation, a pushed network map, and relaying with source checks;
 - `tcd` with a TUN device, direct SSH paths with fallback to the hub, MagicDNS (A and PTR records), the local API and the `tc` CLI;
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
-- accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
+- accounts, one-way sharing with port limits (and shared exit nodes), tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
 - a desktop app for Linux: a window (`tcs-gui`, GTK 4) and a panel icon with a menu (`tcs-tray`);
 - an Android app (VpnService and the same `tcd`, MagicDNS, exit nodes, QR join codes);
@@ -610,5 +615,4 @@ Done:
 
 Roadmap toward parity with the Go TailConnect:
 
-1. An Android client (VpnService), joining from the portal's QR code
-2. Exit nodes on Windows
+1. Exit nodes on Windows and Android

@@ -223,6 +223,7 @@ mod tests {
             path: "direct".into(),
             endpoints: vec![],
             exit_node: exit,
+            exit_client: false,
             e2e: false,
             rx: 0,
             tx: 0,
