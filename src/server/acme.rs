@@ -656,6 +656,11 @@ async fn http_get(url: &str) -> Result<(u16, String)> {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse()?),
         _ => (hostport, if tls { 443 } else { 80 }),
     };
+    // The DuckDNS token is in the URL: plain HTTP only to this machine
+    // (the tests' fake DuckDNS), never across a network.
+    if !tls && !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+        bail!("refusing to send the request unencrypted to {host}: use https://");
+    }
     let req =
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: tailconnect-ssh\r\nConnection: close\r\n\r\n");
     let tcp = tokio::time::timeout(Duration::from_secs(15), tokio::net::TcpStream::connect((host, port))).await??;

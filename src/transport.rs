@@ -61,8 +61,25 @@ pub struct ClientConn {
     pub host_key: String,
 }
 
+/// The SSH algorithms both ends offer: only what TailConnect needs, all
+/// strong. AEAD ciphers only (no CBC/CTR with a separate MAC), no
+/// compression (compressing before encrypting can leak hints about the
+/// content), Ed25519 keys only (every machine and hub key is Ed25519). Key
+/// exchange stays russh's default: ML-KEM-768 + X25519 (post-quantum
+/// hybrid) first, then X25519, never SHA-1.
+fn preferred() -> russh::Preferred {
+    use std::borrow::Cow;
+    russh::Preferred {
+        key: Cow::Owned(vec![russh::keys::Algorithm::Ed25519]),
+        cipher: Cow::Borrowed(&[russh::cipher::CHACHA20_POLY1305, russh::cipher::AES_256_GCM]),
+        compression: Cow::Borrowed(&[russh::compression::NONE]),
+        ..russh::Preferred::DEFAULT
+    }
+}
+
 fn client_ssh_config() -> Arc<client::Config> {
     Arc::new(client::Config {
+        preferred: preferred(),
         inactivity_timeout: Some(KEEPALIVE * 4),
         keepalive_interval: Some(KEEPALIVE),
         keepalive_max: 3,
@@ -74,6 +91,7 @@ fn client_ssh_config() -> Arc<client::Config> {
 
 pub fn server_ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
     Arc::new(server::Config {
+        preferred: preferred(),
         inactivity_timeout: Some(KEEPALIVE * 4),
         keepalive_interval: Some(KEEPALIVE),
         keepalive_max: 3,
