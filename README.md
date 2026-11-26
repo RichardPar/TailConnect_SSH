@@ -381,6 +381,33 @@ packaging/windows/build.sh     # dist/tailconnect-ssh-VERSION-windows-amd64-setu
 
 It downloads Wintun once from wintun.net, checks it against a pinned SHA-256, and embeds the app icon in the programs. The programs aren't code-signed, so SmartScreen may warn the first time: choose **More info → Run anyway**.
 
+### Android
+
+The Android app (Android 10 or later, 64-bit ARM) puts a phone or tablet on the network like any other machine. It gets an address and a name, reaches peers directly or through the hub, resolves MagicDNS names in every app, and can use an exit node.
+
+- **Install**: build `dist/tailconnect-ssh-VERSION-android-arm64.apk` with `android/build.sh`, then either:
+  - run `android/build.sh install` for a phone on USB with USB debugging on;
+  - or copy the APK to the phone and open it.
+
+  It isn't from an app store, so Android may ask you to confirm installing it.
+- **Join**: in the portal, create an auth key and scan its QR code with the app's **Scan QR code**. Or tap **Log in…** and type the hub's address and the key. The app fills in this device's name from the phone's own ("Richard's S21 FE" becomes `richards-s21-fe`). The first time, Android asks to allow the VPN connection.
+- **The app**: the same design as the Windows and Linux apps:
+  - a header card in the state's colour, with this device's name, its address (tap to copy) and a Connect switch;
+  - the exit node;
+  - the machines, with their paths (`direct`, `relay · e2e`, `offline`);
+  - a footer with the portal, Hub & key, the daemon's log, and Log out.
+
+  It follows the phone's light or dark theme.
+- **How**:
+  - The app runs the same `tcd` as Linux, built as a static arm64 program and shipped as `lib/arm64-v8a/libtcs.so`, as a child process.
+  - Its VpnService provides what an app's child process can't get itself, over a socket (`tcd --bridge`, see `src/client/android.rs`): the VPN interface, and the phone's network (its DNS servers and addresses).
+  - The VPN leaves the app itself out, so `tcd`'s own connections use the real network.
+  - All DNS goes to MagicDNS, which answers tailnet names and forwards the rest to the phone's network (or the exit node).
+  - Using an exit node means a new VPN interface with default routes.
+- **Not on Android**: being an exit node.
+
+Build it on Linux. It needs Rust, Python 3, a JDK 17+ and the Android SDK (build-tools and a platform), found via `$JAVA_HOME` and `$ANDROID_HOME` (default `~/Android/jdk` and `~/Android/Sdk`). No Gradle or NDK is needed: `tcd` is cross-built with the project's own toolchain in `target/tools`. The first build creates a signing key, `~/.android/tailconnect-ssh.keystore`. **Keep it**: Android only installs updates signed with the same key. `tests/android-bridge.sh` tests `tcd`'s Android mode on Linux, without a phone, with `tests/fake_android_app.py` standing in for the app.
+
 ### Security notes
 
 - **All traffic between machines is end-to-end encrypted.** Direct paths are SSH sessions between the two machines. Relayed traffic is sealed with per-pair Noise sessions that the hub can't read or forge. The hub still sees metadata: which machines talk to each other, when, and how much.
@@ -401,6 +428,7 @@ cargo build --release --features gui   # also the window, tc-gui (needs libgtk-4
 
 packaging/linux/build.sh               # dist/tailconnect-ssh-VERSION-linux-{amd64,arm64}.tar.gz
 packaging/windows/build.sh             # dist/tailconnect-ssh-VERSION-windows-amd64-setup.exe and .zip
+android/build.sh [install]             # dist/tailconnect-ssh-VERSION-android-arm64.apk
 ```
 
 `packaging/linux/build.sh` makes install packages for 64-bit Intel/AMD and ARM (Raspberry Pi, Rock 5B, ...). It needs only Rust and Python 3: on first use it sets up its cross toolchain, [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) with Zig at pinned versions, in `target/tools`, inside the project. The programs are linked for glibc 2.31, so they run on Debian 11+, Ubuntu 20.04+ and Raspberry Pi OS. The amd64 package also gets the window (`tc-gui`) when GTK 4's development files are installed; the window needs GTK 4.14+ (Ubuntu 24.04, Debian 13). To install a package on a machine, unpack it and run `sudo ./packaging/linux/install.sh client` (or `hub ARGS`).
@@ -570,6 +598,7 @@ Done:
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
 - a desktop app for Linux: a window (`tcs-gui`, GTK 4) and a panel icon with a menu (`tcs-tray`);
+- an Android app (VpnService and the same `tcd`, MagicDNS, exit nodes, QR join codes);
 - a Windows client: a service with a Wintun adapter, MagicDNS through NRPT, using exit nodes, `tcs`, an installer, and an app (tray icon, menu and window);
 - IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node, optionally out through another VPN with a kill switch;
 - key expiry with renewal, machine approval, ephemeral machines;

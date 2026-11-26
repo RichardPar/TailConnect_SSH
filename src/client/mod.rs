@@ -8,6 +8,8 @@
 //! A machine can be an exit node for its account, or send its internet
 //! traffic through one (see [`exit`]).
 
+#[cfg(unix)]
+pub mod android;
 pub mod api;
 mod direct;
 #[cfg_attr(windows, path = "exit_windows.rs")]
@@ -54,6 +56,9 @@ pub struct Options {
     /// As an exit node: send the forwarded traffic out through this
     /// interface (a VPN's tun0, say), blocking it while it's down.
     pub exit_interface: Option<String>,
+    /// Inside the Android app: the bridge to its VpnService (see android.rs).
+    #[cfg(unix)]
+    pub android: Option<android::AndroidOpts>,
 }
 
 /// What survives a restart.
@@ -171,6 +176,12 @@ pub struct Daemon {
     /// The hub's addresses from the last successful lookup.
     hub_addrs: Mutex<Vec<SocketAddr>>,
     next_link: AtomicU64,
+    /// Inside the Android app: the bridge to its VpnService.
+    #[cfg(unix)]
+    bridge: Option<Arc<android::Bridge>>,
+    /// Android: the VPN interface needs new routes (an exit node in use, or
+    /// not); a task asks the app for a new one.
+    retun: Notify,
 }
 
 impl Daemon {
@@ -185,6 +196,11 @@ impl Daemon {
         let state: State = match std::fs::read(&state_path) {
             Ok(b) => serde_json::from_slice(&b).context("parsing state.json")?,
             Err(_) => State::default(),
+        };
+        #[cfg(unix)]
+        let bridge = match &opts.android {
+            Some(a) => Some(android::Bridge::listen(a)?),
+            None => None,
         };
         Ok(Arc::new(Daemon {
             opts,
@@ -210,16 +226,38 @@ impl Daemon {
             dns_pending: Mutex::new(Default::default()),
             dns_applied: Mutex::new(None),
             hub_addrs: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            bridge,
+            retun: Notify::new(),
         }))
+    }
+
+    /// Running inside the Android app?
+    fn is_android(&self) -> bool {
+        #[cfg(unix)]
+        return self.bridge.is_some();
+        #[cfg(not(unix))]
+        false
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("machine key: {}", self.my_key);
-        // Leftovers of a previous run (after a crash): routes, NAT.
-        exit::cleanup();
-        // tcd's own connections keep using the real network when an exit
-        // node is in use.
-        transport::SOCKET_MARK.store(exit::MARK, std::sync::atomic::Ordering::Relaxed);
+        if self.is_android() {
+            // New routes mean a new VPN interface from the app.
+            let d = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    d.retun.notified().await;
+                    d.android_retun();
+                }
+            });
+        } else {
+            // Leftovers of a previous run (after a crash): routes, NAT.
+            exit::cleanup();
+            // tcd's own connections keep using the real network when an exit
+            // node is in use.
+            transport::SOCKET_MARK.store(exit::MARK, std::sync::atomic::Ordering::Relaxed);
+        }
         let api = tokio::spawn(localapi::serve(self.clone()));
         if self.opts.direct_port != 0 {
             let d = self.clone();
@@ -278,6 +316,10 @@ impl Daemon {
         }
         if let Some(t) = self.tun.lock().unwrap().take() {
             t.cancel.cancel();
+            #[cfg(unix)]
+            if let Some(b) = &self.bridge {
+                b.close_tun();
+            }
             // (On Linux the DNS settings go with the interface.)
             #[cfg(windows)]
             {
@@ -368,9 +410,15 @@ impl Daemon {
         };
         // Remember the hub's addresses: with an exit node in use, DNS goes
         // through the tunnel, which is down while reconnecting.
-        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        let found: std::io::Result<Vec<SocketAddr>> = match self.resolver() {
+            // Android: no /etc/resolv.conf; ask the underlying network's DNS.
+            Some(servers) => crate::client::resolve_via(&host, port, &servers).await,
+            None => tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(|a| a.collect()),
+        };
+        let addrs: Vec<SocketAddr> = match found {
             Ok(a) => {
-                let a: Vec<SocketAddr> = a.collect();
                 *self.hub_addrs.lock().unwrap() = a.clone();
                 a
             }
@@ -424,7 +472,7 @@ impl Daemon {
         let _guard = scopeguard(move || writer.abort());
 
         let port = self.opts.direct_port;
-        let mut endpoints = local_endpoints(port);
+        let mut endpoints = self.endpoints(port);
         let hello = ClientMsg::Hello {
             version: crate::PROTOCOL_VERSION,
             hostname: self.opts.hostname.clone(),
@@ -438,10 +486,11 @@ impl Daemon {
 
         // Re-report endpoints when local addresses change.
         let tx_ep = tx.clone();
+        let d_ep = self.clone();
         let ep_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let now = local_endpoints(port);
+                let now = d_ep.endpoints(port);
                 if now != endpoints {
                     endpoints = now.clone();
                     let m = ClientMsg::Endpoints {
@@ -629,6 +678,10 @@ impl Daemon {
 
     /// Turn this machine's exit node role on or off, as its map entry says.
     fn set_role(self: &Arc<Self>, on: bool) {
+        if on && self.is_android() {
+            warn!("exit node: this device can't be an exit node (not supported on Android)");
+            return;
+        }
         let mut serving = self.serving.lock().unwrap();
         match (on, serving.is_some()) {
             (true, false) => match exit::serve(&self.opts.tun_name, self.opts.exit_interface.as_deref()) {
@@ -697,9 +750,18 @@ impl Daemon {
                 }
                 let v6 = self.tun.lock().unwrap().as_ref().is_some_and(|t| t.v6);
                 let keep: Vec<IpAddr> = self.hub_addrs.lock().unwrap().iter().map(|a| a.ip()).collect();
-                match exit::route_via(&self.opts.tun_name, v6, &keep) {
+                // Android: the default routes come with a new VPN interface.
+                let routed = if self.is_android() {
+                    Ok(())
+                } else {
+                    exit::route_via(&self.opts.tun_name, v6, &keep)
+                };
+                match routed {
                     Ok(()) => {
                         *self.exit_in_use.write().unwrap() = Some(ip);
+                        if self.is_android() {
+                            self.retun.notify_one();
+                        }
                         *self.exit_problem.write().unwrap() = None;
                         self.e2e.set_exit(Some(ip));
                         info!("exit node: internet traffic goes through {n}");
@@ -718,7 +780,8 @@ impl Daemon {
     /// routed here, and everything while an exit node is in use. Applied
     /// only when that changes.
     fn update_dns(&self) {
-        if !self.opts.dns || self.tun.lock().unwrap().is_none() {
+        // (Android: DNS comes with the VPN interface.)
+        if !self.opts.dns || self.is_android() || self.tun.lock().unwrap().is_none() {
             return;
         }
         let want = {
@@ -755,7 +818,11 @@ impl Daemon {
         }
         *self.exit_problem.write().unwrap() = problem;
         if self.exit_in_use.write().unwrap().take().is_some() {
-            exit::unroute();
+            if self.is_android() {
+                self.retun.notify_one();
+            } else {
+                exit::unroute();
+            }
             self.e2e.set_exit(None);
             self.update_dns();
             info!("exit node: no longer in use");
@@ -764,6 +831,8 @@ impl Daemon {
 
     /// Create the TUN device, or recreate it if our address changed.
     fn ensure_tun(self: &Arc<Self>, ip: Ipv4Addr, prefix_len: u8) -> Result<()> {
+        #[cfg(unix)]
+        let spec = self.bridge.as_ref().map(|_| self.tun_spec(ip));
         let mut tun = self.tun.lock().unwrap();
         if tun.as_ref().is_some_and(|t| t.ip == ip) {
             return Ok(());
@@ -773,6 +842,41 @@ impl Daemon {
         }
         // Totals count from when the tunnel started.
         self.traffic.lock().unwrap().clear();
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+
+        // Android: the app makes the interface, with its addresses, routes
+        // and DNS (see android.rs).
+        #[cfg(unix)]
+        if let (Some(b), Some(spec)) = (self.bridge.clone(), spec) {
+            *self.tun_tx.write().unwrap() = Some(tx);
+            *tun = Some(Tun {
+                ip,
+                v6: true,
+                cancel: cancel.clone(),
+            });
+            drop(tun);
+            let d = self.clone();
+            tokio::spawn(async move {
+                let dev = match b.request_tun(&spec).await {
+                    Ok(fd) => android::FdTun::new(fd).map_err(anyhow::Error::from),
+                    Err(e) => Err(e),
+                };
+                match dev {
+                    Ok(dev) if !cancel.is_cancelled() => {
+                        info!("VPN interface up: {:?}, routes {:?}", spec.addresses, spec.routes);
+                        d.spawn_tun_io(dev, rx, cancel);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("android: {e:#}");
+                        *d.last_error.write().unwrap() = Some(format!("{e:#}"));
+                    }
+                }
+            });
+            return Ok(());
+        }
+
         let mask = if prefix_len == 0 {
             0
         } else {
@@ -795,39 +899,8 @@ impl Daemon {
         let what =
             "creating the Wintun adapter (tcd needs to run as SYSTEM or an administrator, with wintun.dll beside it)";
         let dev = tun::create_as_async(&cfg).context(what)?;
-        let (mut rd, mut wr) = tokio::io::split(dev);
-        let cancel = CancellationToken::new();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         *self.tun_tx.write().unwrap() = Some(tx);
-
-        let c = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = c.cancelled() => break,
-                    p = rx.recv() => match p {
-                        Some(p) => if let Err(e) = wr.write_all(&p).await { debug!("tun write: {e}"); },
-                        None => break,
-                    },
-                }
-            }
-        });
-        let c = cancel.clone();
-        let d = self.clone();
-        let mtu = self.opts.mtu as usize;
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; mtu + 64];
-            loop {
-                tokio::select! {
-                    _ = c.cancelled() => break,
-                    n = rd.read(&mut buf) => match n {
-                        Ok(0) => break,
-                        Ok(n) => d.outbound(buf[..n].to_vec()),
-                        Err(e) => { warn!("tun read: {e}"); break; }
-                    },
-                }
-            }
-        });
+        self.spawn_tun_io(dev, rx, cancel.clone());
         // IPv6: the address derived from the IPv4 one, routing the /48.
         let ip6 = crate::ip6_of(ip);
         #[cfg(unix)]
@@ -863,6 +936,117 @@ impl Daemon {
         *self.dns_applied.lock().unwrap() = None;
         self.update_dns();
         Ok(())
+    }
+
+    /// Move packets between the device and the tunnel until cancelled.
+    fn spawn_tun_io<D>(self: &Arc<Self>, dev: D, mut rx: mpsc::Receiver<Vec<u8>>, cancel: CancellationToken)
+    where
+        D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        let (mut rd, mut wr) = tokio::io::split(dev);
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = c.cancelled() => break,
+                    p = rx.recv() => match p {
+                        Some(p) => if let Err(e) = wr.write_all(&p).await { debug!("tun write: {e}"); },
+                        None => break,
+                    },
+                }
+            }
+        });
+        let d = self.clone();
+        let mtu = self.opts.mtu as usize;
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; mtu + 64];
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    n = rd.read(&mut buf) => match n {
+                        Ok(0) => break,
+                        Ok(n) => d.outbound(buf[..n].to_vec()),
+                        Err(e) => { warn!("tun read: {e}"); break; }
+                    },
+                }
+            }
+        });
+    }
+
+    /// Android: the VPN interface to ask the app for: this machine's
+    /// addresses, the tailnet (and everything, with an exit node), MagicDNS
+    /// with this machine's zone as the search domain.
+    #[cfg(unix)]
+    fn tun_spec(&self, ip: Ipv4Addr) -> android::TunSpec {
+        let mut routes = vec![
+            format!("{}/{}", crate::TAILNET_NET, crate::TAILNET_PREFIX),
+            format!("{}/{}", crate::TAILNET6, crate::TAILNET6_PREFIX),
+        ];
+        if self.exit_in_use.read().unwrap().is_some() {
+            routes.extend(["0.0.0.0/0".to_string(), "::/0".to_string()]);
+        }
+        let search = {
+            let net = self.net.read().unwrap();
+            net.me.as_ref().map(|me| {
+                if me.zone.is_empty() {
+                    format!("{}.{}", me.account, net.domain)
+                } else {
+                    me.zone.clone()
+                }
+            })
+        };
+        android::TunSpec {
+            addresses: vec![format!("{ip}/32"), format!("{}/128", crate::ip6_of(ip))],
+            routes,
+            dns: vec![crate::MAGIC_DNS_IP.to_string()],
+            search: search.into_iter().collect(),
+            mtu: self.opts.mtu,
+        }
+    }
+
+    /// Android: a new VPN interface with the current routes.
+    fn android_retun(self: &Arc<Self>) {
+        let old = self.tun.lock().unwrap().take();
+        if let Some(t) = old {
+            t.cancel.cancel();
+            if let Err(e) = self.ensure_tun(t.ip, crate::TAILNET_PREFIX) {
+                warn!("android: {e:#}");
+            }
+        }
+    }
+
+    /// Android: the underlying network's DNS servers (for the hub's name
+    /// and other names); None elsewhere (the system resolves).
+    fn resolver(&self) -> Option<Vec<SocketAddr>> {
+        #[cfg(unix)]
+        return self.bridge.as_ref().map(|b| b.resolvers());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Where peers may reach the direct listener. Android: the addresses
+    /// the app reports (an app can't list them itself).
+    fn endpoints(&self, port: u16) -> Vec<SocketAddr> {
+        #[cfg(unix)]
+        if let Some(b) = &self.bridge {
+            if port == 0 {
+                return vec![];
+            }
+            let mut out: Vec<SocketAddr> = b
+                .network
+                .read()
+                .unwrap()
+                .addrs
+                .iter()
+                .map(|(ip, _)| *ip)
+                .filter(|ip| usable_endpoint(*ip))
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect();
+            out.sort();
+            out.dedup();
+            return out;
+        }
+        local_endpoints(port)
     }
 
     /// A packet from the TUN device, leaving this machine: to a peer by its
@@ -1025,6 +1209,22 @@ impl Daemon {
             self.send_to_peer(e, fwd);
             return;
         }
+        // Android: every app's DNS comes here; names outside the tailnet
+        // go to the underlying network's servers.
+        if let (false, Some(servers)) = (local, self.resolver()) {
+            let tun = self.tun_tx.read().unwrap().clone();
+            let (q, src, sport) = (u.payload.to_vec(), u.src, u.sport);
+            tokio::spawn(async move {
+                #[cfg(unix)]
+                if let (Some(a), Some(tx)) = (android::exchange(&servers, &q).await, tun) {
+                    let out = crate::packet::build_udp(crate::MAGIC_DNS_IP, src, 53, sport, &a);
+                    let _ = tx.try_send(out);
+                }
+                #[cfg(not(unix))]
+                let _ = (servers, q, src, sport, tun);
+            });
+            return;
+        }
         if let Some(resp) = resp {
             let out = crate::packet::build_udp(crate::MAGIC_DNS_IP, u.src, 53, u.sport, &resp);
             let tun = self.tun_tx.read().unwrap().clone();
@@ -1164,6 +1364,29 @@ pub fn parse_server(s: &str) -> Result<(String, u16)> {
 
 /// Addresses of this machine's interfaces where peers may reach the direct
 /// listener: everything except loopback, link-local and the tailnet.
+/// May peers try `ip` for a direct session? Not loopback, link-local or a
+/// tunnel address.
+fn usable_endpoint(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !crate::in_tailnet(v4),
+        IpAddr::V6(v6) => !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 && !crate::in_tailnet6(v6),
+    }
+}
+
+/// Resolve `host` through `servers` (Android, which has no system
+/// resolver tcd can use).
+pub async fn resolve_via(host: &str, port: u16, servers: &[SocketAddr]) -> std::io::Result<Vec<SocketAddr>> {
+    #[cfg(unix)]
+    return android::resolve(host, port, servers)
+        .await
+        .map_err(|e| std::io::Error::other(format!("{e:#}")));
+    #[cfg(not(unix))]
+    {
+        let _ = servers;
+        tokio::net::lookup_host((host, port)).await.map(|a| a.collect())
+    }
+}
+
 fn local_endpoints(port: u16) -> Vec<SocketAddr> {
     if port == 0 {
         return vec![];
@@ -1172,11 +1395,7 @@ fn local_endpoints(port: u16) -> Vec<SocketAddr> {
     if let Ok(ifs) = if_addrs::get_if_addrs() {
         for i in ifs {
             let ip = i.ip();
-            let ok = match ip {
-                IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !crate::in_tailnet(v4),
-                IpAddr::V6(v6) => !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 && !crate::in_tailnet6(v6),
-            };
-            if ok {
+            if usable_endpoint(ip) {
                 out.push(SocketAddr::new(ip, port));
             }
         }

@@ -23,20 +23,12 @@ ROOT=$(cd "$HERE/../.." && pwd)
 cd "$ROOT"
 ARCHES=${ARCHES:-"amd64 arm64"}
 GLIBC=2.31
-ZIGBUILD_VERSION=0.24.1
-ZIG_VERSION=0.17.1
-TOOLS=$ROOT/target/tools/zigbuild
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 BINS="tc-control tcd tc tc-tray"
 
 # The cross toolchain, in the project.
-if [ ! -x "$TOOLS/bin/cargo-zigbuild" ] || ! "$TOOLS/bin/pip" freeze 2>/dev/null | grep -qx "cargo-zigbuild==$ZIGBUILD_VERSION"; then
-    echo "setting up cargo-zigbuild $ZIGBUILD_VERSION with Zig $ZIG_VERSION in target/tools ..."
-    rm -rf "${TOOLS:?}"
-    python3 -m venv "$TOOLS"
-    "$TOOLS/bin/pip" install --quiet "cargo-zigbuild==$ZIGBUILD_VERSION" "ziglang==$ZIG_VERSION"
-fi
-PATH=$TOOLS/bin:$PATH
+TOOLS_BIN=$("$ROOT/packaging/zigbuild-tools.sh")
+PATH=$TOOLS_BIN:$PATH
 export PATH
 # Smaller programs: strip symbols when linking.
 CARGO_PROFILE_RELEASE_STRIP=symbols

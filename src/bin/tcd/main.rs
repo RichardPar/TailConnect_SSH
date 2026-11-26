@@ -68,6 +68,21 @@ pub struct Flags {
     /// connection: while it's down, that traffic is blocked (kill switch).
     #[arg(long)]
     exit_interface: Option<String>,
+    /// Inside the Android app: the socket the app's VpnService connects to,
+    /// to provide the VPN interface and the underlying network's details.
+    #[cfg(unix)]
+    #[arg(long)]
+    bridge: Option<PathBuf>,
+    /// Android: the underlying network's DNS servers, until the app reports
+    /// them (comma-separated).
+    #[cfg(unix)]
+    #[arg(long, value_delimiter = ',')]
+    android_dns: Vec<std::net::IpAddr>,
+    /// Android: this device's addresses on the underlying network, as
+    /// ADDRESS/PREFIX (comma-separated).
+    #[cfg(unix)]
+    #[arg(long, value_delimiter = ',')]
+    android_addrs: Vec<String>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -119,6 +134,19 @@ pub fn options(f: Flags) -> Options {
             .map(|ip| std::net::SocketAddr::new(ip, 53))
             .collect(),
         exit_interface: f.exit_interface,
+        #[cfg(unix)]
+        android: f.bridge.map(|bridge| tailconnect::client::android::AndroidOpts {
+            bridge,
+            dns: f.android_dns,
+            addrs: f
+                .android_addrs
+                .iter()
+                .filter_map(|a| {
+                    let (ip, len) = a.split_once('/')?;
+                    Some((ip.parse().ok()?, len.parse().ok()?))
+                })
+                .collect(),
+        }),
     }
 }
 
