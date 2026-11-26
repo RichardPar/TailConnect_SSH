@@ -2,19 +2,39 @@
 
 A self-hosted mesh VPN in Rust that carries IP traffic over **SSH inside TLS on port 443**, instead of WireGuard over UDP. To a firewall or proxy it looks like ordinary HTTPS, so it works on networks that allow only outbound web traffic.
 
-This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It is at the Linux MVP stage: see [Status](#status).
+This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It runs on Linux and Windows: see [Status](#status).
 
 ## How it works
 
+```mermaid
+flowchart LR
+    subgraph alpha["machine alpha"]
+        A_tcd["tcd"] --- A_tun["tcs0<br/>100.64.0.1"]
+    end
+    subgraph hub["hub · port 443"]
+        H["tc-control"]
+        P["web portal"]
+        DB[("SQLite<br/>accounts · machines<br/>keys · rules · shares")]
+        H --- DB
+        P --- DB
+    end
+    subgraph bravo["machine bravo"]
+        B_tcd["tcd"] --- B_tun["tcs0<br/>100.64.0.2"]
+    end
+    A_tcd -- "TLS → SSH<br/>control + sealed packets" --> H
+    B_tcd -- "TLS → SSH<br/>control + sealed packets" --> H
+    A_tcd <-. "direct TLS → SSH, port 7443<br/>when one can reach the other" .-> B_tcd
+    Browser["browser"] -- "HTTPS" --> P
 ```
-             TLS :443 ─ SSH ─ frames            TLS :443 ─ SSH ─ frames
-  ┌──────┐ ───────────────────────► ┌──────────┐ ◄─────────────────────── ┌──────┐
-  │ tcd  │   control + relayed      │tc-control│     control + relayed    │ tcd  │
-  │alpha │   packets                │  (hub)   │     packets              │bravo │
-  └──┬───┘                          └──────────┘                          └──┬───┘
-     │ tcs0 100.64.0.1                                      tcs0 100.64.0.2 │
-     └───────────────── direct TLS ─ SSH session (port 7443) ────────────────┘
-                        when one machine can reach the other
+
+Every connection, to the hub or between machines, is the same stack:
+
+```mermaid
+flowchart LR
+    TCP["TCP"] --> TLS["TLS<br/>ALPN tc-ssh/1"] --> SSH["SSH<br/>Ed25519 public-key auth"] --> CH["one SSH channel"] --> F["frames<br/>[kind u8][len u32][payload]"]
+    F --> C["CONTROL: JSON<br/>hello · welcome · netmap · endpoints · traffic"]
+    F --> PK["PACKET: raw IP<br/>direct links only"]
+    F --> SE["SEALED: 4-byte address + Noise message<br/>relayed by the hub"]
 ```
 
 - **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (ALPN `tc-ssh/1`) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
@@ -23,6 +43,69 @@ This is a Rust rewrite of [TailConnect](../TailConnect) (Go, WireGuard). It is a
 - **Machine identity** is an Ed25519 SSH key (`/var/lib/tailconnect-ssh/machine_key`). The hub knows machines by their public key. Clients trust the hub's SSH host key on first use and pin it.
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
+
+**Joining and staying connected:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as tcd (new machine)
+    participant H as tc-control (hub)
+    M->>H: TCP + TLS, ALPN tc-ssh/1 (pins the certificate fingerprint if self-signed)
+    M->>H: SSH auth with the machine's Ed25519 key
+    Note over M,H: client pins the hub's SSH host key on first use
+    M->>H: CONTROL hello { hostname, auth key (first time only), endpoints, port 7443 }
+    H->>H: check the key (SHA-256 hash), assign 100.64.x.y, store the machine
+    H-->>M: CONTROL welcome { this machine: name, address · MagicDNS domain }
+    H-->>M: CONTROL netmap { peers, keys, endpoints, what each may open · notice }
+    opt local addresses change
+        M->>H: CONTROL endpoints
+    end
+    loop whenever anything changes
+        H-->>M: CONTROL netmap (to every affected machine, within a second)
+    end
+    loop every 30 s while counts change
+        M->>H: CONTROL traffic { bytes per peer }
+    end
+```
+
+**A packet relayed through the hub, end-to-end encrypted:**
+
+```mermaid
+sequenceDiagram
+    participant A as alpha (tcd)
+    participant H as hub
+    participant B as bravo (tcd)
+    Note over A,B: X25519 keys derived from each machine's Ed25519 key, published in the netmap
+    A->>H: SEALED [dst 100.64.0.2] Noise IK handshake init
+    H->>B: SEALED [src 100.64.0.1] handshake init
+    B-->>H: SEALED [dst 100.64.0.1] handshake response
+    H-->>A: SEALED [src 100.64.0.2] handshake response
+    Note over A,B: session keys known only to alpha and bravo
+    A->>H: SEALED [dst] ChaCha20-Poly1305(IP packet, counter)
+    H->>H: relay only if the two are in each other's maps
+    H->>B: SEALED [src] ciphertext
+    B->>B: decrypt, check sender key ↔ inner source address, replay window, packet filter
+    Note over A,B: rekey every 2 min, sessions refused after 3 min
+```
+
+**Which path a packet takes:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Relay: peer appears in netmap
+    Relay --> Dialling: peer has endpoints
+    Dialling --> Direct: TLS + SSH up, peer key matches netmap
+    Dialling --> Relay: dial fails (retry later)
+    Direct --> Relay: link drops (falls back at once)
+    Relay --> Direct: peer dials us on 7443
+    Direct --> [*]: peer leaves netmap
+    Relay --> [*]: peer leaves netmap
+    note right of Direct
+        simultaneous dials: both keep
+        the link dialled by the smaller key
+    end note
+```
 
 ### Per-account DNS domains
 
@@ -46,6 +129,24 @@ By default, an account's machines are `NAME.ACCOUNT.tc.internal`, under the hub'
 
 **Cut off** (an expired key, waiting for approval, or a suspended account) means the machine keeps its keys and its connection to the hub, gets an empty network map with the reason as a notice, and is invisible to every other machine. When the reason goes away, it's back within a second, with nothing to redo.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: joins, account requires approval
+    [*] --> Active: joins (or pre-approved key)
+    Pending --> Active: owner/operator approves
+    Active --> CutOff: key expires · account suspended
+    CutOff --> Active: tcs up --authkey · account activated · expiry changed
+    Active --> Removed: operator removes · ephemeral and offline > 30 min
+    CutOff --> Removed: operator removes
+    Pending --> Removed: operator removes
+    Removed --> [*]
+    note right of CutOff
+        keeps keys and hub connection,
+        gets an empty netmap with a notice,
+        invisible to every other machine
+    end note
+```
+
 ### IPv6 and exit nodes
 
 **IPv6 inside the tunnel.**
@@ -66,6 +167,23 @@ By default, an account's machines are `NAME.ACCOUNT.tc.internal`, under the hub'
 | Other machines in the network | Through the tunnel, as before |
 | tcd's own connections to the hub and to peers | Direct: they carry the tunnel |
 | DNS | Names outside MagicDNS are resolved by the exit node, so the local network's resolver sees none of the lookups. MagicDNS names are answered on the machine itself. |
+
+```mermaid
+flowchart TD
+    P["outgoing packet on the client"] --> M{"fwmark 0x7443?<br/>(tcd's own sockets)"}
+    M -- yes --> MAIN["main table → real network<br/>(hub and peer links)"]
+    M -- no --> S{"main table has a more<br/>specific route than default?"}
+    S -- "yes (LAN, tunnel peers)" --> MAIN2["main table, as before"]
+    S -- no --> T7443["table 7443: default via tcs0"]
+    T7443 --> EX["exit node"]
+    EX --> F{"sender allowed?<br/>(own account, unrestricted)"}
+    F -- no --> DROP["dropped"]
+    F -- yes --> X{"--exit-interface set?"}
+    X -- no --> NAT["nftables masquerade<br/>→ exit node's uplink"]
+    X -- yes --> UP{"interface up?"}
+    UP -- yes --> T7444["rules 5260/5261 → table 7444<br/>→ tun0 / second uplink"]
+    UP -- no --> KS["unreachable (metric 4000)<br/>kill switch: blocked"]
+```
 
 How it works and what to know:
 - **Using one.** The machine uses policy routing, as `wg-quick` does, leaving the main routing table alone:
@@ -106,6 +224,19 @@ How it's enforced:
 
 - **Network maps.** The hub computes each machine's peers from accounts, shares and rules. Other machines' names, addresses and keys never reach it.
 - **Relay.** The hub relays only between machines that are in each other's maps.
+```mermaid
+flowchart TD
+    IN["packet arrives<br/>(direct link, or decrypted from the hub)"] --> K{"source address bound<br/>to the sending peer's key?"}
+    K -- no --> D["drop + count"]
+    K -- yes --> R{"reply to a flow this<br/>machine started?"}
+    R -- yes --> OK["deliver to TUN"]
+    R -- no --> E{"ICMP error?"}
+    E -- yes --> OK
+    E -- no --> A{"peer's netmap entry allows<br/>this protocol/port here?"}
+    A -- yes --> OK
+    A -- "no / unknown peer / missing entry" --> D
+```
+
 - **Packet filter.** Each peer in a map comes with what it may open on the receiving machine. That machine's stateful filter checks every arriving packet, whether over a direct path or decrypted from the hub, before it reaches the TUN device.
   - It passes replies to flows this machine started (TCP and UDP by ports, ping by identifier), new connections to allowed ports, and ICMP errors. It drops everything else and counts it in `tc status`.
   - It sits on the receiver, so a compromised sender can't switch it off. Each packet's source is bound to the peer's key, so it can't be forged.
@@ -115,10 +246,18 @@ How it's enforced:
 
 The hub serves a web portal on the same port, 443. During the TLS handshake, `tcd` asks for SSH (ALPN `tc-ssh/1`) and browsers ask for HTTP/1.1, so one listener answers both. Open `https://your-hub/` in a browser. With a self-signed certificate the browser warns once: compare the fingerprint `tc-control fingerprint` prints, then accept it.
 
+```mermaid
+flowchart LR
+    C["TLS ClientHello on :443"] --> A{"ALPN"}
+    A -- "tc-ssh/1" --> SSH["SSH server → machine session"]
+    A -- "acme-tls/1" --> ACME["Let's Encrypt challenge certificate"]
+    A -- "http/1.1 / none" --> WEB["web portal + /api/v1"]
+```
+
 | Tab | Who | What's there |
 |---|---|---|
 | Machines | everyone | Machines with online status, address, MagicDNS name, tags and **traffic** (current speeds and totals; click for the breakdown per peer); set tags, rename, remove. Operators see every account's. |
-| Auth keys | everyone | Create keys (1 hour to 90 days, single-use or reusable). A new key is shown once, with the full `tc up` command, including `--tls-fingerprint` for a self-signed certificate. Revoke keys. |
+| Auth keys | everyone | Create keys (1 hour to 90 days, single-use or reusable). A new key is shown once, with the full `tcs up` command (including `--tls-fingerprint` for a self-signed certificate) and a **QR code** of a `tailconnect-ssh://join?server=…&key=…&fp=…` link, for joining from a phone or another device. Revoke keys. |
 | Access rules | everyone | Add and delete rules (operators pick the account) |
 | Sharing | everyone | Share a machine with an account, or create a single-use **share link**; change ports; revoke. Accept, decline or remove shares offered to you, and redeem links. |
 | Accounts | operators | Add accounts (with or without a portal password, tenant or operator); approve sign-ups; suspend and reactivate; change role; reset passwords; delete. Create and revoke **invites**. |
@@ -337,6 +476,46 @@ The admin commands work on the database directly, whether or not the hub is runn
 
 `--state-dir` (`TC_STATE_DIR`) and `--socket` (`TC_SOCKET`) change where things are kept.
 
+## Code layout
+
+```mermaid
+flowchart TB
+    subgraph bins["src/bin"]
+        tcc["tc-control<br/>hub + admin CLI"]
+        tcd["tcd<br/>machine daemon"]
+        tc["tc<br/>client CLI"]
+        ui["tc-tray · tc-gui · tc-win<br/>desktop apps"]
+    end
+    subgraph server["src/server"]
+        smod["mod.rs<br/>listener, ALPN, sessions, relay"]
+        policy["policy.rs<br/>maps from accounts/shares/rules"]
+        db["db.rs<br/>SQLite"]
+        auth["auth.rs"]
+        acme["acme.rs<br/>Let's Encrypt"]
+        portal["portal/<br/>web UI + /api/v1"]
+    end
+    subgraph client["src/client"]
+        cmod["mod.rs<br/>tunnel, routing"]
+        direct["direct.rs<br/>peer links"]
+        exit["exit.rs · exitdns.rs<br/>exit nodes"]
+        lapi["localapi.rs<br/>socket / named pipe"]
+    end
+    subgraph shared["shared"]
+        transport["transport.rs · tls.rs"]
+        frame["frame.rs · proto.rs"]
+        e2e["e2e.rs<br/>Noise IK"]
+        filter["filter.rs · acl.rs"]
+        dns["dns.rs<br/>MagicDNS"]
+        keys["keys.rs · packet.rs"]
+    end
+    tcc --> server
+    tcd --> client
+    tc --> lapi
+    ui --> lapi
+    server --> shared
+    client --> shared
+```
+
 ## Tests
 
 ```sh
@@ -378,7 +557,7 @@ PEBBLE=… CHALLTESTSRV=… tests/acme-pebble.sh   # Let's Encrypt against Pebbl
 
 ## Status
 
-Done (Linux MVP):
+Done:
 
 - the hub on 443 with SSH inside TLS, registration with auth keys, address allocation, a pushed network map, and relaying with source checks;
 - `tcd` with a TUN device, direct SSH paths with fallback to the hub, MagicDNS (A and PTR records), the local API and the `tc` CLI;
@@ -391,10 +570,11 @@ Done (Linux MVP):
 - key expiry with renewal, machine approval, ephemeral machines;
 - per-account MagicDNS domains;
 - an admin HTTP API for scripts (`/api/v1`, bearer token; [docs/api.md](docs/api.md));
-- the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token;
+- the web portal on port 443 (by ALPN): passwords, operator and tenant roles, sign-up with approval or invites, share links, the admin token, QR codes for joining;
 - built-in Let's Encrypt: TLS-ALPN-01 on the hub's own port, HTTP-01, or DNS-01 through DuckDNS, with automatic renewal;
 - an admin CLI, systemd units, and unit and end-to-end tests.
 
 Roadmap toward parity with the Go TailConnect:
 
-1. Windows (Wintun) and Android (VpnService) clients
+1. An Android client (VpnService), joining from the portal's QR code
+2. Exit nodes on Windows

@@ -390,7 +390,13 @@ function secretBox() {
   return el("div", { class: "secret" },
     el("div", {}, el("strong", {}, s.title), " — shown once: copy it now."),
     el("div", { class: "row" }, el("span", { class: "mono" }, s.value), copyButton(s.value)),
-    s.extra ? el("div", { class: "row" }, el("span", { class: "mono" }, s.extra), copyButton(s.extra)) : null);
+    s.extra ? el("div", { class: "row" }, el("span", { class: "mono" }, s.extra), copyButton(s.extra)) : null,
+    s.qr ? el("div", { class: "qr" },
+      el("img", { src: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(s.qr), alt: "QR code of the join link", width: 220, height: 220 }),
+      el("div", { class: "qr-text" },
+        el("strong", {}, "Join with a phone or another device"),
+        el("p", { class: "hint" }, "The code holds this join link (the hub, the key" + (state.me.tls_fingerprint ? ", the certificate's fingerprint" : "") + "). Scan it, or copy the link to a device that has TailConnect-SSH."),
+        s.link ? el("div", { class: "row" }, el("span", { class: "mono" }, s.link), copyButton(s.link)) : null)) : null);
 }
 
 // ---------- machines ----------
@@ -456,7 +462,7 @@ async function keysTab() {
       act(async () => {
         const r = await api("POST", "/keys", { account: me.operator ? state.account : null, reusable: f.reusable, ephemeral: f.ephemeral, preapproved: f.preapproved, expires_hours: Number(f.expires) });
         const fp = me.tls_fingerprint ? " --tls-fingerprint " + me.tls_fingerprint : "";
-        state.secret = { title: "Auth key for " + r.account, value: r.key, extra: "sudo tc up --server " + me.server + fp + " --authkey " + r.key };
+        state.secret = { title: "Auth key for " + r.account, value: r.key, extra: "sudo tcs up --server " + me.server + fp + " --authkey " + r.key, qr: r.qr_svg, link: r.join_url };
       });
     },
   },

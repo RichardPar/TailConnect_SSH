@@ -320,6 +320,12 @@ async fn tenants_see_only_their_own_account() {
         .post("/api/keys", json!({"expires_hours": 24, "reusable": true}), &ca)
         .await;
     assert!(r.body["key"].as_str().unwrap().starts_with("tckey-"));
+    // The join link, and its QR code.
+    let key = r.body["key"].as_str().unwrap().to_string();
+    let link = r.body["join_url"].as_str().unwrap();
+    assert!(link.starts_with("tailconnect-ssh://join?server="), "{link}");
+    assert!(link.contains(&format!("&key={key}")), "{link}");
+    assert!(r.body["qr_svg"].as_str().unwrap().contains("<svg"));
     assert_eq!(
         t.get("/api/keys", &ca).await.body.as_array().unwrap().len(),
         2,
@@ -921,5 +927,18 @@ async fn account_dns_domains() {
     assert_eq!(
         t.get("/api/v1/machines", &ca).await.body[0]["fqdn"],
         "laptop.alice.tc.internal"
+    );
+}
+
+#[test]
+fn join_links() {
+    use super::api::join_url;
+    assert_eq!(
+        join_url("hub.example:8443", "tckey-abc", None),
+        "tailconnect-ssh://join?server=hub.example%3A8443&key=tckey-abc"
+    );
+    assert_eq!(
+        join_url("[fd00::1]:443", "tckey-abc", Some("9aed")),
+        "tailconnect-ssh://join?server=%5Bfd00%3A%3A1%5D%3A443&key=tckey-abc&fp=9aed"
     );
 }

@@ -250,8 +250,10 @@ async fn signup(State(p): P, Extension(c): Extension<ConnInfo>, Json(b): Json<Si
     ok(json!({ "status": a.status.as_str() }))
 }
 
-async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
-    let server = if p.cfg.public_server.is_empty() {
+/// The address machines join with: --public-url, or the host name the
+/// browser used.
+fn join_server(p: &Portal, headers: &HeaderMap) -> String {
+    if p.cfg.public_server.is_empty() {
         let host = headers
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
@@ -259,7 +261,45 @@ async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
         host.strip_suffix(":443").unwrap_or(host).to_string()
     } else {
         p.cfg.public_server.clone()
-    };
+    }
+}
+
+/// What an auth key's QR code holds: a `tailconnect-ssh://join` link with
+/// the hub, the key and (for a self-signed hub) its TLS fingerprint, for an
+/// app that opens such links with its login filled in.
+pub fn join_url(server: &str, key: &str, fingerprint: Option<&str>) -> String {
+    fn pct(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+    let mut u = format!("tailconnect-ssh://join?server={}&key={}", pct(server), pct(key));
+    if let Some(fp) = fingerprint.filter(|f| !f.is_empty()) {
+        u.push_str(&format!("&fp={}", pct(fp)));
+    }
+    u
+}
+
+/// `text` as a QR code in SVG: black on white with the standard quiet zone,
+/// so it scans in dark mode too.
+pub fn qr_svg(text: &str) -> Option<String> {
+    use qrcode::render::svg;
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M).ok()?;
+    Some(
+        code.render::<svg::Color>()
+            .min_dimensions(220, 220)
+            .quiet_zone(true)
+            .dark_color(svg::Color("#000000"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+    )
+}
+
+async fn me(State(p): P, me: Me, headers: HeaderMap) -> ApiResult {
+    let server = join_server(&p, &headers);
     ok(json!({
         "name": me.account.as_ref().map(|a| a.name.clone()),
         "operator": me.operator,
@@ -631,7 +671,7 @@ struct NewKey {
     preapproved: bool,
 }
 
-async fn create_key(State(p): P, me: Me, Json(b): Json<NewKey>) -> ApiResult {
+async fn create_key(State(p): P, me: Me, headers: HeaderMap, Json(b): Json<NewKey>) -> ApiResult {
     if !(1..=24 * 365).contains(&b.expires_hours) {
         return Err(ApiError::bad("keys expire after 1 hour to 1 year"));
     }
@@ -641,7 +681,8 @@ async fn create_key(State(p): P, me: Me, Json(b): Json<NewKey>) -> ApiResult {
         p.db.lock()
             .unwrap()
             .create_authkey_with(&a.name, b.reusable, Some(exp), b.ephemeral, b.preapproved)?;
-    ok(json!({ "key": key, "account": a.name }))
+    let link = join_url(&join_server(&p, &headers), &key, p.cfg.tls_fingerprint.as_deref());
+    ok(json!({ "key": key, "account": a.name, "join_url": link, "qr_svg": qr_svg(&link) }))
 }
 
 async fn revoke_key(State(p): P, me: Me, Path(id): Path<i64>) -> ApiResult {
