@@ -361,12 +361,10 @@ pub async fn run(opts: Options) -> Result<()> {
         Some(po) => Some(start_portal(&hub, &opts, po).await?),
         None => None,
     };
-    // ALPN: tcd asks for tc-ssh/1, browsers for http/1.1, ACME validators
-    // for acme-tls/1.
-    let mut alpn = vec![crate::ALPN.to_vec()];
-    if portal.is_some() {
-        alpn.push(crate::tls::ALPN_HTTP.to_vec());
-    }
+    // ALPN: tcd and browsers ask for http/1.1 (older tcd for tc-ssh/1),
+    // ACME validators for acme-tls/1. h2 isn't offered, so a client offering
+    // both gets http/1.1.
+    let mut alpn = vec![crate::tls::ALPN_HTTP.to_vec(), crate::ALPN.to_vec()];
     let tls_config = match &opts.acme {
         None => {
             let mut c = (*opts.tls.config).clone();
@@ -418,19 +416,32 @@ pub async fn run(opts: Options) -> Result<()> {
                 Ok(Err(e)) => return debug!("{peer}: TLS handshake: {e}"),
                 Err(_) => return debug!("{peer}: TLS handshake timed out"),
             };
-            // tcd asks for tc-ssh/1; anything else (browsers) is the portal.
-            let alpn = tls.get_ref().1.alpn_protocol();
+            let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            let alpn = alpn.as_deref();
             if alpn == Some(acme::ALPN_ACME) {
                 // A TLS-ALPN-01 validation: the handshake was the answer.
                 return;
             }
-            let is_ssh = alpn == Some(crate::ALPN);
-            if !is_ssh {
-                if let Some(router) = portal {
-                    portal::serve_conn(router, tls, portal::ConnInfo { peer, tls: true }).await;
+            // tcd and browsers both ask for http/1.1 (older tcd for
+            // tc-ssh/1): tcd's first bytes are its SSH version line.
+            let mut tls = tls;
+            let first = if alpn == Some(crate::ALPN) {
+                Vec::new()
+            } else {
+                match tokio::time::timeout(Duration::from_secs(20), transport::sniff_ssh(&mut tls)).await {
+                    Ok(Ok((true, first))) => first,
+                    Ok(Ok((false, first))) => {
+                        if let Some(router) = portal {
+                            let stream = transport::Prefixed::new(first, tls);
+                            portal::serve_conn(router, stream, portal::ConnInfo { peer, tls: true }).await;
+                        }
+                        return;
+                    }
+                    Ok(Err(e)) => return debug!("{peer}: {e}"),
+                    Err(_) => return debug!("{peer}: nothing sent after TLS"),
                 }
-                return;
-            }
+            };
+            let tls = transport::Prefixed::new(first, tls);
             let conn = tokio::time::timeout(Duration::from_secs(20), transport::accept_ssh(tls, ssh, policy)).await;
             match conn {
                 Ok(Ok(conn)) => {

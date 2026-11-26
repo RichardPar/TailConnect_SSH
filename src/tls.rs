@@ -53,6 +53,11 @@ pub struct ServerTls {
 /// ALPN protocol id for browsers: the web portal shares port 443 with SSH.
 pub const ALPN_HTTP: &[u8] = b"http/1.1";
 
+/// What `tcd` offers: the same as a browser, so the ClientHello doesn't name
+/// the protocol. Servers tell SSH from HTTP by the first bytes after TLS
+/// (see [`crate::transport::sniff_ssh`]).
+pub const ALPN_CLIENT: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
 /// A server config whose certificate comes from `resolver` (Let's Encrypt).
 pub fn server_with_resolver(
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
@@ -77,7 +82,8 @@ fn build_server(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("building TLS server config")?;
-    config.alpn_protocols = vec![crate::ALPN.to_vec()];
+    // http/1.1 for current clients, tc-ssh/1 for older ones.
+    config.alpn_protocols = vec![ALPN_HTTP.to_vec(), crate::ALPN.to_vec()];
     Ok(ServerTls {
         config: Arc::new(config),
         fingerprint,
@@ -112,11 +118,36 @@ pub fn server_self_signed(dir: &Path, names: Vec<String>) -> Result<ServerTls> {
 }
 
 /// An ephemeral self-signed certificate, for direct peer listeners where TLS
-/// is only camouflage (SSH host keys authenticate the peer).
+/// is only camouflage (SSH host keys authenticate the peer). It looks like an
+/// ordinary appliance certificate: no names, valid from a few weeks ago for a
+/// year.
 pub fn server_ephemeral() -> Result<ServerTls> {
-    let ck = rcgen::generate_simple_self_signed(vec!["tailconnect.invalid".to_string()])?;
-    let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).map_err(|e| anyhow!(e))?;
-    build_server(vec![ck.cert.der().clone()], key)
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let days = crate::now_unix().div_euclid(86_400);
+    let (y, m, d) = civil_date(days - 20 - (rand::random::<u8>() % 20) as i64);
+    params.not_before = rcgen::date_time_ymd(y, m, d);
+    params.not_after = rcgen::date_time_ymd(y + 1, m, d.min(28));
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&rand::random::<[u8; 16]>()));
+    let key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key)?;
+    let key = PrivateKeyDer::try_from(key.serialize_der()).map_err(|e| anyhow!(e))?;
+    build_server(vec![cert.der().clone()], key)
+}
+
+/// The (year, month, day) of a day number counted from 1970-01-01.
+fn civil_date(days: i64) -> (i32, u8, u8) {
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let y = (yoe + era * 400 + i64::from(m <= 2)) as i32;
+    (y, m, d)
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
@@ -140,7 +171,27 @@ pub enum Verify {
     Any,
 }
 
-pub fn client_config(verify: Verify) -> Result<Arc<ClientConfig>> {
+/// Client TLS configs: `modern` offers a browser's ALPN; `legacy` offers
+/// `tc-ssh/1`, for hubs and peers from before servers sniffed for SSH.
+#[derive(Clone)]
+pub struct ClientTls {
+    pub modern: Arc<ClientConfig>,
+    pub legacy: Arc<ClientConfig>,
+}
+
+pub fn client_config(verify: Verify) -> Result<ClientTls> {
+    let config = base_client_config(verify)?;
+    let mut modern = config.clone();
+    modern.alpn_protocols = ALPN_CLIENT.iter().map(|p| p.to_vec()).collect();
+    let mut legacy = config;
+    legacy.alpn_protocols = vec![crate::ALPN.to_vec()];
+    Ok(ClientTls {
+        modern: Arc::new(modern),
+        legacy: Arc::new(legacy),
+    })
+}
+
+fn base_client_config(verify: Verify) -> Result<ClientConfig> {
     let builder = ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions()?;
     let mut config = match verify {
         Verify::WebPki => {
@@ -156,8 +207,8 @@ pub fn client_config(verify: Verify) -> Result<Arc<ClientConfig>> {
             .with_custom_certificate_verifier(Arc::new(PinVerifier::new(None)))
             .with_no_client_auth(),
     };
-    config.alpn_protocols = vec![crate::ALPN.to_vec()];
-    Ok(Arc::new(config))
+    config.alpn_protocols = Vec::new();
+    Ok(config)
 }
 
 /// Accepts the certificate whose fingerprint matches (or any, if `None`),
@@ -231,5 +282,19 @@ mod tests {
             "0".repeat(64)
         );
         assert!(normalise_fingerprint("abc").is_err());
+    }
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(11_016), (2000, 2, 29));
+        assert_eq!(civil_date(20_783), (2026, 11, 26));
+    }
+
+    #[test]
+    fn ephemeral_cert_is_plain() {
+        let t = server_ephemeral().unwrap();
+        assert!(t.names.is_empty());
+        assert_eq!(t.config.alpn_protocols, vec![ALPN_HTTP.to_vec(), crate::ALPN.to_vec()]);
     }
 }

@@ -24,7 +24,6 @@ use crate::proto::Node;
 use crate::transport::{self, HostKey, KeyPolicy};
 
 const RETRY: Duration = Duration::from_secs(30);
-const SNI: &str = "tailconnect.invalid";
 
 pub async fn listen(d: Arc<Daemon>) -> Result<()> {
     let port = d.opts.direct_port;
@@ -102,9 +101,11 @@ async fn dial(d: Arc<Daemon>, n: Node) {
         if crate::machine_of(ep.ip()).is_some() || ep.ip() == std::net::IpAddr::V4(crate::MAGIC_DNS_IP) {
             continue;
         }
+        // The address as the server name: no SNI is sent, as for any
+        // HTTPS connection to an IP address.
         let r = transport::dial(
             *ep,
-            SNI,
+            &ep.ip().to_string(),
             tls.clone(),
             d.key.clone(),
             "peer",

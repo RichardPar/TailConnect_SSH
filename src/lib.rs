@@ -37,7 +37,9 @@ pub const TAILNET_PREFIX: u8 = 10;
 /// The in-tunnel MagicDNS resolver address.
 pub const MAGIC_DNS_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 100);
 
-/// ALPN protocol id offered and required on every TLS connection.
+/// ALPN protocol id that older `tcd` offered on every TLS connection. Still
+/// accepted, and offered again when a server from before SSH sniffing turns
+/// down the browser ALPN that `tcd` now offers ([`tls::ALPN_CLIENT`]).
 pub const ALPN: &[u8] = b"tc-ssh/1";
 
 /// Default MTU of the TUN device. Packets travel inside SSH inside TLS inside

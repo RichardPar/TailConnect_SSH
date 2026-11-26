@@ -31,13 +31,13 @@ Every connection, to the hub or between machines, is the same stack:
 
 ```mermaid
 flowchart LR
-    TCP["TCP"] --> TLS["TLS<br/>ALPN tc-ssh/1"] --> SSH["SSH<br/>Ed25519 public-key auth"] --> CH["one SSH channel"] --> F["frames<br/>[kind u8][len u32][payload]"]
+    TCP["TCP"] --> TLS["TLS<br/>ALPN h2, http/1.1"] --> SSH["SSH<br/>Ed25519 public-key auth"] --> CH["one SSH channel"] --> F["frames<br/>[kind u8][len u32][payload]"]
     F --> C["CONTROL: JSON<br/>hello · welcome · netmap · endpoints · traffic"]
     F --> PK["PACKET: raw IP<br/>direct links only"]
     F --> SE["SEALED: 4-byte address + Noise message<br/>relayed by the hub"]
 ```
 
-- **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (ALPN `tc-ssh/1`) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
+- **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (offering the ALPN a browser does, `h2, http/1.1`) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames, padded to a few fixed sizes per write so the TLS records don't show the size of each packet: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
 - **End-to-end encryption of relayed traffic.** Before relaying anything, two machines run a Noise IK handshake (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) through the hub. Every relayed packet is then sealed with ChaCha20-Poly1305. The hub sees only the 4-byte destination address, and tells the receiver which machine sent each message. It never relays plaintext. The receiver checks, by cryptography, that the message came from that machine's key, and that the inner packet's source address is that machine's. Details are in [src/e2e.rs](src/e2e.rs).
 - **Direct paths.** Each `tcd` also listens on port 7443 (TLS + SSH again) and reports its addresses to the hub, which adds the public address it sees. Peers dial each other's endpoints. Each side checks the other's SSH key against the network map, so only machines on the network get in. If the two dial each other at the same moment, both keep the link dialled by the smaller key. When a direct link drops, traffic goes back through the hub straight away, and the daemon dials again. A peer that starts sending through the hub while we still hold a direct link to it has lost that link, so we drop ours too.
 - **Noticing dead connections.** SSH keepalives run every 5 seconds (10 on Android), and on Linux and Android `TCP_USER_TIMEOUT` gives up after two of them unanswered, so a silently dead connection, to the hub or a peer, is noticed in about 15 seconds. Desktops check their outgoing address every 2 seconds and the Android app checks the network every second. On another network, `tcd` drops its direct links and reconnects to the hub at once (retries start at 250 ms); if only the addresses changed, it re-reports its endpoints.
@@ -52,7 +52,7 @@ sequenceDiagram
     autonumber
     participant M as tcd (new machine)
     participant H as tc-control (hub)
-    M->>H: TCP + TLS, ALPN tc-ssh/1 (pins the certificate fingerprint if self-signed)
+    M->>H: TCP + TLS, ALPN h2/http/1.1 (pins the certificate fingerprint if self-signed)
     M->>H: SSH auth with the machine's Ed25519 key
     Note over M,H: client pins the hub's SSH host key on first use
     M->>H: CONTROL hello { hostname, auth key (first time only), endpoints, port 7443 }
@@ -247,14 +247,16 @@ flowchart TD
 
 ### Web portal
 
-The hub serves a web portal on the same port, 443. During the TLS handshake, `tcd` asks for SSH (ALPN `tc-ssh/1`) and browsers ask for HTTP/1.1, so one listener answers both. Open `https://your-hub/` in a browser. With a self-signed certificate the browser warns once: compare the fingerprint `tc-control fingerprint` prints, then accept it.
+The hub serves a web portal on the same port, 443. `tcd` and browsers make the same TLS handshake (both offer `h2, http/1.1`; the hub picks HTTP/1.1), so nothing in it names the protocol. The hub then waits for the client's first bytes: `SSH-` starts a machine session, anything else goes to the portal. Older `tcd` asked for ALPN `tc-ssh/1`, which is still accepted; a new `tcd` falls back to it with an older hub or peer. Direct peer links work the same way, with no server name in the handshake and a plain self-signed certificate; anything but SSH gets a `404`. Open `https://your-hub/` in a browser. With a self-signed certificate the browser warns once: compare the fingerprint `tc-control fingerprint` prints, then accept it.
 
 ```mermaid
 flowchart LR
     C["TLS ClientHello on :443"] --> A{"ALPN"}
-    A -- "tc-ssh/1" --> SSH["SSH server → machine session"]
     A -- "acme-tls/1" --> ACME["Let's Encrypt challenge certificate"]
-    A -- "http/1.1 / none" --> WEB["web portal + /api/v1"]
+    A -- "tc-ssh/1 (older tcd)" --> SSH["SSH server → machine session"]
+    A -- "http/1.1 / none" --> B{"first bytes"}
+    B -- "SSH-" --> SSH
+    B -- "anything else" --> WEB["web portal + /api/v1"]
 ```
 
 | Tab | Who | What's there |
