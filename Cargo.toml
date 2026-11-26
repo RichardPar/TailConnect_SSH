@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.105"
+arboard = "3.7.0"
 argon2 = "0.6.0"
 axum = "0.8.9"
 clap = { version = "4.6.10", features = ["derive", "env"] }
 curve25519-dalek = "5.0.0"
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"], optional = true }
 hex = "0.4.3"
 hyper = { version = "1.13.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service"] }
@@ -36,6 +38,28 @@ tun = { version = "0.8.15", features = ["async"] }
 webpki-roots = "1.0.12"
 x509-parser = "0.18"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Networking_WinSock",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
+] }
+# The Windows app (tc-win, shipped as TailConnectSSH.exe): --features wingui.
+eframe = { version = "0.37.0", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+tray-icon = { version = "0.27.0", optional = true }
+
 # Optimise dependencies (crypto) even in debug builds.
 [profile.dev.package."*"]
 opt-level = 2
@@ -43,3 +67,18 @@ opt-level = 2
 [dev-dependencies]
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }
+
+[features]
+# The window, tc-gui: needs GTK 4.14's development files (libgtk-4-dev).
+gui = ["dep:gtk"]
+
+# The Windows app, tc-win (shipped as TailConnectSSH.exe).
+wingui = ["dep:eframe", "dep:tray-icon"]
+
+[[bin]]
+name = "tc-gui"
+required-features = ["gui"]
+
+[[bin]]
+name = "tc-win"
+required-features = ["wingui"]

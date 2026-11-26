@@ -1,5 +1,5 @@
 //! The local API between `tc` and `tcd`: one JSON request line, one JSON
-//! response line, over a Unix socket.
+//! response line, over a Unix socket (Linux) or a named pipe (Windows).
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -7,11 +7,13 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use crate::proto::Node;
 
+#[cfg(unix)]
 pub const DEFAULT_SOCKET: &str = "/run/tailconnect-ssh/tcd.sock";
+#[cfg(windows)]
+pub const DEFAULT_SOCKET: &str = r"\\.\pipe\tailconnect-ssh";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -114,10 +116,8 @@ pub struct PeerStatus {
 
 /// Send one request to `tcd`.
 pub async fn call(socket: &Path, req: &Request) -> Result<Response> {
-    let s = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connecting to tcd at {} (is tcd running?)", socket.display()))?;
-    let (r, mut w) = s.into_split();
+    let s = connect(socket).await?;
+    let (r, mut w) = tokio::io::split(s);
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     w.write_all(&line).await?;
@@ -128,4 +128,34 @@ pub async fn call(socket: &Path, req: &Request) -> Result<Response> {
         return Err(anyhow!("tcd closed the connection"));
     }
     Ok(serde_json::from_str(&out)?)
+}
+
+#[cfg(unix)]
+async fn connect(socket: &Path) -> Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to tcd at {} (is tcd running?)", socket.display()))
+}
+
+#[cfg(windows)]
+async fn connect(socket: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(socket.as_os_str()) {
+            Ok(c) => return Ok(c),
+            // Every instance is busy for a moment: try again shortly.
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "connecting to the TailConnect-SSH service at {} (is it running?)",
+                        socket.display()
+                    )
+                });
+            }
+        }
+    }
 }

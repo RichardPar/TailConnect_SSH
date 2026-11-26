@@ -187,6 +187,61 @@ The hub can get a free, publicly trusted certificate from Let's Encrypt and rene
 - **Who sees what.** Tenants see their own machines' traffic. In the per-peer breakdown, a peer is named only if it's one of the account's own machines or linked by a share; any other peer, such as a removed machine, shows as "another machine". Operators see everything.
 - **On the machine.** `tcs status` shows the same counts per peer.
 
+### Desktop app (Linux)
+
+Two programs, both installed by `install.sh client`:
+
+- **`tcs-gui`**, the TailConnect window, in the applications menu. It shows:
+  - the connection, this machine's name and address (with a copy button), the hub, and any problem;
+  - Connect or Disconnect, the exit node (chosen from the machines that offer it), and a button that opens the web portal;
+  - "Log in…" (hub, auth key, and a TLS fingerprint for a self-signed hub) and "Log out…";
+  - the network's other machines: online or not, their addresses (with copy buttons), the path to each (`direct`, `hub, e2e`), what they may open here, and the traffic exchanged.
+- **`tcs-tray`**, an icon in the desktop panel that starts at login. It works with any panel that shows StatusNotifierItem icons: Cinnamon, KDE, MATE, XFCE and Ubuntu's GNOME; plain GNOME needs the AppIndicator extension. Clicking the icon opens the window. The icon is:
+  - teal while connected;
+  - grey while disconnected or logged out;
+  - amber with a "!" when something needs attention, such as the service not running, the account suspended, the chosen exit node unavailable, or the exit interface down. A desktop notification says what went wrong.
+
+  Its menu has the state, this machine's address (click to copy), Connect or Disconnect, "Copy address of" each other machine, the exit node, and the web portal.
+
+Connecting, disconnecting and choosing an exit node need root or membership of the `tailconnect-ssh` group. `install.sh client` creates that group and adds the user who ran it, effective at once. Logging in and out from the window ask for an administrator's password (through polkit's `pkexec`); in a terminal they're `sudo tcs up --server … --authkey …` and `sudo tcs logout`.
+
+The window is built only with `--features gui`, which needs GTK 4.14 or later and its development files (`sudo apt install libgtk-4-dev`). Machines that run it need the GTK 4 libraries (`libgtk-4-1`), which desktop distributions already have.
+
+### Windows
+
+A Windows 10 (2004+) or 11 PC joins like any other machine: it gets an address and a name, reaches peers directly or through the hub, and resolves MagicDNS names in every program.
+
+- **Install**: unzip `tailconnect-ssh-VERSION-windows-amd64.zip` and double-click `install.cmd` (or run `tcd install` as administrator). This sets up:
+  - `C:\Program Files\TailConnect-SSH` and the **TailConnectSSH** service, which starts with Windows and restarts if it fails;
+  - `tcs` on the PATH;
+  - firewall rules for peers' direct connections and for the tunnel;
+  - the app in the Start menu, at sign-in, and in Settings → Apps.
+
+  Running it again upgrades in place. Settings → Apps → Uninstall runs `tcd uninstall`; add `--purge` to also delete the keys.
+- **The app** (`TailConnectSSH.exe`): an icon by the clock (teal, grey or amber, as on Linux) whose right-click menu has the address, Connect/Disconnect, the other machines and the exit node. Left-click opens a small window:
+  - a header card in the state's colour, with this PC's name, its address (click to copy) and a Connect switch;
+  - the exit node;
+  - the machines, with their paths (`direct`, `relay · e2e`, `offline`);
+  - the web portal, "Hub & key" and logging out.
+
+  It follows Windows' light or dark theme. Closing the window keeps the icon.
+- **Permissions**: any signed-in user may connect, disconnect and choose the exit node. Logging in and out need an administrator: the app asks Windows for elevation, and `tcs up --authkey` / `tcs logout` need an elevated prompt.
+- **How**:
+  - a Wintun adapter "TailConnect-SSH" (`wintun.dll` beside `tcd.exe`);
+  - MagicDNS through NRPT rules for the network's zones, plus the PC's zone as the adapter's DNS suffix, so short names work. The rules are removed when the tunnel goes down;
+  - an exit node is used through `0.0.0.0/1` + `128.0.0.0/1` routes on the adapter, with a host route keeping the hub on the real network;
+  - the local API is the named pipe `\\.\pipe\tailconnect-ssh`;
+  - keys and the service's log (`tcd.log`) are in `C:\ProgramData\TailConnect-SSH`, readable only by administrators.
+- **Not yet**: being an exit node.
+
+Build the package on Linux (needs `rustup target add x86_64-pc-windows-gnu`, `mingw-w64` and `zip`):
+
+```sh
+packaging/windows/build.sh     # dist/tailconnect-ssh-VERSION-windows-amd64.zip
+```
+
+It downloads Wintun once from wintun.net, checks it against a pinned SHA-256, and embeds the app icon in the programs. The programs aren't code-signed, so SmartScreen may warn the first time: choose **More info → Run anyway**.
+
 ### Security notes
 
 - **All traffic between machines is end-to-end encrypted.** Direct paths are SSH sessions between the two machines. Relayed traffic is sealed with per-pair Noise sessions that the hub can't read or forge. The hub still sees metadata: which machines talk to each other, when, and how much.
@@ -202,7 +257,8 @@ The hub can get a free, publicly trusted certificate from Let's Encrypt and rene
 ## Build
 
 ```sh
-cargo build --release      # target/release/{tc-control,tcd,tc}
+cargo build --release                  # target/release/{tc-control,tcd,tc,tc-tray}
+cargo build --release --features gui   # also the window, tc-gui (needs libgtk-4-dev)
 ```
 
 ## Quick start
@@ -273,6 +329,7 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control shares list` / `create NODE ACCOUNT [PORTS]` / `accept ID` / `ports ID PORTS` / `revoke ID` | Shares |
 | `tcd [--tun tcs0] [--direct-port 7443] [--mtu 1400] [--no-dns] [--hostname NAME] [--exit-dns IP,…] [--exit-interface IFACE]` | Machine daemon (needs root or `CAP_NET_ADMIN`) |
 | `tc up [--server HOST[:PORT]] [--authkey KEY] [--tls-fingerprint FP] [--exit-node NAME]` | Join or reconnect; `--exit-node` alone switches the exit node without reconnecting (`""` for none) |
+| `tc-tray`, `tc-gui` | Panel icon and menu; the window (see "Desktop app") |
 | `tc down` / `tc logout` | Disconnect / disconnect and forget the server |
 | `tc status [--json]`, `tc ip [NAME]` | Show this machine, its peers, the path to each (`direct` or `hub`), and what they may do (`shared with you`, `has access to this machine on tcp:80`, `rules: can open tcp:22 here`) |
 
@@ -328,6 +385,8 @@ Done (Linux MVP):
 - end-to-end encryption of relayed traffic (Noise IK per pair of machines, rekeying, replay protection);
 - accounts, one-way sharing with port limits, tag-based access rules, account suspension, and a stateful packet filter on each receiving machine;
 - traffic reports per machine and peer in the portal and `tcs status`;
+- a desktop app for Linux: a window (`tcs-gui`, GTK 4) and a panel icon with a menu (`tcs-tray`);
+- a Windows client: a service with a Wintun adapter, MagicDNS through NRPT, using exit nodes, `tcs`, an installer, and an app (tray icon, menu and window);
 - IPv6 inside the tunnel, and exit nodes (Linux) with DNS through the exit node, optionally out through another VPN with a kill switch;
 - key expiry with renewal, machine approval, ephemeral machines;
 - per-account MagicDNS domains;

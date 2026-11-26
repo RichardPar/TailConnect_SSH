@@ -43,10 +43,7 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
         let (tcp, addr) = listener.accept().await?;
         // Replies on accepted sessions must use the real network too, not an
         // exit node's routes.
-        {
-            use std::os::fd::AsRawFd;
-            crate::transport::set_mark(tcp.as_raw_fd(), super::exit::MARK);
-        }
+        crate::transport::set_mark(&tcp, super::exit::MARK);
         let (d, tls, ssh, policy) = (d.clone(), tls.clone(), ssh.clone(), policy.clone());
         tokio::spawn(async move {
             match transport::accept(tcp, tls, ssh, policy).await {
@@ -99,9 +96,9 @@ async fn dial(d: Arc<Daemon>, n: Node) {
         return;
     };
     for ep in &n.endpoints {
-        if let std::net::IpAddr::V4(v4) = ep.ip()
-            && crate::in_tailnet(v4)
-        {
+        // Never a tunnel address (IPv4 or IPv6): that would be a "direct"
+        // session running inside the tunnel itself.
+        if crate::machine_of(ep.ip()).is_some() || ep.ip() == std::net::IpAddr::V4(crate::MAGIC_DNS_IP) {
             continue;
         }
         let r = transport::dial(

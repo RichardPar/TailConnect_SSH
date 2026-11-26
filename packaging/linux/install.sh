@@ -16,6 +16,13 @@
 # ARGS given to `hub` are written there the first time) and
 # /etc/default/tailconnect-ssh (TCD_ARGS). Existing settings are kept.
 #
+# `client` also installs the panel icon (`tcs-tray`, started at login from
+# /etc/xdg/autostart/tailconnect-ssh-tray.desktop), the window (`tcs-gui`,
+# in the applications menu as TailConnect; only when it was built, with
+# `cargo build --release --features gui`), and creates the group
+# tailconnect-ssh, whose members may connect, disconnect and choose the exit
+# node without sudo; the installing user ($SUDO_USER) is added to it.
+#
 # Binaries are taken from target/release, or from the directory in $BIN.
 set -eu
 
@@ -63,8 +70,27 @@ hub)
     echo "hub installed: systemctl status tailconnect-ssh-control; admin CLI: sudo tcs-control --help"
     ;;
 client)
-    copy_bins tcd tc
+    copy_bins tcd tc tc-tray
     ln -sf "$PREFIX/bin/tc" /usr/local/bin/tcs
+    ln -sf "$PREFIX/bin/tc-tray" /usr/local/bin/tcs-tray
+    groupadd -r -f tailconnect-ssh
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && ! id -nG "$SUDO_USER" | grep -qw tailconnect-ssh; then
+        usermod -aG tailconnect-ssh "$SUDO_USER"
+        echo "added $SUDO_USER to the tailconnect-ssh group: it may connect, disconnect and pick the exit node without sudo"
+    fi
+    if [ -x "$BIN/tc-gui" ]; then
+        copy_bins tc-gui
+        ln -sf "$PREFIX/bin/tc-gui" /usr/local/bin/tcs-gui
+        install -m 0644 "$HERE/tailconnect-ssh.desktop" /usr/share/applications/tailconnect-ssh.desktop
+    else
+        echo "note: no window (tc-gui): build it with cargo build --release --features gui (needs libgtk-4-dev)"
+        rm -f /usr/share/applications/tailconnect-ssh.desktop
+    fi
+    rm -f /etc/xdg/autostart/tailconnect-ssh.desktop # (its old name)
+    install -m 0644 "$HERE/tailconnect-ssh-tray.desktop" /etc/xdg/autostart/tailconnect-ssh-tray.desktop
+    if [ -f /etc/xdg/autostart/tailconnect.desktop ]; then
+        echo "note: the WireGuard TailConnect's tray also starts at login (/etc/xdg/autostart/tailconnect.desktop)"
+    fi
     install -m 0644 "$HERE/tailconnect-ssh.service" "$UNITS/"
     if [ ! -f /etc/default/tailconnect-ssh ]; then
         printf '# Arguments for tcd (see `tcd --help`).\nTCD_ARGS=""\n' >/etc/default/tailconnect-ssh
@@ -82,11 +108,14 @@ uninstall)
         rm -f "$UNITS/$u.service"
     done
     systemctl daemon-reload
-    rm -f /usr/local/bin/tcs /usr/local/bin/tcs-control
+    rm -f /usr/local/bin/tcs /usr/local/bin/tcs-control /usr/local/bin/tcs-tray /usr/local/bin/tcs-gui \
+        /usr/share/applications/tailconnect-ssh.desktop /etc/xdg/autostart/tailconnect-ssh.desktop \
+        /etc/xdg/autostart/tailconnect-ssh-tray.desktop
     rm -rf "$PREFIX"
     if [ $purge = yes ]; then
         rm -rf /var/lib/tailconnect-ssh /var/lib/tailconnect-ssh-control \
             /etc/default/tailconnect-ssh /etc/default/tailconnect-ssh-control
+        groupdel tailconnect-ssh 2>/dev/null || true
         echo "removed TailConnect-SSH with its keys, database and settings"
     else
         echo "removed TailConnect-SSH (state kept in /var/lib/tailconnect-ssh*, settings in /etc/default/tailconnect-ssh*; --purge deletes them)"

@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -22,10 +21,7 @@ pub fn load_or_create(path: &Path) -> Result<PrivateKey> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut f = crate::private_file(fs::OpenOptions::new().write(true).create_new(true))
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
     f.write_all(text.as_bytes())?;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TailConnect panel icon
+Comment=Panel icon and menu for TailConnect-SSH
+Exec=tcs-tray
+Icon=network-vpn
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

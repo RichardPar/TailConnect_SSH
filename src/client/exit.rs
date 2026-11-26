@@ -40,8 +40,7 @@
 //! Everything is undone when the role ends, the exit node is no longer used,
 //! or tcd stops, and leftovers are removed when tcd starts (after a crash).
 
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::IpAddr;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,10 +58,10 @@ const PREFS: [u32; 6] = [5260, 5261, 5262, 5270, 5271, 5272];
 pub const EXIT_TABLE: u32 = 7444;
 /// Firewall mark on the DNS forwarder's sockets when an exit interface is set.
 pub const EXIT_MARK: u32 = 0x7444;
-/// Port of the exit node's DNS forwarder, on its tunnel address.
-pub const DNS_PORT: u16 = 41653;
 const NFT_TABLE: &str = "tailconnect-ssh-exit";
 const TAG: &str = "tailconnect-ssh-exit";
+
+pub use super::exitdns::{DNS_PORT, Pending, dns_forwarder, system_resolvers};
 
 fn run(args: &[&str]) -> Result<String> {
     let out = Command::new(args[0]).args(&args[1..]).output()?;
@@ -393,8 +392,9 @@ pub fn unserve(s: Serving) {
 
 // ---- using an exit node ----
 
-/// Send everything without a more specific route into `tun`.
-pub fn route_via(tun: &str, v6: bool) -> Result<()> {
+/// Send everything without a more specific route into `tun`. (`_keep`, the
+/// hub's addresses, stay on the real network through tcd's socket mark.)
+pub fn route_via(tun: &str, v6: bool, _keep: &[IpAddr]) -> Result<()> {
     unroute();
     let mark = format!("{MARK:#x}");
     let table = TABLE.to_string();
@@ -481,115 +481,6 @@ fn shell_words(s: &str) -> Vec<String> {
     out
 }
 
-// ---- DNS ----
-
-/// The host's resolvers, from /etc/resolv.conf.
-pub fn system_resolvers() -> Vec<SocketAddr> {
-    std::fs::read_to_string("/etc/resolv.conf")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .filter_map(|a| a.trim().parse::<std::net::IpAddr>().ok())
-        .map(|ip| SocketAddr::new(ip, 53))
-        .collect()
-}
-
-/// Answer DNS queries on `bind`:[`DNS_PORT`] for machines `allowed` to use
-/// this exit node, by asking `upstreams` (in turn). Runs until cancelled.
-pub async fn dns_forwarder(
-    bind: Ipv4Addr,
-    upstreams: Vec<SocketAddr>,
-    allowed: Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync>,
-    cancel: CancellationToken,
-    mark: Option<u32>,
-) {
-    // The tunnel address may take a moment to be usable.
-    let sock = loop {
-        match tokio::net::UdpSocket::bind((bind, DNS_PORT)).await {
-            Ok(s) => break Arc::new(s),
-            Err(e) => {
-                debug!("exit node DNS: binding {bind}:{DNS_PORT}: {e}");
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
-            }
-        }
-    };
-    if upstreams.is_empty() {
-        warn!("exit node DNS: no resolvers (see --exit-dns); lookups through this exit node will fail");
-    } else {
-        info!("exit node DNS: answering on {bind}:{DNS_PORT} with {upstreams:?}");
-    }
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let (n, from) = tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = sock.recv_from(&mut buf) => match r { Ok(x) => x, Err(_) => continue },
-        };
-        let std::net::IpAddr::V4(from_ip) = from.ip() else {
-            continue;
-        };
-        if !allowed(from_ip) || n < 12 {
-            continue;
-        }
-        let q = buf[..n].to_vec();
-        let (sock, ups) = (sock.clone(), upstreams.clone());
-        tokio::spawn(async move {
-            for up in ups {
-                if let Ok(a) = ask(up, &q, mark).await {
-                    let _ = sock.send_to(&a, from).await;
-                    return;
-                }
-            }
-        });
-    }
-}
-
-async fn ask(up: SocketAddr, q: &[u8], mark: Option<u32>) -> Result<Vec<u8>> {
-    let local: SocketAddr = if up.is_ipv4() {
-        "0.0.0.0:0".parse()?
-    } else {
-        "[::]:0".parse()?
-    };
-    let s = tokio::net::UdpSocket::bind(local).await?;
-    if let Some(m) = mark {
-        // Out through the exit interface (and its kill switch) too.
-        use std::os::fd::AsRawFd;
-        crate::transport::set_mark(s.as_raw_fd(), m);
-    }
-    s.send_to(q, up).await?;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let (n, from) = tokio::time::timeout(Duration::from_secs(4), s.recv_from(&mut buf)).await??;
-        // Only the server we asked, with the query's ID.
-        if from == up && n >= 2 && buf[..2] == q[..2] {
-            return Ok(buf[..n].to_vec());
-        }
-    }
-}
-
-/// Queries this machine sent to its exit node's DNS forwarder, to map the
-/// answers back to MagicDNS: (client port, DNS ID) → when.
-#[derive(Default)]
-pub struct Pending(HashMap<(u16, u16), std::time::Instant>);
-
-impl Pending {
-    pub fn add(&mut self, port: u16, id: u16) {
-        let now = std::time::Instant::now();
-        if self.0.len() > 4096 {
-            self.0.retain(|_, t| now.duration_since(*t) < Duration::from_secs(10));
-        }
-        self.0.insert((port, id), now);
-    }
-
-    pub fn take(&mut self, port: u16, id: u16) -> bool {
-        self.0
-            .remove(&(port, id))
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,14 +524,5 @@ mod tests {
         assert_eq!(widest_gateway(eth).as_deref(), Some("192.168.2.1"));
         // Point-to-point (wg0, tun0 without via): straight out of the device.
         assert_eq!(widest_gateway("10.0.0.0/24 proto kernel scope link src 10.0.0.2"), None);
-    }
-
-    #[test]
-    fn pending_dns_queries() {
-        let mut p = Pending::default();
-        p.add(5353, 7);
-        assert!(!p.take(5353, 8));
-        assert!(p.take(5353, 7));
-        assert!(!p.take(5353, 7), "only once");
     }
 }

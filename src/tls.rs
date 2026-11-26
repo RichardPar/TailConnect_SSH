@@ -121,12 +121,7 @@ pub fn server_ephemeral() -> Result<ServerTls> {
 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = crate::private_file(fs::OpenOptions::new().write(true).create(true).truncate(true))
         .open(path)
         .with_context(|| format!("writing {}", path.display()))?;
     f.write_all(data)?;

@@ -99,14 +99,15 @@ async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
     };
     let mark = SOCKET_MARK.load(std::sync::atomic::Ordering::Relaxed);
     if mark != 0 {
-        use std::os::fd::AsRawFd;
-        set_mark(sock.as_raw_fd(), mark);
+        set_mark(&sock, mark);
     }
     sock.connect(addr).await
 }
 
 /// Set a socket's firewall mark (needs CAP_NET_ADMIN; ignored without).
-pub fn set_mark(fd: std::os::fd::RawFd, mark: u32) {
+#[cfg(unix)]
+pub fn set_mark(sock: &impl std::os::fd::AsRawFd, mark: u32) {
+    let fd = sock.as_raw_fd();
     let m: libc::c_uint = mark;
     // SAFETY: setsockopt on a valid fd with a pointer to a c_uint of the given size.
     let r = unsafe {
@@ -122,6 +123,11 @@ pub fn set_mark(fd: std::os::fd::RawFd, mark: u32) {
         tracing::debug!("SO_MARK: {}", std::io::Error::last_os_error());
     }
 }
+
+/// Windows has no firewall marks: while an exit node is in use, a host route
+/// keeps the hub on the real network instead (see the client's exit module).
+#[cfg(windows)]
+pub fn set_mark(_sock: &impl std::os::windows::io::AsRawSocket, _mark: u32) {}
 
 /// Dial `addr` and bring up SSH-in-TLS.
 ///

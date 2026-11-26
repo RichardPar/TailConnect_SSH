@@ -238,14 +238,8 @@ fn load_saved(cfg: &Config) -> Option<(Arc<CertifiedKey>, i64, i64)> {
 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut f = crate::private_file(std::fs::OpenOptions::new().write(true).create(true).truncate(true)).open(&tmp)?;
     f.write_all(data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())

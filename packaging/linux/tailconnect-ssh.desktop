@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TailConnect
+GenericName=Private network
+Comment=Connect this computer to your TailConnect-SSH network
+Exec=tcs-gui
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+Keywords=vpn;network;ssh;tailconnect;
+StartupNotify=true

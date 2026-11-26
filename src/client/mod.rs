@@ -10,8 +10,13 @@
 
 pub mod api;
 mod direct;
+#[cfg_attr(windows, path = "exit_windows.rs")]
 mod exit;
+mod exitdns;
 mod localapi;
+pub mod view;
+#[cfg(windows)]
+pub mod win;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -171,6 +176,8 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(opts: Options) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&opts.state_dir).with_context(|| format!("creating {}", opts.state_dir.display()))?;
+        #[cfg(windows)]
+        win::restrict_dir(&opts.state_dir);
         let key = crate::keys::load_or_create(&opts.state_dir.join("machine_key"))?;
         let my_key = key_id(key.public_key());
         let e2e = crate::e2e::E2e::new(crate::keys::x25519_private(&key)?);
@@ -271,6 +278,12 @@ impl Daemon {
         }
         if let Some(t) = self.tun.lock().unwrap().take() {
             t.cancel.cancel();
+            // (On Linux the DNS settings go with the interface.)
+            #[cfg(windows)]
+            {
+                *self.dns_applied.lock().unwrap() = None;
+                tokio::task::spawn_blocking(win::clear_dns);
+            }
         }
         *self.tun_tx.write().unwrap() = None;
         *self.hub_tx.write().unwrap() = None;
@@ -683,7 +696,8 @@ impl Daemon {
                     return;
                 }
                 let v6 = self.tun.lock().unwrap().as_ref().is_some_and(|t| t.v6);
-                match exit::route_via(&self.opts.tun_name, v6) {
+                let keep: Vec<IpAddr> = self.hub_addrs.lock().unwrap().iter().map(|a| a.ip()).collect();
+                match exit::route_via(&self.opts.tun_name, v6, &keep) {
                     Ok(()) => {
                         *self.exit_in_use.write().unwrap() = Some(ip);
                         *self.exit_problem.write().unwrap() = None;
@@ -726,7 +740,10 @@ impl Daemon {
             return;
         }
         *applied = Some(want.clone());
+        #[cfg(unix)]
         apply_dns(&self.opts.tun_name, want.0, want.1, want.2);
+        #[cfg(windows)]
+        win::apply_dns(self.opts.tun_name.clone(), want.0, want.1, want.2);
     }
 
     /// Stop sending internet traffic through an exit node.
@@ -767,7 +784,17 @@ impl Daemon {
             .netmask(Ipv4Addr::from(mask))
             .mtu(self.opts.mtu)
             .up();
-        let dev = tun::create_as_async(&cfg).context("opening /dev/net/tun (tcd needs root or CAP_NET_ADMIN)")?;
+        #[cfg(windows)]
+        cfg.platform_config(|p| {
+            p.device_guid(win::ADAPTER_GUID);
+            p.wintun_file(win::wintun_path());
+        });
+        #[cfg(unix)]
+        let what = "opening /dev/net/tun (tcd needs root or CAP_NET_ADMIN)";
+        #[cfg(windows)]
+        let what =
+            "creating the Wintun adapter (tcd needs to run as SYSTEM or an administrator, with wintun.dll beside it)";
+        let dev = tun::create_as_async(&cfg).context(what)?;
         let (mut rd, mut wr) = tokio::io::split(dev);
         let cancel = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -803,6 +830,7 @@ impl Daemon {
         });
         // IPv6: the address derived from the IPv4 one, routing the /48.
         let ip6 = crate::ip6_of(ip);
+        #[cfg(unix)]
         let v6 = match exit_cmd(&[
             "ip",
             "-6",
@@ -818,6 +846,8 @@ impl Daemon {
                 false
             }
         };
+        #[cfg(windows)]
+        let v6 = win::configure_adapter(&self.opts.tun_name, ip6, crate::TAILNET6_PREFIX);
         info!(
             "{} up with {ip}/{prefix_len}{}",
             self.opts.tun_name,
@@ -1144,7 +1174,7 @@ fn local_endpoints(port: u16) -> Vec<SocketAddr> {
             let ip = i.ip();
             let ok = match ip {
                 IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !crate::in_tailnet(v4),
-                IpAddr::V6(v6) => !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80,
+                IpAddr::V6(v6) => !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 && !crate::in_tailnet6(v6),
             };
             if ok {
                 out.push(SocketAddr::new(ip, port));
@@ -1156,6 +1186,7 @@ fn local_endpoints(port: u16) -> Vec<SocketAddr> {
     out
 }
 
+#[cfg(unix)]
 /// Configure systemd-resolved for `tun`: MagicDNS as its server, `search`
 /// as its search domain, `routes` (and `.` with `all`) routed to it.
 fn apply_dns(tun: &str, search: String, routes: Vec<String>, all: bool) {
@@ -1186,6 +1217,7 @@ fn apply_dns(tun: &str, search: String, routes: Vec<String>, all: bool) {
 }
 
 /// Run a system command (iproute2 and the like).
+#[cfg(unix)]
 fn exit_cmd(args: &[&str]) -> Result<()> {
     let out = std::process::Command::new(args[0]).args(&args[1..]).output()?;
     if !out.status.success() {
@@ -1220,12 +1252,29 @@ fn find_peer<'a>(net: &'a Net, s: &str) -> Option<&'a PeerState> {
         .find(|p| p.node.name == name && p.node.account == account)
 }
 
+/// Asks a running daemon to shut down (the Windows service's Stop).
+static SHUTDOWN: Notify = Notify::const_new();
+
+/// Shut down the daemon, as SIGTERM does on Linux.
+pub fn request_shutdown() {
+    SHUTDOWN.notify_one();
+}
+
 async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = SHUTDOWN.notified() => {}
+        }
+    }
+    #[cfg(windows)]
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+        _ = SHUTDOWN.notified() => {}
     }
 }
 
