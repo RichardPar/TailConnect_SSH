@@ -583,10 +583,10 @@ async function sharingTab() {
     el("td", {}, exitCell(s)),
     el("td", {}, badge(s.status, s.status === "active" ? "ok" : "warn")),
     el("td", { class: "actions" },
-      el("button", { title: "Let them send their internet traffic through this machine, if it's an exit node",
+      !s.editable ? null : el("button", { title: "Let them send their internet traffic through this machine, if it's an exit node",
         onclick: () => act(() => api("POST", "/shares/" + s.id + "/exit", { on: !s.exit }), s.exit ? "No longer shared as an exit node" : "Shared as an exit node") },
         s.exit ? "Stop exit" : "Share exit"),
-      el("button", { onclick: async () => {
+      !s.editable ? null : el("button", { onclick: async () => {
         const r = await ask("Ports for " + s.machine + " shared with " + s.account, [{ name: "ports", label: "* or a list such as tcp:80,tcp:443", value: s.ports }]);
         if (r) act(() => api("POST", "/shares/" + s.id + "/ports", { ports: r.ports }), "Ports saved");
       } }, "Ports"),

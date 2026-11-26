@@ -5,9 +5,14 @@
 //! upgrade. Its `Sec-WebSocket-Key` is a proof (16 bytes, base64, the same
 //! shape as a real key) that it knows a secret the server knows:
 //!
-//! * to the hub: the hub's SSH host key id (pinned at the first connection),
-//!   or, when joining, the auth key it was given;
-//! * to a peer's direct port: that peer's key id, from the network map.
+//! * the hub's **network secret**: random, made by the hub and given to every
+//!   machine when it connects; it opens the hub and every direct port;
+//! * when joining (no network secret yet): the auth key it was given;
+//! * until a machine has the network secret (it last connected to an older
+//!   hub): the server's SSH key id, the hub's pinned host key or the peer's
+//!   key from the network map. Those are public keys, shown to anyone who
+//!   ran SSH against the port before it was hidden, so a server running
+//!   with `--hide-ssh` no longer accepts them.
 //!
 //! The proof is bound to the TLS session (an RFC 5705 exporter), so seeing
 //! one, even by sitting in the middle of an unauthenticated TLS connection,
@@ -25,8 +30,19 @@ const LABEL: &[u8] = b"EXPORTER-tailconnect-ssh-open-v1";
 /// A secret both ends know; the proof is derived from it.
 pub type Secret = [u8; 32];
 
+/// A new network secret, as the hub stores it and sends it (hex).
+pub fn new_network_secret() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+/// The secret from a network secret as the hub sends it.
+pub fn secret_for_network(hex_secret: &str) -> Option<Secret> {
+    let b = hex::decode(hex_secret.trim()).ok()?;
+    (b.len() == 32).then(|| derive(b"network", &b))
+}
+
 /// The secret for a server whose SSH key id is `key_id` (the hub's host key,
-/// or a peer's machine key).
+/// or a peer's machine key), for a machine without the network secret.
 pub fn secret_for_key(key_id: &str) -> Secret {
     derive(b"key", key_id.trim().as_bytes())
 }

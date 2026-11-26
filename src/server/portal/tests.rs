@@ -450,6 +450,28 @@ async fn sharing_by_name_and_by_link() {
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(t.get("/api/shares", &ca).await.body["with_me"][0]["exit"], true);
     assert_eq!(t.get("/api/shares", &cr).await.body["by_me"][0]["exit"], true);
+    // An operator with an account sees the share and may revoke it, but not
+    // change what it grants: only the owner's account may.
+    let ops = t.get("/api/shares", &cop).await.body;
+    let row = ops["by_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == sid)
+        .unwrap()
+        .clone();
+    assert_eq!(row["editable"], false);
+    assert_eq!(t.get("/api/shares", &cr).await.body["by_me"][0]["editable"], true);
+    for (path, body) in [("exit", json!({"on": false})), ("ports", json!({"ports": "tcp:1"}))] {
+        let r = t.post(&format!("/api/shares/{sid}/{path}"), body, &cop).await;
+        assert_eq!(
+            r.status,
+            StatusCode::BAD_REQUEST,
+            "operator changed {path}: {:?}",
+            r.body
+        );
+    }
+    assert_eq!(t.get("/api/shares", &ca).await.body["with_me"][0]["exit"], true);
     // alice shares nas with bob by link.
     let r = t
         .post("/api/share-links", json!({"node_id": nas, "ports": "", "days": 7}), &ca)

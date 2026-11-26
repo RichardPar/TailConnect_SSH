@@ -270,6 +270,7 @@ async fn dispatch(d: &Arc<Daemon>, req: Request) -> Result<()> {
                         // A different server: forget the old one's keys.
                         st.server_host_key = None;
                         st.tls_fingerprint = None;
+                        st.network_secret = None;
                     }
                     st.server = Some(s);
                 }

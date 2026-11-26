@@ -135,7 +135,7 @@ enum Cmd {
         /// Refuse plain SSH: only machines whose opening request proves they
         /// know this hub's key (or an auth key, when joining) get SSH, so a
         /// probe finds only the web portal; machines' direct ports follow.
-        /// Every machine must run 0.4.0 or later.
+        /// Every machine must run 0.4.1 or later and have connected since.
         #[arg(long)]
         hide_ssh: bool,
     },

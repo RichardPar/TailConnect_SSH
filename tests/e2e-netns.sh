@@ -211,7 +211,7 @@ RID=$(bear -H 'Content-Type: application/json' -d '{"account":"alice","from":"*"
 [[ $(curl_ -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tc-admin-wrong' https://127.0.0.1/api/v1/machines) == 401 ]] || fail "API: wrong token accepted"
 pass "admin HTTP API: bearer token from tc-control admin-token, /api/v1 status, rule created and deleted, wrong token refused"
 
-NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=D
+NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=D NS_internet=I
 start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"
     # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
@@ -456,11 +456,19 @@ SEEN=$(web charlie 203.0.113.10)
 [[ "$SEEN" == 203.0.113.1 ]] || fail "charlie's traffic through the shared exit node: web sees '$SEEN'"
 ANS=$(on charlie dig +short +time=2 +tries=2 @100.100.100.100 web.example A)
 [[ "$ANS" == 203.0.113.10 ]] || fail "DNS through the shared exit node: web.example -> '$ANS'"
+# Not the exit node's own network: bravo's address on alpha's link, and an
+# IPv6 address on alpha's "internet" link (alpha's own subnet).
+serve_tcp bravo 10.99.0.2 9100
+serve_tcp internet 2001:db8:1::10 9100
+sleep 0.5
+can_tcp bravo 10.99.0.2 9100 || fail "test server on bravo's 10.99.0.2 not up"
+if can_tcp charlie 10.99.0.2 9100; then fail "charlie (another account) reached a private address through the shared exit node"; fi
+if can_tcp charlie 2001:db8:1::10 9100; then fail "charlie reached the exit node's own IPv6 subnet through the shared exit node"; fi
 tc_ charlie up --exit-node "" >/dev/null
 ctl shares exit "$SID" off >/dev/null
 ctl shares ports "$SID" tcp:9001 >/dev/null
 wait_status_not charlie "alpha.richard.*exit node" "charlie still offered alpha after the share's exit option was turned off"
-pass "a share can offer an exit node to another account (all ports and the option needed)"
+pass "a share can offer an exit node to another account (all ports and the option needed), for the internet only: not the exit node's private or IPv6 subnets"
 
 ctl nodes exit-node alpha.richard off >/dev/null
 wait_status bravo "goes direct" "bravo didn't fall back when alpha stopped being an exit node"

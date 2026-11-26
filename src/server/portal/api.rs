@@ -440,6 +440,17 @@ fn own_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, 
 /// account's, operators included (sharing what was shared with you, or a
 /// tenant's machine, would hand out access its owner didn't give); only the
 /// admin token, which has no account, may share any machine.
+/// May `me` change what a share of account `owner`'s machine grants (its
+/// ports, the exit option)? Only that account, or the admin token (no
+/// account), as for creating it ([`shareable_node`]). Operators may still
+/// see and revoke any share.
+fn may_change_share(me: &Me, owner: i64) -> bool {
+    match me.account_id() {
+        Some(a) => a == owner,
+        None => me.operator,
+    }
+}
+
 fn shareable_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, ApiError> {
     let n = own_node(p, me, id)?;
     match me.account_id() {
@@ -781,6 +792,7 @@ async fn shares(State(p): P, me: Me) -> ApiResult {
             "id": s.id, "node_id": s.node_id, "machine": format!("{}.{}", s.node, s.owner),
             "owner": s.owner, "account": s.account, "ports": s.ports, "exit": s.exit,
             "status": if s.accepted { "active" } else { "pending" }, "created": s.created,
+            "editable": may_change_share(&me, s.owner_id),
         })
     };
     let all = db.shares()?;
@@ -855,6 +867,12 @@ async fn share_ports(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<Por
     if !me.may(s.owner_id) {
         return Err(ApiError::not_found());
     }
+    if !may_change_share(&me, s.owner_id) {
+        return Err(ApiError::bad(format!(
+            "only account {} can change what its share grants",
+            s.owner
+        )));
+    }
     let ports = db.set_share_ports(id, ports_or_all(&b.ports))?;
     ok(json!({ "ports": ports }))
 }
@@ -870,6 +888,12 @@ async fn share_exit(State(p): P, me: Me, Path(id): Path<i64>, Json(b): Json<On>)
     let s = db.share(id).map_err(|_| ApiError::not_found())?;
     if !me.may(s.owner_id) {
         return Err(ApiError::not_found());
+    }
+    if !may_change_share(&me, s.owner_id) {
+        return Err(ApiError::bad(format!(
+            "only account {} can change what its share grants",
+            s.owner
+        )));
     }
     db.set_share_exit(id, b.on)?;
     ok(json!({ "exit": b.on }))

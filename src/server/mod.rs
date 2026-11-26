@@ -57,7 +57,7 @@ pub struct Options {
     /// Refuse plain SSH (and the old `tc-ssh/1` ALPN): only clients whose
     /// opening request proves they know the hub's key or an auth key get
     /// SSH, so probing finds only the web portal. Machines' direct ports do
-    /// the same. Needs every machine on 0.4.0 or later.
+    /// the same. Needs every machine on 0.4.1 or later, connected once since (for the network secret).
     pub hide_ssh: bool,
 }
 
@@ -98,6 +98,8 @@ pub struct Hub {
     traffic: Mutex<HashMap<Ipv4Addr, TrafficReport>>,
     /// See [`Options::hide_ssh`].
     hide_ssh: bool,
+    /// Opens the hub and direct ports; sent to machines in `Welcome`.
+    network_secret: String,
 }
 
 /// A machine's latest traffic report, with speeds from the one before.
@@ -351,6 +353,19 @@ pub async fn run(opts: Options) -> Result<()> {
     info!("SSH host key: {}", key_id(host_key.public_key()));
     info!("TLS certificate SHA-256: {}", opts.tls.fingerprint);
 
+    // What opens the hub: the network secret, made once and given to every
+    // machine; the host key only while plain SSH is open anyway.
+    let network_secret = match db.setting("network_secret")? {
+        Some(s) if crate::knock::secret_for_network(&s).is_some() => s,
+        _ => {
+            let s = crate::knock::new_network_secret();
+            db.set_setting("network_secret", &s)?;
+            s
+        }
+    };
+    let net_secret = crate::knock::secret_for_network(&network_secret).expect("just checked");
+    let host_secret = (!opts.hide_ssh).then(|| crate::knock::secret_for_key(&key_id(host_key.public_key())));
+
     let hub = Arc::new(Hub {
         db: Mutex::new(db),
         domain: opts.domain.clone(),
@@ -360,12 +375,12 @@ pub async fn run(opts: Options) -> Result<()> {
         snapshot: RwLock::new(Arc::default()),
         traffic: Mutex::new(HashMap::new()),
         hide_ssh: opts.hide_ssh,
+        network_secret: network_secret.clone(),
     });
     hub.refresh()?;
     tokio::spawn(hub.clone().watch_db());
     tokio::spawn(hub.clone().remove_ephemeral(opts.ephemeral_timeout));
 
-    let host_secret = crate::knock::secret_for_key(&key_id(host_key.public_key()));
     let ssh = transport::server_ssh_config(host_key);
     let portal = match &opts.portal {
         Some(po) => Some(start_portal(&hub, &opts, po).await?),
@@ -447,7 +462,8 @@ pub async fn run(opts: Options) -> Result<()> {
                 let exporter = crate::knock::exporter(tls.get_ref().1);
                 let check = |k: &str| {
                     let Some(e) = exporter else { return false };
-                    if crate::knock::proof(&host_secret, &e) == k {
+                    let proof = |s: &crate::knock::Secret| crate::knock::proof(s, &e) == k;
+                    if proof(&net_secret) || host_secret.as_ref().is_some_and(proof) {
                         return true;
                     }
                     // Joining: the auth key it was given.
@@ -743,6 +759,7 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
                         domain: hub.domain.clone(),
                         prefix_len: crate::TAILNET_PREFIX,
                         hide_ssh: hub.hide_ssh,
+                        network_secret: Some(hub.network_secret.clone()),
                     };
                     if tx.send(Frame::control(&w)).await.is_err() {
                         break;
@@ -827,6 +844,7 @@ mod tests {
             snapshot: RwLock::new(Arc::default()),
             traffic: Mutex::new(HashMap::new()),
             hide_ssh: false,
+            network_secret: String::new(),
         }
     }
 

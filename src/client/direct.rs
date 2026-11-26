@@ -38,8 +38,9 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
     let ssh = transport::server_ssh_config((*d.key).clone());
     let dw = Arc::downgrade(&d);
     let policy: KeyPolicy = Arc::new(move |k| dw.upgrade().is_some_and(|d| d.peer_ip_by_key(&key_id(k)).is_some()));
-    // Peers open with a proof that they know our key (from their map).
-    let secret = crate::knock::secret_for_key(&d.my_key);
+    // Peers open with a proof that they know the network secret, or, if
+    // they haven't got it yet and SSH isn't hidden, our key (from their map).
+    let own_secret = crate::knock::secret_for_key(&d.my_key);
     loop {
         let (tcp, addr) = listener.accept().await?;
         // Replies on accepted sessions must use the real network too, not an
@@ -48,9 +49,21 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
         crate::transport::fail_fast(&tcp);
         let (d, tls, ssh, policy) = (d.clone(), tls.clone(), ssh.clone(), policy.clone());
         tokio::spawn(async move {
-            let admit = || transport::Admit {
-                secret,
-                hide_ssh: d.state.lock().unwrap().hide_ssh,
+            let admit = || {
+                let st = d.state.lock().unwrap();
+                let mut secrets: Vec<_> = st
+                    .network_secret
+                    .as_deref()
+                    .and_then(crate::knock::secret_for_network)
+                    .into_iter()
+                    .collect();
+                if !st.hide_ssh {
+                    secrets.push(own_secret);
+                }
+                transport::Admit {
+                    secrets,
+                    hide_ssh: st.hide_ssh,
+                }
             };
             match transport::accept(tcp, tls, ssh, policy, admit).await {
                 Ok(conn) => {
@@ -101,6 +114,13 @@ async fn dial(d: Arc<Daemon>, n: Node) {
     let Ok(tls) = crate::tls::client_config(crate::tls::Verify::Any) else {
         return;
     };
+    let open = d
+        .state
+        .lock()
+        .unwrap()
+        .network_secret
+        .as_deref()
+        .and_then(crate::knock::secret_for_network);
     for ep in &n.endpoints {
         // Never a tunnel address (IPv4 or IPv6): that would be a "direct"
         // session running inside the tunnel itself.
@@ -117,7 +137,7 @@ async fn dial(d: Arc<Daemon>, n: Node) {
             "peer",
             HostKey::Pinned(n.key.clone()),
             Duration::from_secs(3),
-            Some(crate::knock::secret_for_key(&n.key)),
+            Some(open.unwrap_or_else(|| crate::knock::secret_for_key(&n.key))),
         )
         .await;
         match r {

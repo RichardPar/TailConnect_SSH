@@ -104,6 +104,10 @@ pub enum ServerMsg {
         /// plain SSH too, and take only the opening request.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         hide_ssh: bool,
+        /// The network secret that opens the hub and direct ports (see
+        /// [`crate::knock`]), hex. Machines keep it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_secret: Option<String>,
     },
     /// The full list of peers. Sent after `Welcome` and whenever it changes.
     NetMap {

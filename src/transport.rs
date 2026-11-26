@@ -571,10 +571,10 @@ impl ServerConn {
 }
 
 /// How a direct listener lets clients in.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Admit {
-    /// The secret for the opening request: the listener's own key id.
-    pub secret: crate::knock::Secret,
+    /// The secrets an opening request may prove (see [`crate::knock`]).
+    pub secrets: Vec<crate::knock::Secret>,
     /// Refuse plain SSH (older clients), as the hub says (`--hide-ssh`).
     pub hide_ssh: bool,
 }
@@ -595,7 +595,7 @@ pub async fn accept(
         let exporter = crate::knock::exporter(tls.get_ref().1);
         let admit = admit();
         let first = read_first(&mut tls, |k| {
-            exporter.is_some_and(|e| crate::knock::proof(&admit.secret, &e) == k)
+            exporter.is_some_and(|e| admit.secrets.iter().any(|s| crate::knock::proof(s, &e) == k))
         })
         .await?;
         let rest = match first {
@@ -850,7 +850,7 @@ mod tests {
                         }
                     } else {
                         let admit = Admit {
-                            secret,
+                            secrets: vec![secret],
                             hide_ssh: mode == Mode::Hidden,
                         };
                         accept(tcp, tls, ssh, policy, move || admit).await

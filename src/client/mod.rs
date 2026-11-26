@@ -76,6 +76,10 @@ struct State {
     /// so it does from the start, before the hub says so again.
     #[serde(default)]
     hide_ssh: bool,
+    /// The hub's network secret (hex), which opens it and peers' direct
+    /// ports (see [`crate::knock`]).
+    #[serde(default)]
+    network_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +186,10 @@ pub struct Daemon {
     dns_pending: Mutex<exit::Pending>,
     /// The hub's addresses from the last successful lookup.
     hub_addrs: Mutex<Vec<SocketAddr>>,
+    /// This machine's own IPv6 subnets (its interfaces' prefixes), and when
+    /// they were read: as an exit node, other accounts' machines may not
+    /// reach them. Read again after a few seconds.
+    local_subnets: Mutex<(Option<Instant>, Vec<Prefix>)>,
     next_link: AtomicU64,
     /// Inside the Android app: the bridge to its VpnService.
     #[cfg(unix)]
@@ -230,6 +238,7 @@ impl Daemon {
             run: Mutex::new(None),
             map_changed: Notify::new(),
             next_link: AtomicU64::new(1),
+            local_subnets: Mutex::new((None, Vec::new())),
             e2e,
             filter: Mutex::new(Default::default()),
             traffic: Mutex::new(HashMap::new()),
@@ -481,13 +490,15 @@ impl Daemon {
                 cached
             }
         };
-        // The opening request's secret: the hub's key once pinned, else the
-        // auth key we're joining with.
-        let open = match (&st.server_host_key, auth_key.as_deref()) {
-            (Some(k), _) => Some(crate::knock::secret_for_key(k)),
-            (None, Some(a)) => Some(crate::knock::secret_for_auth_key(a)),
-            (None, None) => None,
-        };
+        // The opening request's secret: the network secret once given,
+        // else the auth key we're joining with, else (from an older hub)
+        // its pinned key.
+        let open = st
+            .network_secret
+            .as_deref()
+            .and_then(crate::knock::secret_for_network)
+            .or_else(|| auth_key.as_deref().map(crate::knock::secret_for_auth_key))
+            .or_else(|| st.server_host_key.as_deref().map(crate::knock::secret_for_key));
         let mut last = anyhow!("{host} has no addresses");
         let mut conn = None;
         for a in addrs {
@@ -645,15 +656,23 @@ impl Daemon {
                     domain,
                     prefix_len,
                     hide_ssh,
+                    network_secret,
                 } => {
                     info!("joined as {}.{} ({}) in {domain}", node.name, node.account, node.ip);
-                    let changed = {
+                    let (hide_changed, changed) = {
                         let mut st = self.state.lock().unwrap();
-                        let c = st.hide_ssh != hide_ssh;
+                        let h = st.hide_ssh != hide_ssh;
                         st.hide_ssh = hide_ssh;
-                        c
+                        let s = network_secret.is_some() && st.network_secret != network_secret;
+                        if s {
+                            st.network_secret = network_secret;
+                        }
+                        (h, h || s)
                     };
                     if changed {
+                        self.save_state();
+                    }
+                    if hide_changed {
                         info!(
                             "direct port: {}",
                             if hide_ssh {
@@ -662,7 +681,6 @@ impl Daemon {
                                 "plain SSH accepted"
                             }
                         );
-                        self.save_state();
                     }
                     *auth_key = None;
                     {
@@ -804,6 +822,32 @@ impl Daemon {
             p.node.exit_client
                 || (p.node.account == me.account && crate::acl::Access::from_wire(&p.node.inbound).is_all())
         })
+    }
+
+    /// May `via`, using this machine as its exit node, send to `dst`? This
+    /// account's machines: anywhere, as before. Other accounts' machines (a
+    /// share that offers the exit node) only the internet: no private,
+    /// link-local or other special addresses, and none of this machine's own
+    /// IPv6 subnets (a LAN's global prefix), so a shared exit node doesn't
+    /// open the owner's home network. (A LAN's IPv4 addresses are private;
+    /// a public IPv4 subnet, a server's neighbours, is the internet.)
+    fn exit_may_reach(&self, via: Ipv4Addr, dst: IpAddr) -> bool {
+        let own = {
+            let net = self.net.read().unwrap();
+            let Some(me) = &net.me else { return false };
+            net.peers.get(&via).is_some_and(|p| p.node.account == me.account)
+        };
+        if own {
+            return true;
+        }
+        if !is_internet(dst) {
+            return false;
+        }
+        let mut cache = self.local_subnets.lock().unwrap();
+        if cache.0.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            *cache = (Some(Instant::now()), local_subnets());
+        }
+        !cache.1.iter().any(|&(net, len)| in_prefix(dst, net, len))
     }
 
     /// Use the chosen exit node if it's offered and online; otherwise go
@@ -1306,6 +1350,7 @@ impl Daemon {
                 && dst != IpAddr::V4(crate::MAGIC_DNS_IP)
                 && !matches!(dst, IpAddr::V6(v6) if crate::in_tailnet6(v6))
                 && self.may_use_me_as_exit(via)
+                && self.exit_may_reach(via, dst)
         };
         if !ok {
             debug!("dropping packet {src} -> {dst} (via {via})");
@@ -1584,6 +1629,74 @@ fn desktop_change(
     }
 }
 
+/// An address prefix: network address and length.
+type Prefix = (IpAddr, u8);
+
+/// The IPv6 prefixes of this machine's interfaces.
+fn local_subnets() -> Vec<Prefix> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(_) => None,
+            if_addrs::IfAddr::V6(a) => Some((IpAddr::V6(a.ip), a.prefixlen)),
+        })
+        .collect()
+}
+
+/// Is `ip` within `net`/`len`?
+fn in_prefix(ip: IpAddr, net: IpAddr, len: u8) -> bool {
+    match (ip, net) {
+        (IpAddr::V4(a), IpAddr::V4(n)) => {
+            let m = u32::MAX.checked_shl(32 - len.min(32) as u32).unwrap_or(0);
+            u32::from(a) & m == u32::from(n) & m
+        }
+        (IpAddr::V6(a), IpAddr::V6(n)) => {
+            let m = u128::MAX.checked_shl(128 - len.min(128) as u32).unwrap_or(0);
+            u128::from(a) & m == u128::from(n) & m
+        }
+        _ => false,
+    }
+}
+
+/// Is `ip` an ordinary internet address: not private, shared (CGNAT, the
+/// tailnet), loopback, link-local, multicast or otherwise reserved for
+/// local use? (Documentation ranges pass: they're routed nowhere, and the
+/// tests use them as "the internet".) IPv6 addresses that embed IPv4
+/// (mapped, NAT64) are judged by that IPv4 address.
+fn is_internet(ip: IpAddr) -> bool {
+    const V4: &[(Ipv4Addr, u8)] = &[
+        (Ipv4Addr::new(0, 0, 0, 0), 8),
+        (Ipv4Addr::new(10, 0, 0, 0), 8),
+        (Ipv4Addr::new(100, 64, 0, 0), 10),
+        (Ipv4Addr::new(127, 0, 0, 0), 8),
+        (Ipv4Addr::new(169, 254, 0, 0), 16),
+        (Ipv4Addr::new(172, 16, 0, 0), 12),
+        (Ipv4Addr::new(192, 0, 0, 0), 24),
+        (Ipv4Addr::new(192, 88, 99, 0), 24),
+        (Ipv4Addr::new(192, 168, 0, 0), 16),
+        (Ipv4Addr::new(198, 18, 0, 0), 15),
+        (Ipv4Addr::new(224, 0, 0, 0), 4),
+        (Ipv4Addr::new(240, 0, 0, 0), 4),
+    ];
+    match ip {
+        IpAddr::V4(_) => !V4.iter().any(|&(n, l)| in_prefix(ip, IpAddr::V4(n), l)),
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_internet(IpAddr::V4(v4));
+            }
+            let s = a.segments();
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+                let o = a.octets();
+                return is_internet(IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15])));
+            }
+            // Global unicast is 2000::/3, less IANA's special-purpose
+            // 2001::/23 (Teredo, benchmarking, ORCHID).
+            (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && s[1] < 0x0200)
+        }
+    }
+}
+
 /// This machine's network, from its interfaces' usable addresses.
 fn local_network() -> netchange::Network {
     let mut addrs: Vec<(IpAddr, u8)> = if_addrs::get_if_addrs()
@@ -1727,7 +1840,50 @@ fn scopeguard<F: FnOnce()>(f: F) -> impl Drop {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_server;
+    use super::{in_prefix, is_internet, parse_server};
+    use std::net::IpAddr;
+
+    #[test]
+    fn only_internet_addresses_for_other_accounts() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for a in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "146.70.175.94",
+            "2a00:1450:4009:81f::200e",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+        ] {
+            assert!(is_internet(ip(a)), "{a}");
+        }
+        for a in [
+            "192.168.10.131",
+            "10.0.0.1",
+            "172.20.1.1",
+            "100.64.0.5",
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.251",
+            "255.255.255.255",
+            "fd74:6373:7368::1",
+            "fe80::1",
+            "::1",
+            "ff02::1",
+            "2001:2::1",
+            "::ffff:192.168.1.1",
+            "64:ff9b::c0a8:0101",
+            "::",
+        ] {
+            assert!(!is_internet(ip(a)), "{a}");
+        }
+        assert!(in_prefix(ip("192.168.10.200"), ip("192.168.10.109"), 24));
+        assert!(!in_prefix(ip("192.168.11.1"), ip("192.168.10.109"), 24));
+        assert!(in_prefix(ip("2a02:c7c:1234:5600::9"), ip("2a02:c7c:1234:5600::1"), 64));
+        assert!(!in_prefix(ip("2a02:c7c:1234:5601::9"), ip("2a02:c7c:1234:5600::1"), 64));
+        assert!(in_prefix(ip("1.2.3.4"), ip("9.9.9.9"), 0));
+        assert!(!in_prefix(ip("1.2.3.4"), ip("::1"), 0));
+    }
 
     #[test]
     fn desktop_network_changes() {

@@ -60,6 +60,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     let limit = match kind {
         PACKET => MAX_PACKET,
         SEALED => MAX_PACKET + 64,
+        // Filler is at most a few KiB (see `padded_len`).
+        PAD => 64 << 10,
         _ => MAX_FRAME,
     };
     if len > limit {
