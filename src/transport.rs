@@ -1,13 +1,16 @@
 //! SSH-inside-TLS connections.
 //!
-//! Dialling: TCP → TLS (ALPN `h2, http/1.1`, like a browser) → SSH,
+//! Dialling: TCP → TLS (ALPN `h2, http/1.1`, like a browser) → the opening
+//! request that proves the client may connect ([`crate::knock`]) → SSH,
 //! public-key auth with the machine key → one session channel used as a byte
-//! stream for frames. A server from before SSH sniffing turns that ALPN down,
-//! so a failed handshake is tried once more offering `tc-ssh/1`.
+//! stream for frames. Older servers are met halfway: one that answers the
+//! opening request as a web server gets SSH straight after TLS, and one from
+//! before SSH sniffing (it turns the browser ALPN down) gets `tc-ssh/1`.
 //!
 //! Accepting: the reverse, with the SSH public key the client proved it holds
 //! handed to the caller as its identity. Servers send nothing until the
-//! client has: its first bytes (`SSH-`, or an HTTP request) say which it is.
+//! client has: its first bytes (the opening request, `SSH-` from an older
+//! client, or anything else) say which it is.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -26,11 +29,14 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::keys::key_id;
 
-/// Seconds between SSH keepalives on an idle connection. A connection that
-/// misses three is dead: with 5 s that's noticed in 15–20 s, so a failed
-/// link (the Wi-Fi gone, a dead uplink) moves to another path quickly. The
-/// Android app sets 10 s (fewer wake-ups of a phone's radio; Android tells
-/// it about network changes anyway).
+/// Average seconds between SSH keepalives. The dialling side sends them at
+/// random intervals around this (0.6–1.4 times it), so an idle link has no
+/// regular beat for traffic analysis to pick out, and treats a connection
+/// whose keepalive goes unanswered for two intervals as dead: with 5 s
+/// that's noticed in about 15 s, so a failed link (the Wi-Fi gone, a dead
+/// uplink) moves to another path quickly. The Android app sets 10 s (fewer
+/// wake-ups of a phone's radio; Android tells it about network changes
+/// anyway).
 pub static KEEPALIVE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5);
 
 fn keepalive() -> Duration {
@@ -70,7 +76,7 @@ impl client::Handler for ClientHandler {
 
 /// A live client connection. Keep `handle` alive as long as `stream` is used.
 pub struct ClientConn {
-    pub handle: client::Handle<ClientHandler>,
+    pub handle: Arc<client::Handle<ClientHandler>>,
     pub stream: ChannelStream<client::Msg>,
     /// The server's SSH host key id, as verified.
     pub host_key: String,
@@ -92,24 +98,28 @@ fn preferred() -> russh::Preferred {
     }
 }
 
+/// The client sends its own keepalives (see [`keep_alive`]).
 fn client_ssh_config() -> Arc<client::Config> {
     Arc::new(client::Config {
         preferred: preferred(),
-        inactivity_timeout: Some(keepalive() * 4),
-        keepalive_interval: Some(keepalive()),
-        keepalive_max: 3,
+        inactivity_timeout: None,
+        keepalive_interval: None,
         nodelay: true,
         window_size: 8 << 20,
         ..Default::default()
     })
 }
 
+/// A server's own keepalive starts only after three intervals without hearing
+/// from the client, so it stays quiet while the client sends its randomly
+/// timed ones (an older client sends one every interval); two unanswered
+/// ones close the connection.
 pub fn server_ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
     Arc::new(server::Config {
         preferred: preferred(),
-        inactivity_timeout: Some(keepalive() * 4),
-        keepalive_interval: Some(keepalive()),
-        keepalive_max: 3,
+        inactivity_timeout: Some(keepalive() * 8),
+        keepalive_interval: Some(keepalive() * 3),
+        keepalive_max: 2,
         nodelay: true,
         window_size: 8 << 20,
         auth_rejection_time: Duration::from_secs(1),
@@ -191,7 +201,9 @@ pub fn set_mark(_sock: &impl std::os::windows::io::AsRawSocket, _mark: u32) {}
 /// Dial `addr` and bring up SSH-in-TLS.
 ///
 /// `sni` is the TLS server name (a host name, or an IP literal, which sends
-/// no name at all).
+/// no name at all). `open` is the secret for the opening request (see
+/// [`crate::knock`]); `None` goes straight to SSH, as older clients did.
+#[allow(clippy::too_many_arguments)]
 pub async fn dial(
     addr: SocketAddr,
     sni: &str,
@@ -200,9 +212,18 @@ pub async fn dial(
     user: &str,
     host_key: HostKey,
     connect_timeout: Duration,
+    open: Option<crate::knock::Secret>,
 ) -> Result<ClientConn> {
-    let attempt = |config: Arc<rustls::ClientConfig>| {
-        let (key, host_key) = (key.clone(), host_key.clone());
+    // The Host header a browser would send.
+    let host = match (sni.parse::<std::net::IpAddr>().is_ok(), addr.port()) {
+        (true, 443) if addr.is_ipv4() => addr.ip().to_string(),
+        (true, 443) => format!("[{}]", addr.ip()),
+        (true, _) => addr.to_string(),
+        (false, 443) => sni.to_string(),
+        (false, port) => format!("{sni}:{port}"),
+    };
+    let attempt = |config: Arc<rustls::ClientConfig>, open: Option<crate::knock::Secret>| {
+        let (key, host_key, host) = (key.clone(), host_key.clone(), host.clone());
         async move {
             let tcp = tokio::time::timeout(connect_timeout, connect(addr))
                 .await
@@ -212,41 +233,75 @@ pub async fn dial(
             tcp.set_nodelay(true).ok();
             tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
-                handshake_client(tcp, sni, config, key, user, host_key),
+                handshake_client(tcp, sni, &host, config, key, user, host_key, open),
             )
             .await
             .map_err(|_| Failed::other(anyhow!("handshake with {addr} timed out")))
             .and_then(|r| r)
         }
     };
-    match attempt(tls.modern).await {
+    // Each step down is taken only when the server clearly is an older one:
+    // retrying on any failure would put plain SSH, or tc-ssh/1, on the wire
+    // whenever a peer is merely down or refuses us.
+    let mut r = attempt(tls.modern.clone(), open).await;
+    let mut refused = false;
+    if open.is_some()
+        && let Err(Failed {
+            older: Older::NoOpening,
+            error,
+        }) = &r
+    {
+        tracing::debug!("{addr}: {error:#}; an older server, or one that doesn't know us: trying SSH at once");
+        refused = true;
+        r = attempt(tls.modern.clone(), None).await;
+    }
+    let r = match r {
         Ok(c) => Ok(c),
-        // Only a server that is clearly from before SSH sniffing gets the
-        // old ALPN: retrying on any failure would put tc-ssh/1 on the wire
-        // whenever a peer is merely down or refuses us.
         Err(Failed {
-            old_server: true,
+            older: Older::NoSniffing,
             error,
         }) => {
             tracing::debug!("{addr}: {error:#}; an older server, trying the old ALPN");
-            attempt(tls.legacy).await.map_err(|f| f.error)
+            attempt(tls.legacy, None).await.map_err(|f| f.error)
         }
         Err(f) => Err(f.error),
-    }
+    };
+    // A server that hides SSH and doesn't know us fails every step; say so
+    // rather than how the last one failed.
+    r.map_err(|e| {
+        if refused {
+            e.context(format!(
+                "{addr} answered as a plain web server: it doesn't know this machine's key or \
+                 auth key, or it isn't a TailConnect-SSH server"
+            ))
+        } else {
+            e
+        }
+    })
 }
 
-/// A failed dial, and whether the server looked like one from before SSH
-/// sniffing: it refused the browser ALPN (an older peer) or answered SSH
-/// with HTTP (an older hub's portal).
+/// What a failed dial says about the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Older {
+    /// Nothing: it's down, refused us, or failed some other way.
+    No,
+    /// It answered the opening request as a web server: from before it, or
+    /// it doesn't accept our proof.
+    NoOpening,
+    /// It refused the browser ALPN (an older peer) or answered SSH with HTTP
+    /// (an older hub's portal): from before SSH sniffing.
+    NoSniffing,
+}
+
 struct Failed {
-    old_server: bool,
+    older: Older,
     error: anyhow::Error,
 }
 
 impl Failed {
     fn other(error: anyhow::Error) -> Self {
         Failed {
-            old_server: false,
+            older: Older::No,
             error,
         }
     }
@@ -304,24 +359,82 @@ fn refused_alpn(e: &std::io::Error) -> bool {
         })
 }
 
+/// Send the opening request on `tls` and read the answer. Returns the bytes
+/// read after the answer's head (the start of SSH).
+async fn open_client<S: AsyncRead + AsyncWrite + Unpin>(
+    tls: &mut S,
+    host: &str,
+    proof: &str,
+) -> Result<Vec<u8>, Failed> {
+    let io = |e: std::io::Error| Failed::other(anyhow!(e).context("opening request"));
+    tls.write_all(crate::knock::request(host, proof).as_bytes())
+        .await
+        .map_err(io)?;
+    tls.flush().await.map_err(io)?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let end = loop {
+        if let Some(end) = crate::knock::head_end(&buf) {
+            break end;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(Failed {
+                older: Older::NoOpening,
+                error: anyhow!("the server answered the opening request with a long page"),
+            });
+        }
+        let n = tls.read(&mut tmp).await.map_err(io)?;
+        if n == 0 {
+            return Err(Failed::other(anyhow!(
+                "the server closed the connection on the opening request"
+            )));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+    let status = buf.split(|&b| b == b'\n').next().unwrap_or_default();
+    if status.starts_with(b"HTTP/1.1 101 ") {
+        return Ok(buf[end..].to_vec());
+    }
+    let status = String::from_utf8_lossy(status).trim().to_string();
+    Err(Failed {
+        older: if status.starts_with("HTTP/") {
+            Older::NoOpening
+        } else {
+            Older::No
+        },
+        error: anyhow!("the server answered the opening request with {status:?}"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handshake_client(
     tcp: TcpStream,
     sni: &str,
+    host: &str,
     tls: Arc<rustls::ClientConfig>,
     key: Arc<PrivateKey>,
     user: &str,
     host_key: HostKey,
+    open: Option<crate::knock::Secret>,
 ) -> Result<ClientConn, Failed> {
     let name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .context("bad TLS server name")
         .map_err(Failed::other)?;
-    let tls = TlsConnector::from(tls).connect(name, tcp).await.map_err(|e| Failed {
-        old_server: refused_alpn(&e),
+    let mut tls = TlsConnector::from(tls).connect(name, tcp).await.map_err(|e| Failed {
+        older: if refused_alpn(&e) { Older::NoSniffing } else { Older::No },
         error: anyhow!(e).context("TLS handshake"),
     })?;
+    let rest = match open {
+        Some(secret) => {
+            let exporter =
+                crate::knock::exporter(tls.get_ref().1).ok_or_else(|| Failed::other(anyhow!("no TLS exporter")))?;
+            open_client(&mut tls, host, &crate::knock::proof(&secret, &exporter)).await?
+        }
+        None => Vec::new(),
+    };
     let first = Arc::new(Mutex::new(Vec::new()));
     let tls = FirstBytes {
-        inner: tls,
+        inner: Prefixed::new(rest, tls),
         seen: first.clone(),
     };
     let seen = Arc::new(Mutex::new(None));
@@ -338,7 +451,11 @@ async fn handshake_client(
                 return Failed::other(anyhow!("SSH host key changed: expected {want}, server presented {got}"));
             }
             Failed {
-                old_server: first.lock().unwrap().starts_with(b"HTTP/"),
+                older: if open.is_none() && first.lock().unwrap().starts_with(b"HTTP/") {
+                    Older::NoSniffing
+                } else {
+                    Older::No
+                },
                 error: anyhow!("SSH handshake: {e}"),
             }
         })?;
@@ -352,6 +469,8 @@ async fn handshake_client(
         }
         let channel = handle.channel_open_session().await.context("opening SSH channel")?;
         let host_key = seen.lock().unwrap().clone().unwrap_or_default();
+        let handle = Arc::new(handle);
+        tokio::spawn(keep_alive(Arc::downgrade(&handle)));
         Ok(ClientConn {
             handle,
             stream: channel.into_stream(),
@@ -360,6 +479,32 @@ async fn handshake_client(
     }
     .await;
     r.map_err(Failed::other)
+}
+
+/// Send keepalives at random intervals (see [`KEEPALIVE_SECS`]) while the
+/// connection's handle lives, and close the connection when one goes
+/// unanswered for two intervals.
+async fn keep_alive(handle: std::sync::Weak<client::Handle<ClientHandler>>) {
+    loop {
+        let base = keepalive().as_secs_f64();
+        let wait = base * (0.6 + 0.8 * rand::random::<f64>());
+        tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+        let Some(h) = handle.upgrade() else { return };
+        if h.is_closed() {
+            return;
+        }
+        match tokio::time::timeout(keepalive() * 2, h.send_ping()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::debug!("keepalive unanswered; closing the connection");
+                let _ = h
+                    .disconnect(russh::Disconnect::ByApplication, "keepalive timeout", "en")
+                    .await;
+                return;
+            }
+        }
+    }
 }
 
 /// Decides whether an authenticated client key may proceed.
@@ -425,50 +570,102 @@ impl ServerConn {
     }
 }
 
+/// How a direct listener lets clients in.
+#[derive(Clone, Copy)]
+pub struct Admit {
+    /// The secret for the opening request: the listener's own key id.
+    pub secret: crate::knock::Secret,
+    /// Refuse plain SSH (older clients), as the hub says (`--hide-ssh`).
+    pub hide_ssh: bool,
+}
+
 /// Accept TLS then SSH on `tcp`, and wait for the client's session channel.
+/// Anything but an accepted opening request (or, unless `hide_ssh`, plain
+/// SSH) gets a 404, like a web server with nothing there.
 pub async fn accept(
     tcp: TcpStream,
     tls: TlsAcceptor,
     ssh: Arc<server::Config>,
     policy: KeyPolicy,
+    admit: impl FnOnce() -> Admit,
 ) -> Result<ServerConn> {
     tcp.set_nodelay(true).ok();
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async move {
         let mut tls = tls.accept(tcp).await.context("TLS handshake")?;
-        let (is_ssh, first) = sniff_ssh(&mut tls).await?;
-        if !is_ssh {
-            // Look like a web server with nothing here.
-            let _ = tls.write_all(NOT_FOUND).await;
-            let _ = tls.shutdown().await;
-            bail!("not SSH");
-        }
-        accept_ssh(Prefixed::new(first, tls), ssh, policy).await
+        let exporter = crate::knock::exporter(tls.get_ref().1);
+        let admit = admit();
+        let first = read_first(&mut tls, |k| {
+            exporter.is_some_and(|e| crate::knock::proof(&admit.secret, &e) == k)
+        })
+        .await?;
+        let rest = match first {
+            First::Open(rest) => {
+                tls.write_all(crate::knock::accepted().as_bytes()).await?;
+                tls.flush().await?;
+                rest
+            }
+            First::Ssh(b) if !admit.hide_ssh => b,
+            First::Ssh(_) | First::Other(_) => {
+                let _ = tls.write_all(NOT_FOUND).await;
+                let _ = tls.shutdown().await;
+                bail!("not an accepted opening");
+            }
+        };
+        accept_ssh(Prefixed::new(rest, tls), ssh, policy).await
     })
     .await
     .map_err(|_| anyhow!("handshake timed out"))?
 }
 
-/// The reply to anything but SSH on a direct listener.
+/// The reply to anything else on a direct listener.
 pub const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
-/// Read the first bytes the client sends and say whether they start an SSH
-/// session (`SSH-`). Returns the bytes read, which must be replayed (see
-/// [`Prefixed`]). An SSH client sends its version line at once; a browser
-/// sends its request at once.
-pub async fn sniff_ssh<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(bool, Vec<u8>)> {
+/// What a client sent first, after TLS.
+#[derive(Debug, PartialEq, Eq)]
+pub enum First {
+    /// An opening request whose proof was accepted; the bytes after it.
+    Open(Vec<u8>),
+    /// `SSH-` straight away (an older client); the bytes read, to replay.
+    Ssh(Vec<u8>),
+    /// Anything else (a browser, a probe); the bytes read, to replay.
+    Other(Vec<u8>),
+}
+
+/// Read what the client sends first and sort it (see [`First`]). `accept`
+/// checks an opening request's `Sec-WebSocket-Key`. Every client sends at
+/// once: an SSH client its version line, a browser or `tcd` a request.
+pub async fn read_first<S: AsyncRead + Unpin>(s: &mut S, accept: impl FnOnce(&str) -> bool) -> std::io::Result<First> {
     let mut buf = Vec::new();
-    let mut tmp = [0u8; 256];
-    while buf.len() < 4 {
+    let mut tmp = [0u8; 2048];
+    loop {
         let n = s.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Ok(First::Other(buf));
         }
         buf.extend_from_slice(&tmp[..n]);
-        if !b"SSH-".starts_with(&buf[..buf.len().min(4)]) {
-            return Ok((false, buf));
+        let k = buf.len().min(4);
+        let (ssh, get) = (b"SSH-".starts_with(&buf[..k]), b"GET ".starts_with(&buf[..k]));
+        if k < 4 && (ssh || get) {
+            continue;
+        }
+        if ssh {
+            return Ok(First::Ssh(buf));
+        }
+        if !get {
+            return Ok(First::Other(buf));
+        }
+        if let Some(end) = crate::knock::head_end(&buf) {
+            let ok = crate::knock::key_of(&buf[..end]).is_some_and(accept);
+            return Ok(if ok {
+                First::Open(buf[end..].to_vec())
+            } else {
+                First::Other(buf)
+            });
+        }
+        if buf.len() > 16 * 1024 {
+            return Ok(First::Other(buf));
         }
     }
-    Ok((buf.starts_with(b"SSH-"), buf))
 }
 
 /// A stream that first yields `prefix` (bytes already read from it).
@@ -569,67 +766,94 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knock;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     #[tokio::test]
-    async fn sniffs_ssh_and_replays() {
-        for (input, ssh) in [
-            (&b"SSH-2.0-russh\r\n"[..], true),
-            (b"GET / HTTP/1.1\r\n", false),
-            (b"S", false),
-            (b"", false),
+    async fn sorts_the_first_bytes_and_replays() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let open = format!("GET / HTTP/1.1\r\nHost: a\r\nSec-WebSocket-Key: {key}\r\n\r\nSSH-2.0-x\r\n");
+        let wrong = "GET / HTTP/1.1\r\nSec-WebSocket-Key: AAAA\r\n\r\n";
+        for (input, want) in [
+            (&b"SSH-2.0-russh\r\n"[..], First::Ssh(b"SSH-2.0-russh\r\n".to_vec())),
+            (
+                b"GET / HTTP/1.1\r\n\r\n",
+                First::Other(b"GET / HTTP/1.1\r\n\r\n".to_vec()),
+            ),
+            (wrong.as_bytes(), First::Other(wrong.as_bytes().to_vec())),
+            (open.as_bytes(), First::Open(b"SSH-2.0-x\r\n".to_vec())),
+            (b"S", First::Other(b"S".to_vec())),
+            (b"POST /", First::Other(b"POST /".to_vec())),
+            (b"", First::Other(Vec::new())),
         ] {
-            let (mut a, mut b) = tokio::io::duplex(1024);
+            let (mut a, mut b) = tokio::io::duplex(4096);
             a.write_all(input).await.unwrap();
             drop(a);
-            let (is_ssh, first) = sniff_ssh(&mut b).await.unwrap();
-            assert_eq!(is_ssh, ssh, "{input:?}");
-            let mut all = Vec::new();
-            Prefixed::new(first, b).read_to_end(&mut all).await.unwrap();
-            assert_eq!(all, input);
+            let got = read_first(&mut b, |k| k == key).await.unwrap();
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(input));
+            if let First::Other(first) = got {
+                let mut all = Vec::new();
+                Prefixed::new(first, b).read_to_end(&mut all).await.unwrap();
+                assert_eq!(all, input);
+            }
         }
     }
 
     #[tokio::test]
-    async fn sniff_decides_on_a_split_prefix() {
+    async fn waits_for_a_split_opening() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        let t = tokio::spawn(async move { sniff_ssh(&mut b).await.unwrap() });
-        a.write_all(b"SS").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        a.write_all(b"H-2.0").await.unwrap();
-        let (is_ssh, first) = t.await.unwrap();
-        assert!(is_ssh);
-        assert!(first.starts_with(b"SSH-"));
+        let t = tokio::spawn(async move { read_first(&mut b, |k| k == "k").await.unwrap() });
+        for part in [&b"G"[..], b"ET / HTTP/1.1\r\nSec-WebSocket-Key: k\r\n", b"\r\n"] {
+            a.write_all(part).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(t.await.unwrap(), First::Open(Vec::new()));
     }
 
-    /// A server on localhost; `old` makes it behave like one from before
-    /// sniffing (only tc-ssh/1, SSH at once). Counts TLS connections.
-    async fn server(old: bool, allow: bool) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        /// From before SSH sniffing: only tc-ssh/1, SSH at once.
+        Old,
+        /// Takes the opening request, and plain SSH.
+        New,
+        /// Takes only the opening request (`--hide-ssh`).
+        Hidden,
+    }
+
+    /// A server on localhost. Counts TLS connections; returns the secret
+    /// that opens it.
+    async fn server(mode: Mode, allow: bool) -> (SocketAddr, Arc<AtomicUsize>, knock::Secret) {
         use russh::keys::{Algorithm, PrivateKey};
         let host = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let secret = knock::secret_for_key(&key_id(host.public_key()));
         let mut cfg = (*crate::tls::server_ephemeral().unwrap().config).clone();
-        if old {
+        if mode == Mode::Old {
             cfg.alpn_protocols = vec![crate::ALPN.to_vec()];
         }
         let tls = TlsAcceptor::from(Arc::new(cfg));
         let ssh = server_ssh_config(host);
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::new(AtomicUsize::new(0));
         let n2 = n.clone();
         tokio::spawn(async move {
             loop {
                 let (tcp, _) = l.accept().await.unwrap();
-                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                n2.fetch_add(1, SeqCst);
                 let (tls, ssh) = (tls.clone(), ssh.clone());
                 let policy: KeyPolicy = Arc::new(move |_| allow);
                 tokio::spawn(async move {
-                    let r = if old {
+                    let r = if mode == Mode::Old {
                         match tls.accept(tcp).await {
                             Ok(t) => accept_ssh(t, ssh, policy).await,
                             Err(e) => Err(e.into()),
                         }
                     } else {
-                        accept(tcp, tls, ssh, policy).await
+                        let admit = Admit {
+                            secret,
+                            hide_ssh: mode == Mode::Hidden,
+                        };
+                        accept(tcp, tls, ssh, policy, move || admit).await
                     };
                     if let Ok(c) = r {
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -638,10 +862,10 @@ mod tests {
                 });
             }
         });
-        (addr, n)
+        (addr, n, secret)
     }
 
-    async fn try_dial(addr: SocketAddr) -> Result<ClientConn> {
+    async fn try_dial(addr: SocketAddr, open: Option<knock::Secret>) -> Result<ClientConn> {
         use russh::keys::{Algorithm, PrivateKey};
         let key = Arc::new(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
         let tls = crate::tls::client_config(crate::tls::Verify::Any).unwrap();
@@ -653,29 +877,97 @@ mod tests {
             "peer",
             HostKey::Tofu,
             Duration::from_secs(2),
+            open,
         )
         .await
     }
 
     #[tokio::test]
     async fn new_server_needs_one_connection() {
-        let (addr, n) = server(false, true).await;
-        try_dial(addr).await.unwrap();
-        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (addr, n, secret) = server(Mode::New, true).await;
+        try_dial(addr, Some(secret)).await.unwrap();
+        assert_eq!(n.load(SeqCst), 1);
+        // Without a secret: plain SSH, still accepted.
+        try_dial(addr, None).await.unwrap();
+        assert_eq!(n.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_proof_falls_back_to_plain_ssh() {
+        // As with a server from before the opening request (it 404s it).
+        let (addr, n, _) = server(Mode::New, true).await;
+        try_dial(addr, Some([9; 32])).await.unwrap();
+        assert_eq!(n.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hidden_server_takes_only_the_proof() {
+        let (addr, n, secret) = server(Mode::Hidden, true).await;
+        assert!(try_dial(addr, None).await.is_err());
+        assert!(try_dial(addr, Some([9; 32])).await.is_err());
+        let tried = n.load(SeqCst);
+        try_dial(addr, Some(secret)).await.unwrap();
+        assert_eq!(n.load(SeqCst), tried + 1);
     }
 
     #[tokio::test]
     async fn old_server_gets_the_old_alpn() {
-        let (addr, n) = server(true, true).await;
-        try_dial(addr).await.unwrap();
-        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let (addr, n, secret) = server(Mode::Old, true).await;
+        try_dial(addr, Some(secret)).await.unwrap();
+        assert_eq!(n.load(SeqCst), 2);
     }
 
     #[tokio::test]
     async fn refusal_by_a_new_server_is_not_retried() {
-        let (addr, n) = server(false, false).await;
-        assert!(try_dial(addr).await.is_err());
-        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (addr, n, secret) = server(Mode::New, false).await;
+        assert!(try_dial(addr, Some(secret)).await.is_err());
+        assert_eq!(n.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_silent_link_is_closed_by_the_keepalive() {
+        // A proxy that forwards, then goes silent without closing anything:
+        // TCP still acknowledges, so only an unanswered keepalive tells.
+        let (server_addr, _, secret) = server(Mode::New, true).await;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = frozen.clone();
+        tokio::spawn(async move {
+            let (a, _) = l.accept().await.unwrap();
+            let b = TcpStream::connect(server_addr).await.unwrap();
+            let (ar, aw) = a.into_split();
+            let (br, bw) = b.into_split();
+            for (mut r, mut w) in [(ar, bw), (br, aw)] {
+                let f = f2.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if !f.load(SeqCst) {
+                            let _ = w.write_all(&buf[..n]).await;
+                        }
+                    }
+                    // Keep the sockets open.
+                    std::future::pending::<()>().await;
+                    drop(w);
+                });
+            }
+        });
+        let mut conn = try_dial(addr, Some(secret)).await.unwrap();
+        frozen.store(true, SeqCst);
+        let t = std::time::Instant::now();
+        let mut b = [0u8; 16];
+        let r = tokio::time::timeout(Duration::from_secs(30), conn.stream.read(&mut b)).await;
+        assert!(matches!(r, Ok(Ok(0)) | Ok(Err(_))), "{r:?}");
+        // Up to 1.4 intervals to the next keepalive, then 2 for its answer.
+        assert!(
+            t.elapsed() < keepalive().mul_f64(3.4) + Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -686,16 +978,16 @@ mod tests {
         let tls = TlsAcceptor::from(Arc::new(cfg));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::new(AtomicUsize::new(0));
         let n2 = n.clone();
         tokio::spawn(async move {
             loop {
                 let (tcp, _) = l.accept().await.unwrap();
-                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                n2.fetch_add(1, SeqCst);
                 let tls = tls.clone();
                 tokio::spawn(async move {
                     if let Ok(mut t) = tls.accept(tcp).await {
-                        let mut b = [0u8; 64];
+                        let mut b = [0u8; 2048];
                         let _ = t.read(&mut b).await;
                         let _ = t.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                         let _ = t.shutdown().await;
@@ -703,8 +995,8 @@ mod tests {
                 });
             }
         });
-        assert!(try_dial(addr).await.is_err());
-        // The legacy retry happened (and failed: the ALPN is refused).
-        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(try_dial(addr, Some([1; 32])).await.is_err());
+        // The opening request, plain SSH, then the legacy ALPN (refused).
+        assert_eq!(n.load(SeqCst), 3);
     }
 }

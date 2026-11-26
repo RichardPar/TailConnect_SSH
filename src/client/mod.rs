@@ -72,6 +72,10 @@ struct State {
     /// The exit node to send internet traffic through (name or address).
     #[serde(default)]
     exit_node: Option<String>,
+    /// The hub hides SSH (`--hide-ssh`): so does the direct listener. Kept
+    /// so it does from the start, before the hub says so again.
+    #[serde(default)]
+    hide_ssh: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,6 +481,13 @@ impl Daemon {
                 cached
             }
         };
+        // The opening request's secret: the hub's key once pinned, else the
+        // auth key we're joining with.
+        let open = match (&st.server_host_key, auth_key.as_deref()) {
+            (Some(k), _) => Some(crate::knock::secret_for_key(k)),
+            (None, Some(a)) => Some(crate::knock::secret_for_auth_key(a)),
+            (None, None) => None,
+        };
         let mut last = anyhow!("{host} has no addresses");
         let mut conn = None;
         for a in addrs {
@@ -488,6 +499,7 @@ impl Daemon {
                 "tailconnect",
                 host_key.clone(),
                 Duration::from_secs(10),
+                open,
             )
             .await
             {
@@ -632,8 +644,26 @@ impl Daemon {
                     node,
                     domain,
                     prefix_len,
+                    hide_ssh,
                 } => {
                     info!("joined as {}.{} ({}) in {domain}", node.name, node.account, node.ip);
+                    let changed = {
+                        let mut st = self.state.lock().unwrap();
+                        let c = st.hide_ssh != hide_ssh;
+                        st.hide_ssh = hide_ssh;
+                        c
+                    };
+                    if changed {
+                        info!(
+                            "direct port: {}",
+                            if hide_ssh {
+                                "plain SSH refused, as the hub does"
+                            } else {
+                                "plain SSH accepted"
+                            }
+                        );
+                        self.save_state();
+                    }
                     *auth_key = None;
                     {
                         let mut net = self.net.write().unwrap();

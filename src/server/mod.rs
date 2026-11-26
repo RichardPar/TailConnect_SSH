@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
@@ -53,6 +54,11 @@ pub struct Options {
     pub ephemeral_timeout: i64,
     /// Domains tenants may choose for their account must end in one of these.
     pub tenant_domain_suffixes: Vec<String>,
+    /// Refuse plain SSH (and the old `tc-ssh/1` ALPN): only clients whose
+    /// opening request proves they know the hub's key or an auth key get
+    /// SSH, so probing finds only the web portal. Machines' direct ports do
+    /// the same. Needs every machine on 0.4.0 or later.
+    pub hide_ssh: bool,
 }
 
 pub struct PortalOptions {
@@ -90,6 +96,8 @@ pub struct Hub {
     snapshot: RwLock<Arc<policy::Snapshot>>,
     /// The latest traffic report of each machine, by address. In memory only.
     traffic: Mutex<HashMap<Ipv4Addr, TrafficReport>>,
+    /// See [`Options::hide_ssh`].
+    hide_ssh: bool,
 }
 
 /// A machine's latest traffic report, with speeds from the one before.
@@ -351,20 +359,25 @@ pub async fn run(opts: Options) -> Result<()> {
         next_conn: AtomicU64::new(1),
         snapshot: RwLock::new(Arc::default()),
         traffic: Mutex::new(HashMap::new()),
+        hide_ssh: opts.hide_ssh,
     });
     hub.refresh()?;
     tokio::spawn(hub.clone().watch_db());
     tokio::spawn(hub.clone().remove_ephemeral(opts.ephemeral_timeout));
 
+    let host_secret = crate::knock::secret_for_key(&key_id(host_key.public_key()));
     let ssh = transport::server_ssh_config(host_key);
     let portal = match &opts.portal {
         Some(po) => Some(start_portal(&hub, &opts, po).await?),
         None => None,
     };
-    // ALPN: tcd and browsers ask for http/1.1 (older tcd for tc-ssh/1),
-    // ACME validators for acme-tls/1. h2 isn't offered, so a client offering
-    // both gets http/1.1.
-    let mut alpn = vec![crate::tls::ALPN_HTTP.to_vec(), crate::ALPN.to_vec()];
+    // ALPN: tcd and browsers ask for http/1.1 (older tcd for tc-ssh/1,
+    // unless SSH is hidden), ACME validators for acme-tls/1. h2 isn't
+    // offered, so a client offering both gets http/1.1.
+    let mut alpn = vec![crate::tls::ALPN_HTTP.to_vec()];
+    if !opts.hide_ssh {
+        alpn.push(crate::ALPN.to_vec());
+    }
     let tls_config = match &opts.acme {
         None => {
             let mut c = (*opts.tls.config).clone();
@@ -398,10 +411,12 @@ pub async fn run(opts: Options) -> Result<()> {
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
     info!(
-        "listening on {} (SSH inside TLS{})",
+        "listening on {} (SSH inside TLS{}{})",
         opts.listen,
-        if portal.is_some() { ", and the web portal" } else { "" }
+        if portal.is_some() { ", and the web portal" } else { "" },
+        if opts.hide_ssh { "; plain SSH refused" } else { "" }
     );
+    let hide_ssh = opts.hide_ssh;
 
     // Any key may authenticate: unknown keys may only register, with an
     // auth key, in their Hello message.
@@ -423,25 +438,52 @@ pub async fn run(opts: Options) -> Result<()> {
                 return;
             }
             // tcd and browsers both ask for http/1.1 (older tcd for
-            // tc-ssh/1): tcd's first bytes are its SSH version line.
+            // tc-ssh/1): tcd opens with a request that proves it knows the
+            // hub's key or an auth key (older tcd with its SSH version line).
             let mut tls = tls;
             let first = if alpn == Some(crate::ALPN) {
-                Vec::new()
+                transport::First::Ssh(Vec::new())
             } else {
-                match tokio::time::timeout(Duration::from_secs(20), transport::sniff_ssh(&mut tls)).await {
-                    Ok(Ok((true, first))) => first,
-                    Ok(Ok((false, first))) => {
-                        if let Some(router) = portal {
-                            let stream = transport::Prefixed::new(first, tls);
-                            portal::serve_conn(router, stream, portal::ConnInfo { peer, tls: true }).await;
-                        }
-                        return;
+                let exporter = crate::knock::exporter(tls.get_ref().1);
+                let check = |k: &str| {
+                    let Some(e) = exporter else { return false };
+                    if crate::knock::proof(&host_secret, &e) == k {
+                        return true;
                     }
+                    // Joining: the auth key it was given.
+                    let hashes = hub.db.lock().unwrap().authkey_hashes().unwrap_or_default();
+                    hashes
+                        .iter()
+                        .any(|h| crate::knock::proof(&crate::knock::secret_for_auth_key_hash(h), &e) == k)
+                };
+                match tokio::time::timeout(Duration::from_secs(20), transport::read_first(&mut tls, check)).await {
+                    Ok(Ok(f)) => f,
                     Ok(Err(e)) => return debug!("{peer}: {e}"),
                     Err(_) => return debug!("{peer}: nothing sent after TLS"),
                 }
             };
-            let tls = transport::Prefixed::new(first, tls);
+            let rest = match first {
+                transport::First::Open(rest) => {
+                    if let Err(e) = async {
+                        tls.write_all(crate::knock::accepted().as_bytes()).await?;
+                        tls.flush().await
+                    }
+                    .await
+                    {
+                        return debug!("{peer}: {e}");
+                    }
+                    rest
+                }
+                transport::First::Ssh(first) if !hide_ssh => first,
+                transport::First::Ssh(first) | transport::First::Other(first) => {
+                    if let Some(router) = portal {
+                        let stream = transport::Prefixed::new(first, tls);
+                        portal::serve_conn(router, stream, portal::ConnInfo { peer, tls: true }).await;
+                    }
+                    return;
+                }
+            };
+            let tls = transport::Prefixed::new(rest, tls);
             let conn = tokio::time::timeout(Duration::from_secs(20), transport::accept_ssh(tls, ssh, policy)).await;
             match conn {
                 Ok(Ok(conn)) => {
@@ -700,6 +742,7 @@ async fn serve(hub: Arc<Hub>, conn: ServerConn, peer: SocketAddr) -> Result<()> 
                         node: view.me,
                         domain: hub.domain.clone(),
                         prefix_len: crate::TAILNET_PREFIX,
+                        hide_ssh: hub.hide_ssh,
                     };
                     if tx.send(Frame::control(&w)).await.is_err() {
                         break;
@@ -783,6 +826,7 @@ mod tests {
             next_conn: AtomicU64::new(1),
             snapshot: RwLock::new(Arc::default()),
             traffic: Mutex::new(HashMap::new()),
+            hide_ssh: false,
         }
     }
 

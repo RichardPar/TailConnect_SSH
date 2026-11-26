@@ -28,6 +28,10 @@ fi
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${BIN:-$ROOT/target/debug}
+# HIDE_SSH=0: run the hub without --hide-ssh (for an older tc-control in
+# $BIN). BRAVO_TCD=PATH: bravo runs that tcd (an older one, say), to test
+# mixed versions.
+HIDE_SSH=${HIDE_SSH:-1}
 W=$(mktemp -d "${TMPDIR:-/tmp}/tc-e2e.XXXXXX")
 PIDS=()
 cleanup() {
@@ -152,7 +156,8 @@ PIDS+=("$!")
 
 # Hub, with two accounts.
 ctl() { TC_STATE_DIR="$W/hub" "$BIN/tc-control" "$@"; }
-TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test --ephemeral-timeout 6s >"$W/hub.log" 2>&1 &
+TC_STATE_DIR="$W/hub" "$BIN/tc-control" serve --listen 0.0.0.0:443 --domain tc.internal --tls-name hub.test --ephemeral-timeout 6s \
+    $([[ $HIDE_SSH == 1 ]] && echo --hide-ssh) >"$W/hub.log" 2>&1 &
 PIDS+=("$!")
 wait_for 40 grep -q "listening on" "$W/hub.log" || fail "hub did not start"
 FP=$(ctl fingerprint | awk '/TLS fingerprint/ {print $3}')
@@ -161,6 +166,15 @@ echo "$PW" | ctl accounts create richard --operator --password >/dev/null
 ctl accounts create alice >/dev/null
 KR=$(ctl authkey create --account richard --reusable)
 pass "hub up, accounts richard (operator) and alice"
+
+# ---- Probing finds a web server, not SSH (--hide-ssh) ----
+probe() { python3 "$ROOT/tests/probe_tls.py" "$@"; }
+if [[ $HIDE_SSH == 1 ]]; then
+R=$(probe 127.0.0.1 443 h2,http/1.1 ssh); [[ $R == "HTTP/1.1 400"* ]] || fail "SSH probe of the hub got: $R"
+R=$(probe 127.0.0.1 443 tc-ssh/1 ssh); [[ $R == tls-error ]] || fail "the hub still takes tc-ssh/1: $R"
+R=$(probe 127.0.0.1 443 h2,http/1.1 ws); [[ $R == "HTTP/1.1 200"* ]] || fail "WebSocket probe without the proof got: $R"
+pass "probing the hub: SSH gets HTTP 400, tc-ssh/1 refused, an upgrade without the proof gets the portal"
+fi
 
 # ---- Web portal on the same port ----
 JAR="$W/cookies"
@@ -201,7 +215,9 @@ NS_alpha=A NS_bravo=B NS_charlie=C NS_delta=D
 start_tcd() { # name direct_port
     local name=$1 port=$2 ns_var="NS_$1"
     # Traffic reports every 2 seconds instead of 30, so the test needn't wait.
-    local cmd=(env TC_TRAFFIC_INTERVAL=2 "$BIN/tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
+    local tcd="$BIN/tcd"
+    [[ $name == bravo && -n ${BRAVO_TCD:-} ]] && tcd=$BRAVO_TCD
+    local cmd=(env TC_TRAFFIC_INTERVAL=2 "$tcd" --state-dir "$W/$name" --socket "$name.sock" --tun "tc-$name"
         --hostname "$name" --direct-port "$port" --no-dns --exit-dns 203.0.113.10)
     # alpha, the exit node, sends forwarded traffic out through vpn0.
     [[ $name == alpha ]] && cmd+=(--exit-interface vpn0)
@@ -515,6 +531,12 @@ can_tcp charlie "$A" 9001 || fail "charlie -> alpha:9001 over direct path"
 can_tcp charlie "$A" 9000 && fail "charlie reached unshared alpha:9000 over direct path"
 cant_ping alpha "$C" || fail "alpha opened a connection to charlie over direct path"
 pass "direct SSH paths; share limits still enforced on them"
+if [[ $HIDE_SSH == 1 ]]; then
+R=$(probe 127.0.0.1 7443 h2,http/1.1 ssh); [[ $R == "HTTP/1.1 404"* ]] || fail "SSH probe of a direct port got: $R"
+R=$(probe 127.0.0.1 7443 h2,http/1.1 ws); [[ $R == "HTTP/1.1 404"* ]] || fail "WebSocket probe of a direct port got: $R"
+grep -q "direct port: plain SSH refused" "$W/alpha.log" || fail "alpha wasn't told to hide SSH"
+pass "probing a direct port: 404 for SSH and for an upgrade without the proof"
+fi
 wait_status bravo "internet traffic and DNS go through alpha.richard" "bravo's exit node choice not kept across a restart"
 [[ "$(web bravo 203.0.113.10)" == 203.0.113.1 ]] || fail "exit node over the direct path"
 pass "exit node choice kept across restarts; works over the direct path too"

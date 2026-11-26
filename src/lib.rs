@@ -17,6 +17,7 @@ pub mod e2e;
 pub mod filter;
 pub mod frame;
 pub mod keys;
+pub mod knock;
 pub mod packet;
 pub mod proto;
 pub mod server;

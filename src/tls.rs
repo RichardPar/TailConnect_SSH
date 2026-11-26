@@ -55,7 +55,7 @@ pub const ALPN_HTTP: &[u8] = b"http/1.1";
 
 /// What `tcd` offers: the same as a browser, so the ClientHello doesn't name
 /// the protocol. Servers tell SSH from HTTP by the first bytes after TLS
-/// (see [`crate::transport::sniff_ssh`]).
+/// (see [`crate::transport::read_first`]).
 pub const ALPN_CLIENT: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// A server config whose certificate comes from `resolver` (Let's Encrypt).

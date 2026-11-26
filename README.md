@@ -31,16 +31,16 @@ Every connection, to the hub or between machines, is the same stack:
 
 ```mermaid
 flowchart LR
-    TCP["TCP"] --> TLS["TLS<br/>ALPN h2, http/1.1"] --> SSH["SSH<br/>Ed25519 public-key auth"] --> CH["one SSH channel"] --> F["frames<br/>[kind u8][len u32][payload]"]
+    TCP["TCP"] --> TLS["TLS<br/>ALPN h2, http/1.1"] --> OPEN["opening request<br/>WebSocket-style, with a proof"] --> SSH["SSH<br/>Ed25519 public-key auth"] --> CH["one SSH channel"] --> F["frames<br/>[kind u8][len u32][payload]"]
     F --> C["CONTROL: JSON<br/>hello · welcome · netmap · endpoints · traffic"]
     F --> PK["PACKET: raw IP<br/>direct links only"]
     F --> SE["SEALED: 4-byte address + Noise message<br/>relayed by the hub"]
 ```
 
-- **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (offering the ALPN a browser does, `h2, http/1.1`) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames, padded to a few fixed sizes per write so the TLS records don't show the size of each packet: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
+- **Hub (`tc-control`).** Every machine keeps one session to the hub: TCP → TLS (offering the ALPN a browser does, `h2, http/1.1`) → an opening request (see [Web portal](#web-portal)) → SSH public-key auth → one SSH channel. On that channel, both sides exchange frames, padded to a few fixed sizes per write so the TLS records don't show the size of each packet: JSON control messages (hello, welcome, network map) and sealed packets. The hub registers machines with pre-auth keys, gives each an address in `100.64.0.0/10`, pushes the network map whenever it changes, and relays packets between machines with no direct path.
 - **End-to-end encryption of relayed traffic.** Before relaying anything, two machines run a Noise IK handshake (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) through the hub. Every relayed packet is then sealed with ChaCha20-Poly1305. The hub sees only the 4-byte destination address, and tells the receiver which machine sent each message. It never relays plaintext. The receiver checks, by cryptography, that the message came from that machine's key, and that the inner packet's source address is that machine's. Details are in [src/e2e.rs](src/e2e.rs).
 - **Direct paths.** Each `tcd` also listens on port 7443 (TLS + SSH again) and reports its addresses to the hub, which adds the public address it sees. Peers dial each other's endpoints. Each side checks the other's SSH key against the network map, so only machines on the network get in. If the two dial each other at the same moment, both keep the link dialled by the smaller key. When a direct link drops, traffic goes back through the hub straight away, and the daemon dials again. A peer that starts sending through the hub while we still hold a direct link to it has lost that link, so we drop ours too.
-- **Noticing dead connections.** SSH keepalives run every 5 seconds (10 on Android), and on Linux and Android `TCP_USER_TIMEOUT` gives up after two of them unanswered, so a silently dead connection, to the hub or a peer, is noticed in about 15 seconds. Desktops check their outgoing address every 2 seconds and the Android app checks the network every second. On another network, `tcd` drops its direct links and reconnects to the hub at once (retries start at 250 ms); if only the addresses changed, it re-reports its endpoints.
+- **Noticing dead connections.** The dialling side sends SSH keepalives at random intervals of 3–7 seconds (6–14 on Android), so an idle link has no regular beat for traffic analysis to pick out. A keepalive unanswered for 10 seconds (20 on Android) closes the connection, and on Linux and Android `TCP_USER_TIMEOUT` gives up on unacknowledged data as fast, so a silently dead connection, to the hub or a peer, is noticed in about 15 seconds. The accepting side sends its own keepalives only after 15 seconds without hearing from the client. Desktops check their outgoing address every 2 seconds and the Android app checks the network every second. On another network, `tcd` drops its direct links and reconnects to the hub at once (retries start at 250 ms); if only the addresses changed, it re-reports its endpoints.
 - **Machine identity** is an Ed25519 SSH key (`/var/lib/tailconnect-ssh/machine_key`). The hub knows machines by their public key. Clients trust the hub's SSH host key on first use and pin it.
 - **TLS** uses either a trusted certificate (`--tls-cert/--tls-key`, for example from Let's Encrypt) or a self-signed one generated on first start. Clients pin a self-signed certificate by its SHA-256 fingerprint (`--tls-fingerprint`).
 - **MagicDNS.** `tcd` answers DNS at `100.100.100.100`, inside the tunnel, from its own network map. Every machine is `name.account.tc.internal`, and plain `name` works for machines of the same account. `tcd` sets this up through `systemd-resolved` (`resolvectl`) when that's available: `tc.internal` is routed to the tunnel, and the machine's own `account.tc.internal` is its search domain. The resolver also answers `name.account` when asked directly (`dig @100.100.100.100 nas.alice`), but systemd-resolved doesn't apply search domains to names with a dot in them, so applications should use the full name for other accounts' machines.
@@ -53,6 +53,8 @@ sequenceDiagram
     participant M as tcd (new machine)
     participant H as tc-control (hub)
     M->>H: TCP + TLS, ALPN h2/http/1.1 (pins the certificate fingerprint if self-signed)
+    M->>H: opening request, proving it knows the auth key (first time) or the hub's SSH key
+    H-->>M: 101 Switching Protocols
     M->>H: SSH auth with the machine's Ed25519 key
     Note over M,H: client pins the hub's SSH host key on first use
     M->>H: CONTROL hello { hostname, auth key (first time only), endpoints, port 7443 }
@@ -247,7 +249,12 @@ flowchart TD
 
 ### Web portal
 
-The hub serves a web portal on the same port, 443. `tcd` and browsers make the same TLS handshake (both offer `h2, http/1.1`; the hub picks HTTP/1.1), so nothing in it names the protocol. The hub then waits for the client's first bytes: `SSH-` starts a machine session, anything else goes to the portal. Older `tcd` asked for ALPN `tc-ssh/1`, which is still accepted; a new `tcd` falls back to it with an older hub or peer. Direct peer links work the same way, with no server name in the handshake and a plain self-signed certificate; anything but SSH gets a `404`. Open `https://your-hub/` in a browser. With a self-signed certificate the browser warns once: compare the fingerprint `tc-control fingerprint` prints, then accept it.
+The hub serves a web portal on the same port, 443. `tcd` and browsers make the same TLS handshake (both offer `h2, http/1.1`; the hub picks HTTP/1.1), so nothing in it names the protocol. The hub then waits for the client's first bytes:
+
+- **`tcd` opens with a request that looks like a browser's WebSocket upgrade** (about 700 bytes, a usual size for a browser request). Its `Sec-WebSocket-Key` is a proof that the machine knows a secret the hub knows: the hub's SSH host key, pinned at the first connection, or, when joining, the auth key it was given. The proof is bound to the TLS session (an RFC 5705 exporter), so it can't be replayed on another connection. When it checks out, the hub answers `101 Switching Protocols` and SSH runs on the stream. Any other request goes to the portal. Details are in [src/knock.rs](src/knock.rs).
+- **`SSH-` straight away** is how older `tcd` starts, and older ones still ask for ALPN `tc-ssh/1`. Both are accepted, unless the hub runs with **`--hide-ssh`**. Then plain SSH gets the portal's `400 Bad Request` and `tc-ssh/1` is refused in the TLS handshake. So anyone probing the port finds only a web server. Turn it on once every machine runs 0.4.0 or later.
+
+A new `tcd` falls back with an older hub or peer: to plain SSH when its opening request gets an ordinary web page back, then to `tc-ssh/1`. Direct peer links work the same way, with no server name in the handshake and a plain self-signed certificate. There, the proof is of the listening machine's key, from the network map. Anything else gets a `404`, and so does plain SSH while the hub runs with `--hide-ssh` (the hub tells every machine). Open `https://your-hub/` in a browser. With a self-signed certificate the browser warns once: compare the fingerprint `tc-control fingerprint` prints, then accept it.
 
 ```mermaid
 flowchart LR
@@ -255,7 +262,8 @@ flowchart LR
     A -- "acme-tls/1" --> ACME["Let's Encrypt challenge certificate"]
     A -- "tc-ssh/1 (older tcd)" --> SSH["SSH server → machine session"]
     A -- "http/1.1 / none" --> B{"first bytes"}
-    B -- "SSH-" --> SSH
+    B -- "opening request with a valid proof" --> SSH
+    B -- "SSH- (older tcd; not with --hide-ssh)" --> SSH
     B -- "anything else" --> WEB["web portal + /api/v1"]
 ```
 
@@ -417,6 +425,7 @@ Build it on Linux. It needs Rust, Python 3, a JDK 17+ and the Android SDK (build
 
 - **All traffic between machines is end-to-end encrypted.** Direct paths are SSH sessions between the two machines. Relayed traffic is sealed with per-pair Noise sessions that the hub can't read or forge. The hub still sees metadata: which machines talk to each other, when, and how much.
 - **SSH algorithms** are limited to what TailConnect needs, on both ends: Ed25519 keys only; AEAD ciphers only (ChaCha20-Poly1305, AES-256-GCM); no compression; key exchange ML-KEM-768 + X25519 (post-quantum hybrid) first, then X25519, never SHA-1.
+- **What traffic analysis can still see.** Inside TLS there's no protocol name, no per-packet size and no regular keepalive beat, and with `--hide-ssh` a probe finds only a web server. Still visible: the TLS ClientHello is rustls's, not a browser's (its JA3/JA4 fingerprint differs), and a machine keeps one long-lived connection to the hub with traffic both ways.
 - **DuckDNS token.** The hub sends DuckDNS requests, which carry the token in the URL, only over HTTPS (plain HTTP only to this machine, for the tests).
 - **E2E keys.** Each machine's X25519 key is derived from its Ed25519 SSH machine key (the libsodium `ed25519_sk_to_curve25519` conversion). Peers' keys come from the network map, so no second key needs distributing.
 - **Sessions:**
@@ -499,6 +508,7 @@ The command tables below use the binaries' own names (`tc-control`, `tcd`, `tc`)
 | `tc-control fingerprint` | Print the TLS fingerprint and SSH host key |
 | `tc-control serve … [--signup off\|approval\|invite\|open] [--public-url HOST] [--portal-host NAME…] [--portal-listen ADDR] [--no-portal]` | Web portal options |
 | `tc-control serve … [--key-expiry 180d\|never] [--ephemeral-timeout 30m] [--tenant-domain-suffixes internal]` | How long machines stay authorized; when ephemeral machines are removed; which domains accounts may choose |
+| `tc-control serve … --hide-ssh` | Refuse plain SSH on the hub and on machines' direct ports, so a probe finds only a web server (every machine must run 0.4.0 or later) |
 | `tc-control accounts create NAME [--operator] [--password]` / `list` / `passwd NAME` / `role NAME operator\|tenant` / `approve NAME` / `approval NAME on\|off` / `domain NAME DOMAIN\|default` / `suspend NAME` / `activate NAME` / `delete NAME` | Accounts (deleting removes the account's machines, keys, rules and shares); passwords are asked for twice, or read from standard input |
 | `tc-control invites create [--days N]` / `list` / `revoke ID` | Invites for sign-up |
 | `tc-control admin-token` | New admin token for the portal (replaces the old one) |
@@ -543,7 +553,7 @@ flowchart TB
         plat["android.rs · win.rs<br/>platform glue"]
     end
     subgraph shared["shared"]
-        transport["transport.rs · tls.rs"]
+        transport["transport.rs · tls.rs · knock.rs"]
         frame["frame.rs · proto.rs"]
         e2e["e2e.rs<br/>Noise IK"]
         filter["filter.rs · acl.rs"]
@@ -598,7 +608,10 @@ cargo build && tests/android-bridge.sh   # tcd's Android mode, with a fake app, 
 - a tag-based access rule, and that deleting it restores everything;
 - direct SSH paths after a restart, with share limits still enforced on them;
 - that a machine removed by the operator is cut off;
-- the web portal on port 443 beside SSH: signing in, creating the key a machine joins with, tagging, refusing unknown host names and cross-site writes, and sign-up waiting for approval.
+- the web portal on port 443 beside SSH: signing in, creating the key a machine joins with, tagging, refusing unknown host names and cross-site writes, and sign-up waiting for approval;
+- probing, with the hub on `--hide-ssh` (as for the whole run): plain SSH and an upgrade without a valid proof get the portal or a `404`, and `tc-ssh/1` is refused, on the hub and on a direct port ([tests/probe_tls.py](tests/probe_tls.py)).
+
+`HIDE_SSH=0` runs the hub without `--hide-ssh`, and `BRAVO_TCD=PATH` gives bravo another `tcd`. Together with `BIN`, they test mixed versions, for example a 0.3.0 hub, or one 0.3.0 machine among new ones.
 
 ## Status
 

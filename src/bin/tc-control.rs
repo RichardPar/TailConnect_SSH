@@ -132,6 +132,12 @@ enum Cmd {
         /// end in one of these, comma-separated. Operators may set any.
         #[arg(long, default_value = "internal", value_delimiter = ',')]
         tenant_domain_suffixes: Vec<String>,
+        /// Refuse plain SSH: only machines whose opening request proves they
+        /// know this hub's key (or an auth key, when joining) get SSH, so a
+        /// probe finds only the web portal; machines' direct ports follow.
+        /// Every machine must run 0.4.0 or later.
+        #[arg(long)]
+        hide_ssh: bool,
     },
     /// Print the TLS fingerprint and SSH host key clients need to pin.
     Fingerprint,
@@ -830,6 +836,7 @@ async fn main() -> Result<()> {
             key_expiry,
             ephemeral_timeout,
             tenant_domain_suffixes,
+            hide_ssh,
         } => {
             let domain = domain.trim_matches('.').to_ascii_lowercase();
             if domain.is_empty() {
@@ -919,6 +926,7 @@ async fn main() -> Result<()> {
                     .map(|s| s.trim().trim_matches('.').to_ascii_lowercase())
                     .filter(|s| !s.is_empty())
                     .collect(),
+                hide_ssh,
             })
             .await
         }

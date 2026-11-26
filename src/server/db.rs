@@ -919,6 +919,15 @@ impl Db {
         Ok(secret)
     }
 
+    /// The hashes of every auth key, for checking a joining machine's
+    /// opening request (see [`crate::knock`]). Used, expired and revoked
+    /// ones too: their holders then get SSH, and the reason they can't join.
+    pub fn authkey_hashes(&self) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT hash FROM authkeys")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn authkeys(&self) -> Result<Vec<AuthKeyRow>> {
         let mut st = self.conn.prepare(
             "SELECT k.id, a.name, k.prefix, k.reusable, k.expires, k.used, k.revoked, k.created, k.ephemeral, k.preapproved

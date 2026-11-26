@@ -100,6 +100,10 @@ pub enum ServerMsg {
         /// MagicDNS domain (`tc.internal`).
         domain: String,
         prefix_len: u8,
+        /// The hub runs with `--hide-ssh`: direct listeners should refuse
+        /// plain SSH too, and take only the opening request.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hide_ssh: bool,
     },
     /// The full list of peers. Sent after `Welcome` and whenever it changes.
     NetMap {
