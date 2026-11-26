@@ -211,13 +211,13 @@ The window is built only with `--features gui`, which needs GTK 4.14 or later an
 
 A Windows 10 (2004+) or 11 PC joins like any other machine: it gets an address and a name, reaches peers directly or through the hub, and resolves MagicDNS names in every program.
 
-- **Install**: unzip `tailconnect-ssh-VERSION-windows-amd64.zip` and double-click `install.cmd` (or run `tcd install` as administrator). This sets up:
+- **Install**: run `tailconnect-ssh-VERSION-windows-amd64-setup.exe` and accept the Windows prompt. The wizard installs, then offers to open the app. For scripts, run `setup.exe /S`, or unzip the `.zip` and run `install.cmd` (or `tcd install` as administrator). Either way it sets up:
   - `C:\Program Files\TailConnect-SSH` and the **TailConnectSSH** service, which starts with Windows and restarts if it fails;
   - `tcs` on the PATH;
   - firewall rules for peers' direct connections and for the tunnel;
   - the app in the Start menu, at sign-in, and in Settings → Apps.
 
-  Running it again upgrades in place. Settings → Apps → Uninstall runs `tcd uninstall`; add `--purge` to also delete the keys.
+  Running a newer setup.exe upgrades in place. Settings → Apps → Uninstall runs `tcd uninstall`; add `--purge` to also delete the keys.
 - **The app** (`TailConnectSSH.exe`): an icon by the clock (teal, grey or amber, as on Linux) whose right-click menu has the address, Connect/Disconnect, the other machines and the exit node. Left-click opens a small window:
   - a header card in the state's colour, with this PC's name, its address (click to copy) and a Connect switch;
   - the exit node;
@@ -234,10 +234,10 @@ A Windows 10 (2004+) or 11 PC joins like any other machine: it gets an address a
   - keys and the service's log (`tcd.log`) are in `C:\ProgramData\TailConnect-SSH`, readable only by administrators.
 - **Not yet**: being an exit node.
 
-Build the package on Linux (needs `rustup target add x86_64-pc-windows-gnu`, `mingw-w64` and `zip`):
+Build the packages on Linux (needs `rustup target add x86_64-pc-windows-gnu`, `mingw-w64`, `nsis` and `zip`):
 
 ```sh
-packaging/windows/build.sh     # dist/tailconnect-ssh-VERSION-windows-amd64.zip
+packaging/windows/build.sh     # dist/tailconnect-ssh-VERSION-windows-amd64-setup.exe and .zip
 ```
 
 It downloads Wintun once from wintun.net, checks it against a pinned SHA-256, and embeds the app icon in the programs. The programs aren't code-signed, so SmartScreen may warn the first time: choose **More info → Run anyway**.
