@@ -212,7 +212,7 @@ pub async fn dial(
     user: &str,
     host_key: HostKey,
     connect_timeout: Duration,
-    open: Option<crate::knock::Secret>,
+    open: Option<crate::knock::Open>,
 ) -> Result<ClientConn> {
     // The Host header a browser would send.
     let host = match (sni.parse::<std::net::IpAddr>().is_ok(), addr.port()) {
@@ -222,7 +222,7 @@ pub async fn dial(
         (false, 443) => sni.to_string(),
         (false, port) => format!("{sni}:{port}"),
     };
-    let attempt = |config: Arc<rustls::ClientConfig>, open: Option<crate::knock::Secret>| {
+    let attempt = |config: Arc<rustls::ClientConfig>, open: Option<crate::knock::Open>| {
         let (key, host_key, host) = (key.clone(), host_key.clone(), host.clone());
         async move {
             let tcp = tokio::time::timeout(connect_timeout, connect(addr))
@@ -365,9 +365,10 @@ async fn open_client<S: AsyncRead + AsyncWrite + Unpin>(
     tls: &mut S,
     host: &str,
     proof: &str,
+    hint: Option<u32>,
 ) -> Result<Vec<u8>, Failed> {
     let io = |e: std::io::Error| Failed::other(anyhow!(e).context("opening request"));
-    tls.write_all(crate::knock::request(host, proof).as_bytes())
+    tls.write_all(crate::knock::request(host, proof, hint).as_bytes())
         .await
         .map_err(io)?;
     tls.flush().await.map_err(io)?;
@@ -415,7 +416,7 @@ async fn handshake_client(
     key: Arc<PrivateKey>,
     user: &str,
     host_key: HostKey,
-    open: Option<crate::knock::Secret>,
+    open: Option<crate::knock::Open>,
 ) -> Result<ClientConn, Failed> {
     let name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .context("bad TLS server name")
@@ -425,10 +426,10 @@ async fn handshake_client(
         error: anyhow!(e).context("TLS handshake"),
     })?;
     let rest = match open {
-        Some(secret) => {
+        Some(o) => {
             let exporter =
                 crate::knock::exporter(tls.get_ref().1).ok_or_else(|| Failed::other(anyhow!("no TLS exporter")))?;
-            open_client(&mut tls, host, &crate::knock::proof(&secret, &exporter)).await?
+            open_client(&mut tls, host, &crate::knock::proof(&o.secret, &exporter), o.hint).await?
         }
         None => Vec::new(),
     };
@@ -594,7 +595,7 @@ pub async fn accept(
         let mut tls = tls.accept(tcp).await.context("TLS handshake")?;
         let exporter = crate::knock::exporter(tls.get_ref().1);
         let admit = admit();
-        let first = read_first(&mut tls, |k| {
+        let first = read_first(&mut tls, |k, _| {
             exporter.is_some_and(|e| admit.secrets.iter().any(|s| crate::knock::proof(s, &e) == k))
         })
         .await?;
@@ -632,9 +633,12 @@ pub enum First {
 }
 
 /// Read what the client sends first and sort it (see [`First`]). `accept`
-/// checks an opening request's `Sec-WebSocket-Key`. Every client sends at
+/// checks an opening request's `Sec-WebSocket-Key` (with its whole head). Every client sends at
 /// once: an SSH client its version line, a browser or `tcd` a request.
-pub async fn read_first<S: AsyncRead + Unpin>(s: &mut S, accept: impl FnOnce(&str) -> bool) -> std::io::Result<First> {
+pub async fn read_first<S: AsyncRead + Unpin>(
+    s: &mut S,
+    accept: impl FnOnce(&str, &[u8]) -> bool,
+) -> std::io::Result<First> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {
@@ -655,7 +659,8 @@ pub async fn read_first<S: AsyncRead + Unpin>(s: &mut S, accept: impl FnOnce(&st
             return Ok(First::Other(buf));
         }
         if let Some(end) = crate::knock::head_end(&buf) {
-            let ok = crate::knock::key_of(&buf[..end]).is_some_and(accept);
+            let head = &buf[..end];
+            let ok = crate::knock::key_of(head).is_some_and(|k| accept(k, head));
             return Ok(if ok {
                 First::Open(buf[end..].to_vec())
             } else {
@@ -789,7 +794,7 @@ mod tests {
             let (mut a, mut b) = tokio::io::duplex(4096);
             a.write_all(input).await.unwrap();
             drop(a);
-            let got = read_first(&mut b, |k| k == key).await.unwrap();
+            let got = read_first(&mut b, |k, _| k == key).await.unwrap();
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(input));
             if let First::Other(first) = got {
                 let mut all = Vec::new();
@@ -802,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn waits_for_a_split_opening() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        let t = tokio::spawn(async move { read_first(&mut b, |k| k == "k").await.unwrap() });
+        let t = tokio::spawn(async move { read_first(&mut b, |k, _| k == "k").await.unwrap() });
         for part in [&b"G"[..], b"ET / HTTP/1.1\r\nSec-WebSocket-Key: k\r\n", b"\r\n"] {
             a.write_all(part).await.unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -866,6 +871,7 @@ mod tests {
     }
 
     async fn try_dial(addr: SocketAddr, open: Option<knock::Secret>) -> Result<ClientConn> {
+        let open = open.map(knock::Open::with);
         use russh::keys::{Algorithm, PrivateKey};
         let key = Arc::new(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
         let tls = crate::tls::client_config(crate::tls::Verify::Any).unwrap();

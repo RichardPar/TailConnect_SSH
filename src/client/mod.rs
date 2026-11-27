@@ -497,8 +497,13 @@ impl Daemon {
             .network_secret
             .as_deref()
             .and_then(crate::knock::secret_for_network)
-            .or_else(|| auth_key.as_deref().map(crate::knock::secret_for_auth_key))
-            .or_else(|| st.server_host_key.as_deref().map(crate::knock::secret_for_key));
+            .map(crate::knock::Open::with)
+            .or_else(|| auth_key.as_deref().map(crate::knock::Open::auth_key))
+            .or_else(|| {
+                st.server_host_key
+                    .as_deref()
+                    .map(|k| crate::knock::Open::with(crate::knock::secret_for_key(k)))
+            });
         let mut last = anyhow!("{host} has no addresses");
         let mut conn = None;
         for a in addrs {

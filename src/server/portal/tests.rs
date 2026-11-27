@@ -992,3 +992,40 @@ fn join_links() {
         "tailconnect-ssh://join?server=%5Bfd00%3A%3A1%5D%3A443&key=tckey-abc&fp=9aed"
     );
 }
+
+#[tokio::test]
+async fn sizes_and_counts_are_limited() {
+    let t = T::new(Signup::Off);
+    let web = t.db(|db| {
+        let kr = db.create_authkey("alice", true, None).unwrap();
+        db.register("ssh-ed25519 W", "web", &kr).unwrap().id
+    });
+    let ca = t.login("alice").await;
+    // A port list of 65 entries, or 17 tags, is refused; 64 and 16 are fine.
+    let ports = |n: u16| (1..=n).map(|i| format!("tcp:{i}")).collect::<Vec<_>>().join(",");
+    let r = t
+        .post("/api/rules", json!({"from": "*", "to": "*", "ports": ports(65)}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    let r = t
+        .post("/api/rules", json!({"from": "*", "to": "*", "ports": ports(64)}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let tags = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>().join(",");
+    let r = t
+        .post(&format!("/api/machines/{web}/tags"), json!({"tags": tags(17)}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    let r = t
+        .post(&format!("/api/machines/{web}/tags"), json!({"tags": tags(16)}), &ca)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    // At most 100 unused auth keys per account (one exists already).
+    for i in 1..100 {
+        let r = t.post("/api/keys", json!({"expires_hours": 1}), &ca).await;
+        assert_eq!(r.status, StatusCode::OK, "key {i}: {:?}", r.body);
+    }
+    let r = t.post("/api/keys", json!({"expires_hours": 1}), &ca).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    assert!(r.body["error"].as_str().unwrap().contains("at most 100"));
+}

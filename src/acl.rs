@@ -131,6 +131,9 @@ impl Access {
     /// Parse a port spec: `*`, or a comma-separated list.
     pub fn parse(spec: &str) -> Result<Self> {
         let spec = spec.trim();
+        if spec.len() > 4096 {
+            bail!("port list too long");
+        }
         if spec == "*" || spec.eq_ignore_ascii_case("all") {
             return Ok(Access::All);
         }
@@ -140,6 +143,9 @@ impl Access {
                 return Ok(Access::All);
             }
             v.push(part.parse()?);
+            if v.len() > MAX_PORT_ENTRIES {
+                bail!("at most {MAX_PORT_ENTRIES} entries in a port list (use ranges, such as tcp:8000-8100)");
+            }
         }
         if v.is_empty() {
             bail!("empty port spec (use * for everything)");
@@ -245,6 +251,10 @@ impl fmt::Display for Selector {
 
 /// A DNS-label-like name: `a-z0-9-`, 1 to 63 characters, no leading or
 /// trailing `-`. Used for account names, machine names in selectors, tags.
+/// The most entries a port list may have: every machine checks them on
+/// every new connection, and they travel in every network map.
+pub const MAX_PORT_ENTRIES: usize = 64;
+
 pub fn valid_label(s: &str, what: &str) -> Result<String> {
     let s = s.trim().to_ascii_lowercase();
     let ok = !s.is_empty()

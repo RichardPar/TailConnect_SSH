@@ -137,7 +137,9 @@ async fn dial(d: Arc<Daemon>, n: Node) {
             "peer",
             HostKey::Pinned(n.key.clone()),
             Duration::from_secs(3),
-            Some(open.unwrap_or_else(|| crate::knock::secret_for_key(&n.key))),
+            Some(crate::knock::Open::with(
+                open.unwrap_or_else(|| crate::knock::secret_for_key(&n.key)),
+            )),
         )
         .await;
         match r {

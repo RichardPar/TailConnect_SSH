@@ -81,11 +81,55 @@ pub fn proof(secret: &Secret, exporter: &[u8; 32]) -> String {
     base64(&h.finalize()[..16])
 }
 
+/// What a client opens with: the secret it proves, and, when that's an auth
+/// key, a hint of which one (see [`hint_of_auth_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Open {
+    pub secret: Secret,
+    pub hint: Option<u32>,
+}
+
+impl Open {
+    pub fn with(secret: Secret) -> Self {
+        Open { secret, hint: None }
+    }
+
+    /// Joining with `auth_key`.
+    pub fn auth_key(auth_key: &str) -> Self {
+        Open {
+            secret: secret_for_auth_key(auth_key),
+            hint: hint_of_auth_key(auth_key),
+        }
+    }
+}
+
+/// The 8 hex digits after `tckey-`, which the hub stores (and the portal
+/// shows) as the key's prefix: with them, the hub checks only the keys that
+/// start so, not every key it has.
+pub fn hint_of_auth_key(auth_key: &str) -> Option<u32> {
+    let h = auth_key.trim().strip_prefix("tckey-")?.get(..8)?;
+    u32::from_str_radix(h, 16).ok()
+}
+
+/// The stored prefix of the auth keys a hint points to.
+pub fn auth_key_prefix(hint: u32) -> String {
+    format!("tckey-{hint:08x}")
+}
+
+/// The hint in a request head's path (`/?h=XXXXXXXX`), if any.
+pub fn hint_of(head: &[u8]) -> Option<u32> {
+    let line = std::str::from_utf8(head).ok()?.split("\r\n").next()?;
+    let path = line.strip_prefix("GET ")?.split(' ').next()?;
+    let h = path.strip_prefix("/?h=")?;
+    (h.len() == 8).then(|| u32::from_str_radix(h, 16).ok())?
+}
+
 /// The request a client opens with. `host` is the `Host` header (name or
 /// address, with the port unless it's 443).
-pub fn request(host: &str, key: &str) -> String {
+pub fn request(host: &str, key: &str, hint: Option<u32>) -> String {
+    let path = hint.map_or("/".to_string(), |h| format!("/?h={h:08x}"));
     format!(
-        "GET / HTTP/1.1\r\n\
+        "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Connection: Upgrade\r\n\
          Pragma: no-cache\r\n\
@@ -170,7 +214,13 @@ mod tests {
     fn request_carries_the_proof() {
         let e = [7u8; 32];
         let k = proof(&secret_for_key("SHA256:abc"), &e);
-        let req = request("hub.example:8443", &k);
+        let req = request("hub.example:8443", &k, None);
+        assert_eq!(hint_of(req.as_bytes()), None);
+        let req2 = request("hub.example:8443", &k, Some(0x00ab12cd));
+        assert_eq!(hint_of(req2.as_bytes()), Some(0x00ab12cd));
+        assert_eq!(hint_of_auth_key("tckey-00ab12cdffff"), Some(0x00ab12cd));
+        assert_eq!(auth_key_prefix(0x00ab12cd), "tckey-00ab12cd");
+        assert_eq!(hint_of_auth_key("nope"), None);
         let end = head_end(req.as_bytes()).unwrap();
         assert_eq!(end, req.len());
         assert_eq!(key_of(req.as_bytes()), Some(k.as_str()));

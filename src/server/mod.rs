@@ -460,14 +460,23 @@ pub async fn run(opts: Options) -> Result<()> {
                 transport::First::Ssh(Vec::new())
             } else {
                 let exporter = crate::knock::exporter(tls.get_ref().1);
-                let check = |k: &str| {
+                let check = |k: &str, head: &[u8]| {
                     let Some(e) = exporter else { return false };
                     let proof = |s: &crate::knock::Secret| crate::knock::proof(s, &e) == k;
                     if proof(&net_secret) || host_secret.as_ref().is_some_and(proof) {
                         return true;
                     }
-                    // Joining: the auth key it was given.
-                    let hashes = hub.db.lock().unwrap().authkey_hashes().unwrap_or_default();
+                    // Joining: the auth key it was given, which the hint
+                    // narrows down to the few that start the same.
+                    let Some(hint) = crate::knock::hint_of(head) else {
+                        return false;
+                    };
+                    let hashes = hub
+                        .db
+                        .lock()
+                        .unwrap()
+                        .authkey_hashes_with_prefix(&crate::knock::auth_key_prefix(hint))
+                        .unwrap_or_default();
                     hashes
                         .iter()
                         .any(|h| crate::knock::proof(&crate::knock::secret_for_auth_key_hash(h), &e) == k)

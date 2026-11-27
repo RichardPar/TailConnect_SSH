@@ -384,6 +384,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// The most tags a machine may have.
+pub const MAX_TAGS: usize = 16;
+
 fn hash_key(k: &str) -> String {
     hex::encode(Sha256::digest(k.trim().as_bytes()))
 }
@@ -485,6 +488,8 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn)?;
+        // For the opening request's auth-key lookup.
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS authkeys_prefix ON authkeys(prefix)")?;
         Ok(Db {
             conn,
             pool: FULL_POOL,
@@ -871,6 +876,9 @@ impl Db {
         }
         clean.sort();
         clean.dedup();
+        if clean.len() > MAX_TAGS {
+            bail!("at most {MAX_TAGS} tags on a machine");
+        }
         if self
             .conn
             .execute("UPDATE nodes SET tags = ?1 WHERE id = ?2", params![clean.join(","), id])?
@@ -919,12 +927,15 @@ impl Db {
         Ok(secret)
     }
 
-    /// The hashes of every auth key, for checking a joining machine's
-    /// opening request (see [`crate::knock`]). Used, expired and revoked
-    /// ones too: their holders then get SSH, and the reason they can't join.
-    pub fn authkey_hashes(&self) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT hash FROM authkeys")?;
-        let rows = st.query_map([], |r| r.get(0))?;
+    /// The hashes of the auth keys starting with `prefix`, for checking a
+    /// joining machine's opening request (see [`crate::knock`]). Used,
+    /// expired and revoked ones too: their holders then get SSH, and the
+    /// reason they can't join.
+    pub fn authkey_hashes_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT hash FROM authkeys WHERE prefix = ?1 LIMIT 16")?;
+        let rows = st.query_map([prefix], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

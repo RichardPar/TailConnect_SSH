@@ -440,6 +440,21 @@ fn own_node(p: &Portal, me: &Me, id: i64) -> Result<crate::server::db::NodeRow, 
 /// account's, operators included (sharing what was shared with you, or a
 /// tenant's machine, would hand out access its owner didn't give); only the
 /// admin token, which has no account, may share any machine.
+// Per-account limits on what the portal creates, so that one account can't
+// grow the hub's database, or every machine's network map, without bound.
+// (`tc-control` on the hub itself isn't limited.)
+const MAX_KEYS: usize = 100;
+const MAX_RULES: usize = 200;
+const MAX_SHARES: usize = 200;
+const MAX_LINKS: usize = 100;
+
+fn limit(have: usize, max: usize, what: &str) -> Result<(), ApiError> {
+    if have >= max {
+        return Err(ApiError::bad(format!("at most {max} {what}")));
+    }
+    Ok(())
+}
+
 /// May `me` change what a share of account `owner`'s machine grants (its
 /// ports, the exit option)? Only that account, or the admin token (no
 /// account), as for creating it ([`shareable_node`]). Operators may still
@@ -704,10 +719,18 @@ async fn create_key(State(p): P, me: Me, headers: HeaderMap, Json(b): Json<NewKe
     }
     let a = target_account(&p, &me, b.account.as_deref())?;
     let exp = now_unix() + b.expires_hours as i64 * 3600;
-    let key =
-        p.db.lock()
-            .unwrap()
-            .create_authkey_with(&a.name, b.reusable, Some(exp), b.ephemeral, b.preapproved)?;
+    let db = p.db.lock().unwrap();
+    let now = now_unix();
+    let live = db
+        .authkeys()?
+        .iter()
+        .filter(|k| {
+            k.account == a.name && !k.revoked && k.expires.is_none_or(|e| e > now) && (k.reusable || k.used == 0)
+        })
+        .count();
+    limit(live, MAX_KEYS, "unused auth keys in an account (revoke some first)")?;
+    let key = db.create_authkey_with(&a.name, b.reusable, Some(exp), b.ephemeral, b.preapproved)?;
+    drop(db);
     let link = join_url(&join_server(&p, &headers), &key, p.cfg.tls_fingerprint.as_deref());
     ok(json!({ "key": key, "account": a.name, "join_url": link, "qr_svg": qr_svg(&link) }))
 }
@@ -764,7 +787,10 @@ async fn add_rule(State(p): P, me: Me, Json(b): Json<NewRule>) -> ApiResult {
     } else {
         b.ports.as_str()
     };
-    let id = p.db.lock().unwrap().add_rule(&a.name, &b.from, &b.to, ports)?;
+    let db = p.db.lock().unwrap();
+    let n = db.rules()?.iter().filter(|r| r.account_id == a.id).count();
+    limit(n, MAX_RULES, "access rules in an account")?;
+    let id = db.add_rule(&a.name, &b.from, &b.to, ports)?;
     ok(json!({ "id": id }))
 }
 
@@ -835,8 +861,10 @@ fn ports_or_all(s: &str) -> &str {
 }
 
 async fn create_share(State(p): P, me: Me, Json(b): Json<NewShare>) -> ApiResult {
-    shareable_node(&p, &me, b.node_id)?;
+    let n = shareable_node(&p, &me, b.node_id)?;
     let db = p.db.lock().unwrap();
+    let owned = db.shares()?.iter().filter(|s| s.owner_id == n.account_id).count();
+    limit(owned, MAX_SHARES, "shares of an account's machines")?;
     // Don't reveal whether an account exists beyond what the share needs:
     // sharing with a name that doesn't exist fails the same way as a typo.
     let id = db.create_share(b.node_id, b.account.trim(), ports_or_all(&b.ports))?;
@@ -922,12 +950,17 @@ async fn create_link(State(p): P, me: Me, Json(b): Json<NewLink>) -> ApiResult {
     if !(1..=90).contains(&b.days) {
         return Err(ApiError::bad("links are valid for 1 to 90 days"));
     }
-    shareable_node(&p, &me, b.node_id)?;
-    let exp = now_unix() + b.days as i64 * 86400;
-    let code =
-        p.db.lock()
-            .unwrap()
-            .create_share_link(b.node_id, ports_or_all(&b.ports), exp)?;
+    let n = shareable_node(&p, &me, b.node_id)?;
+    let now = now_unix();
+    let exp = now + b.days as i64 * 86400;
+    let db = p.db.lock().unwrap();
+    let open = db
+        .share_links()?
+        .iter()
+        .filter(|l| l.owner_id == n.account_id && l.used_by.is_none() && !l.revoked && l.expires > now)
+        .count();
+    limit(open, MAX_LINKS, "unused share links in an account (revoke some first)")?;
+    let code = db.create_share_link(b.node_id, ports_or_all(&b.ports), exp)?;
     ok(json!({ "code": code }))
 }
 
